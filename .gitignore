@@ -16,3 +16,10 @@ video/
 show_stable/
 loras/
 lora_data/
+mapping.json
+recordings/
+online_keys.json
+online_keys.tmp
+fonts/*
+!fonts/.gitkeep
+tests/golden/*.tmp

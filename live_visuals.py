@@ -40,7 +40,9 @@ Keys (projector / preview window)
   hold       X flash | Z strobe | I invert | Q freeze | K blackout | J zoom punch
   tempo      , or . tap tempo
   mouse      click = ripple at that point (when not calibrating)
-  mapping    Ctrl+C corner-pin calibrate (drag corners) | R reset pin (while calibrating) | S save pin | Ctrl+G grid
+  mapping    Ctrl+C calibrate (drag the nearest surface corner) | S save mapping | Ctrl+G outlines + grid + names
+             while calibrating: Ctrl+Z undo the last mapping edit | Ctrl+R reset the selected surface to full frame
+             (several surfaces, masks, edge glow: the panel's MAPPING tab; saved in surfaces.json)
   guarded    Ctrl+BACKSPACE reset space + shape + motion to defaults | Ctrl+W toggle touch remote / panel server
   quit       preview window: ESC. On the projector (--monitor): Shift+ESC, or ESC twice within 1 s (exit code 0);
              closing the window needs the same confirmation. The hint is printed on the console, never projected.
@@ -85,6 +87,34 @@ try:
     from art_layer import ArtPass
 except ImportError:
     ArtPass = None
+import surfaces as surf_model                        # multi-surface mapping model (pure Python)
+try:
+    from surface_render import SurfaceRenderer       # its output stage: every surface from the one rendered frame
+except ImportError:
+    SurfaceRenderer = None
+try:
+    from fx_stack import LandPass, PreviewTap        # TouchVDMX merge: 3D landscape decks + swarm, panel monitor
+except ImportError:
+    LandPass = PreviewTap = None
+try:
+    from beings import BeingsPass                    # living / supernatural creatures layer (l_beings)
+except ImportError:
+    BeingsPass = None
+try:                                                 # text layer (l_text): SDF letters + the compositor GLSL for SCENE_FS
+    from text_layer import CPU_ONLY_PARAMS as TEXT_CPU_ONLY, SCENE_GLSL as TEXT_GLSL, TextPass
+except ImportError:
+    TextPass, TEXT_CPU_ONLY = None, frozenset(n for n, v in PARAMS.items() if v[3] == "text")
+    TEXT_GLSL = ("uniform float p_l_text; vec2 textWarp(vec2 a, vec2 b){ return vec2(0.0); } "
+                 "void textMix(inout vec3 o, inout float c, vec2 a, vec2 b, vec2 d, float e){}")
+
+try:
+    import governor as gov_mod                       # resource governor: lowers costs before the laptop chokes
+except ImportError:
+    gov_mod = None
+try:
+    import recorder as rec_mod                       # show recorder -> recordings/*.mp4 (REC in the panel, Ctrl+R)
+except ImportError:
+    rec_mod = None
 
 HERE = Path(__file__).parent
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)   # it warns on every (intended) decode-time rescale
@@ -119,8 +149,9 @@ CLOCK_UNIFORMS = ("beat", "beat_phase", "bar_phase", "phrase_phase")
 TEX_CAP = 64                      # most-recent AI textures kept on the GPU (older ones are evicted)
 STRICT = False                    # True in headless runs: guarded() re-raises so tests see every failure
 # PARAMS that never reach the shader as p_<name>: the CPU integrates / resolves them into other uniforms
-CPU_ONLY = {"speed", "flow", "rotate", "palette", "travel", "serpent_speed", "chase_rate"} | {
-    n for n, v in PARAMS.items() if v[3] in ("fractal", "art")}   # consumed by math_layers.FractalPass / art_layer.ArtPass
+CPU_ONLY = {"speed", "flow", "rotate", "palette", "travel", "serpent_speed", "chase_rate", "spin"} | {
+    n for n, v in PARAMS.items() if v[3] in ("fractal", "art", "land", "beings")} | (   # consumed by FractalPass / ArtPass / LandPass
+    {"l_swarm"} & set(PARAMS)) | (set(TEXT_CPU_ONLY) & set(PARAMS))            # (l_swarm is mixed inside fx_stack.LandPass)
 RESET_GROUPS = ("space", "shape", "motion")
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
@@ -132,9 +163,13 @@ void main(){ v_uv = in_pos*0.5+0.5; gl_Position = vec4(in_pos,0,1); }
 
 SCENE_FS = """
 #version 330
-uniform sampler2D texA, texB, prevFrame, texV, texF, texR;
+uniform sampler2D texA, texB, prevFrame, texV, texF, texR, texL, texG;
 uniform float t, mixAB, bass, mid, high, aspect, pxh, hasVideo, limiter, nanGuard;
 uniform float rotPh, chasePh, chaseCol, travelAct, breath, calm;
+uniform float spinPh, spinV, p_spin_twist;   // barrel-roll phase (wrapped at TAU), signed spin speed, corkscrew amount
+uniform sampler2D texS;             // the chosen image, flat (uploaded art piece); AI textures are texA / texB
+uniform float artUse, srcAI, srcAsp;   // art_use mode (0 = fly-through relief in texR), 1 = use the AI texture, image aspect
+uniform float srcPh, srcTr;         // image drift phase and tunnel scroll, both wrapped at 2 (one mirrored repeat)
 // Every phase that grows for hours is integrated in double precision on the CPU and arrives here already
 // wrapped at a period where the pattern repeats exactly, so float32 never has to resolve a large number.
 uniform float swN[6];               // swim noise offsets (x 0.21 0.31 0.23 0.17 0.05 0.03), wrapped at 1600
@@ -154,7 +189,7 @@ uniform float p_travel_mode, p_tunnel_curve, p_depth_fog;
 uniform float p_serpent, p_serpent_mode, p_serpent_count, p_serpent_segments, p_serpent_wiggle, p_serpent_size;
 uniform float p_swim, p_ripple, p_ripple_decay, p_twirl, p_bulge, p_wave, p_density;
 uniform float p_hue, p_saturation, p_chase, p_chase_width, p_chase_mode, p_trails;
-uniform float p_l_kene, p_l_beads, p_l_lines, p_l_ai, p_l_echo, p_l_video, p_luma_key, p_l_fractal, p_l_art;
+uniform float p_l_kene, p_l_beads, p_l_lines, p_l_ai, p_l_echo, p_l_video, p_luma_key, p_l_fractal, p_l_art, p_l_land, p_l_beings;
 uniform vec3 pal[5];
 uniform vec3 rip[8];                // x, y (content uv), age in seconds (< 0 = inactive)
 in vec2 v_uv;
@@ -165,7 +200,7 @@ const float SFLAT = 2.2;            // flat field: lattice units per frame heigh
 const float HSF = 0.3926991;        // flat field: lobe half-period (PI/8)
 
 // lattice description for the topology being shaded (set by main before each shade() call)
-float G_hs, G_F, G_cw, G_nb, G_kl, G_thr, G_vs, G_ts, G_ar, G_cofs, G_sparse;
+float G_hs, G_F, G_cw, G_nb, G_kl, G_thr, G_vs, G_ts, G_ar, G_cofs, G_sparse, G_flat;
 
 mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
 float max3(vec3 c){ return max(c.r, max(c.g, c.b)); }
@@ -187,6 +222,22 @@ vec3 palette(float x){ x=fract(x+0.06*sin(TAU*phrase_phase))*5.0; int i=int(x); 
 vec3 palStop(float k){ return pal[int(mod(k,5.0))]; }
 float aa(float sd, float e){ return clamp(0.5 - sd/max(e,1e-5), 0., 1.); }     // coverage of a signed distance
 
+// ---- the chosen image (art_use modes 1..5): mirrored repeat, so any mapping is seamless
+vec3 srcImg(vec2 uv, float lod){
+  uv = 1.0 - abs(1.0 - mod(uv, 2.0));
+  if (srcAI > 0.5) {                                                 // AI textures are near-monochrome: palette-tint them
+    vec3 a = mix(textureLod(texA, uv, lod).rgb, textureLod(texB, uv, lod).rgb, mixAB);
+    float l = dot(a, vec3(.299,.587,.114));
+    return mix(a*a*1.7, palette(l*0.9+t*0.02)*l*1.8, 0.70);
+  }
+  return textureLod(texS, uv, lod).rgb;
+}
+vec2 srcFit(vec2 p){                                                 // cover-fit: the image fills the frame
+  float a = max(srcAsp, 1e-3);
+  return (a > aspect ? vec2(p.x/a, p.y) : vec2(p.x, p.y*a)/aspect) + 0.5;
+}
+float srcKey(vec3 im){ return smoothstep(0.10, 0.42, dot(im, vec3(.299,.587,.114))); }   // dark paint stays black
+
 // ---- TAS "motion key": every element carries a hue index 0..1; a soft window sweeps over the index.
 // amount 0 = everything lit, 1 = only the window (plus a faint ghost of the structure).
 float chaseKey(float idx){
@@ -204,10 +255,10 @@ float chaseKey(float idx){
 // composition field: lotus-petal lobes on the lattice; >0 and <0 petals interleave
 float lobe(float uu, float v){ return sin(G_F*uu)*cos(PI*v); }
 
-// ---- kene: a generative labyrinth. Lattice points (i,j) with i+j odd each hold one wall of length 2
+// ---- kene, mandala topology (the look of the stable show, kept as it is): a generative labyrinth. Lattice points (i,j) with i+j odd each hold one wall of length 2
 // (horizontal or vertical) that can pivot; rules per mirrored 8x8 super-tile give stepped diamonds,
 // nested squares and grids, with hash-seeded defects that open labyrinth paths.
-float keneBit(vec2 ij, float slot){
+float keneBitM(vec2 ij, float slot){
   vec2 st = floor((ij+4.0)/8.0);
   vec2 fo = abs(ij - st*8.0);
   float seed = hash21(mod(st, 8.0)*7.31+vec2(3.7,1.9));
@@ -218,7 +269,7 @@ float keneBit(vec2 ij, float slot){
   float flip = step(hash21(fo*1.37 + seed*91.7 + mod(slot, 64.0)*13.1), 0.10);
   return abs(base-flip);
 }
-vec3 kene(vec2 g, float eg, out float kcov){
+vec3 keneM(vec2 g, float eg, out float kcov){
   float l = G_kl, e = eg/l;
   vec2 q = g/l;
   vec2 cid = floor(vec2(q.x+q.y, q.x-q.y)*0.5);
@@ -227,8 +278,8 @@ vec3 kene(vec2 g, float eg, out float kcov){
     vec2 c = cid + vec2(dx,dy);
     vec2 ij = vec2(c.x+c.y+1.0, c.x-c.y);
     float ph = t*0.11 + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
-    float s = keneBit(ij, slot);
-    if (ph-slot > 0.82) s = mix(s, keneBit(ij, slot+1.0), smoothstep(0.82, 1.0, ph-slot));
+    float s = keneBitM(ij, slot);
+    if (ph-slot > 0.82) s = mix(s, keneBitM(ij, slot+1.0), smoothstep(0.82, 1.0, ph-slot));
     vec2 cs = normalize(vec2(1.0-s, s)+1e-4);                        // wall direction (pivots while s moves)
     vec2 lp = q - ij;
     vec2 dd = vec2(max(abs(dot(lp,cs))-1.0, 0.0), abs(dot(lp, vec2(-cs.y,cs.x))));
@@ -245,6 +296,62 @@ vec3 kene(vec2 g, float eg, out float kcov){
   float pp = 0.03125*(q.x+q.y) + t*0.02 + chaseCol;
   vec3 c = palette(pp)*bold*chaseKey(i1) + palette(pp+0.37+0.06*lv)*thin*chaseKey(i2);
   kcov = mix(smoothstep(0.30, 0.20, d), smoothstep(0.26, 0.17, d), G_sparse);
+  return c*sh;
+}
+
+// ---- kene, flat topology: a generative line field in three weights (inspired by Amazonian kene, not a copy of any design).
+// Lattice points (i,j) with i+j odd each hold one wall of length 2 that can pivot. A wall joins either two
+// nodes of the primary grid (even, even) or, turned a quarter, two nodes of the dual grid (odd, odd): primary
+// walls are drawn bold with a fine outline, dual walls thin, so the thin lines always fill the space between
+// the bold ones. Rules per mirrored 16x16 super-tile lay the bold lines out as nested stepped diamonds, stepped
+// crosses and squares; a node left without a wall gets a small fill motif; a few hash-seeded defects keep it alive.
+float keneBit(vec2 ij, float slot){                                  // 1 = this point holds a primary (bold) wall
+  vec2 st = floor((ij+8.0)/16.0);
+  vec2 fo = abs(ij - st*16.0);
+  float seed = hash21(mod(st, 4.0)*7.31+vec2(3.7,1.9));               // period 64 lattice units, as the phase wraps assume
+  float sum = fo.x+fo.y, ring = floor(sum*0.5), base;
+  if (seed < 0.60) base = step(mod(ring + floor(seed*40.0), 3.0), 0.5);         // nested stepped diamonds: 1 bold, 2 thin
+  else if (seed < 0.93) base = max(step(abs(fo.x-fo.y), 1.5), step(abs(ring-4.0), 0.5));   // stepped X + one diamond
+  else base = 1.0 - mod(max(fo.x, fo.y), 2.0);                                  // nested squares
+  float flip = step(hash21(fo*1.37 + seed*91.7 + mod(slot, 64.0)*13.1), 0.025);
+  return abs(base-flip);
+}
+vec3 kene(vec2 g, float eg, out float kcov){
+  float l = G_kl, e = eg/l;
+  vec2 q = g/l;
+  vec2 cid = floor(vec2(q.x+q.y, q.x-q.y)*0.5);
+  float dA = 1e3, dB = 1e3; vec2 wA = vec2(0), wB = vec2(0);
+  for (int dy=-1; dy<=1; dy++) for (int dx=-1; dx<=1; dx++){
+    vec2 c = cid + vec2(dx,dy);
+    vec2 ij = vec2(c.x+c.y+1.0, c.x-c.y);
+    float ph = t*0.11 + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
+    float P = keneBit(ij, slot);
+    if (ph-slot > 0.82) P = mix(P, keneBit(ij, slot+1.0), smoothstep(0.82, 1.0, ph-slot));
+    float s = abs(P - mod(ij.x, 2.0));                               // 0 = horizontal, 1 = vertical
+    vec2 cs = normalize(vec2(1.0-s, s)+1e-4);                        // wall direction (pivots while P moves)
+    vec2 lp = q - ij;
+    vec2 dd = vec2(max(abs(dot(lp,cs))-1.0, 0.0), abs(dot(lp, vec2(-cs.y,cs.x))));
+    float di = max(max(dd.x,dd.y), (dd.x+dd.y)*0.7071);              // octagonal metric: 45 degree chamfers
+    float a = di + (1.0-P)*0.7, b = di + P*0.7;                      // a pivoting wall thins out / thickens on the way
+    if (a < dA){ dA = a; wA = ij; }
+    if (b < dB){ dB = b; wB = ij; }
+  }
+  float fine = smoothstep(0.13, 0.05, e)*(1.0-G_sparse);
+  float bold = aa(dA-0.150, e)*smoothstep(0.45, 0.16, e);
+  float outl = aa(abs(dA-0.345)-0.038, e)*fine;                      // fine line hugging every bold line
+  float thin = aa(dB-0.068, e)*fine;                                 // secondary lines: the dual of the bold ones
+  // fill motifs on nodes no wall touches: a stepped diamond on the primary grid, a small box on the dual grid
+  vec2 mA = abs(q - floor(q*0.5+0.5)*2.0), mB = abs(q - 1.0 - floor((q-1.0)*0.5+0.5)*2.0);
+  float sA = mA.x+mA.y, sB = max(mB.x, mB.y);
+  float motA = (aa(sA-0.20, e) + aa(abs(sA-0.46)-0.045, e))*step(1.2, dA)*step(sA, 0.6)*fine;
+  float motB = (aa(sB-0.11, e) + aa(abs(sB-0.33)-0.035, e))*step(1.2, dB)*step(sB, 0.5)*fine;
+  float i1 = fract((wA.x+wA.y)/16.0), i2 = fract((wB.x+wB.y)/16.0 + 0.09);   // steps 1/8 per wall along a staircase
+  float sh = 0.82+0.5*high*vnoise(q*3.0+t*3.0);
+  float pp = 0.03125*(q.x+q.y) + t*0.02 + chaseCol;
+  float k1 = chaseKey(i1), k2 = chaseKey(i2);
+  vec3 c = palette(pp)*(bold + 0.9*motA)*k1 + palette(pp+0.20)*outl*(0.35+0.65*k1)*0.8
+         + palette(pp+0.42)*(thin + motB)*k2;
+  kcov = mix(max(smoothstep(0.40, 0.30, dA), max(thin, max(motA, motB))), smoothstep(0.26, 0.17, dA), G_sparse);
   return c*sh;
 }
 
@@ -307,14 +414,14 @@ vec3 shade(vec2 g, float eg, out float cov){
     float wthr = mix(thr*0.45, thr, part);
     float win = smoothstep(wthr, wthr+0.08, sL);
     float idx = fract(lum*0.8 + lobeI*0.25);
-    col += c*win*(0.85+0.5*bass)*chaseKey(idx)*p_l_ai;
+    col += c*win*(0.85+0.5*bass)*chaseKey(idx)*(p_l_ai + 3.0*max(p_l_ai-0.5, 0.0));   // above the default the fader keeps adding light (x4 at 1)
     cov = max(cov, win*key*p_l_ai);
   }
 
   // kene line field: everywhere the medallions are not
   if (p_l_kene > 0.0) {
     float occ = smoothstep(thr-0.13, thr-0.05, aL)*max(sb, sa);
-    float kc; vec3 c = kene(g, eg, kc);
+    float kc; vec3 c = G_flat > 0.5 ? kene(g, eg, kc) : keneM(g, eg, kc);
     col += c*(1.0-occ)*p_l_kene;
     cov = max(cov, kc*(1.0-occ)*p_l_kene);
   }
@@ -355,7 +462,7 @@ vec2 mandalaG(float u, float th, float rr){
   return vec2(u, v*hs);
 }
 void setMandala(float folds, float cell){
-  G_hs = PI/folds; G_F = folds;
+  G_hs = PI/folds; G_F = folds; G_flat = 0.0;
   G_nb = max(2.0, floor(G_hs/cell+0.5)); G_cw = G_hs/G_nb;
   G_kl = G_hs/max(1.0, floor(G_hs/(cell*1.6)+0.5));
   G_vs = 0.5/G_hs;
@@ -363,7 +470,7 @@ void setMandala(float folds, float cell){
   G_ar = G_hs*exp2(floor(log2(3.76/G_hs)+0.5))/8.0;                  // arc ring ratio (log): 8 rings = 2^j half-wedges
 }
 void setFlat(){
-  G_hs = HSF; G_F = 8.0; G_nb = 7.0; G_cw = HSF/7.0; G_kl = HSF/4.0; G_vs = 0.2/HSF;
+  G_hs = HSF; G_F = 8.0; G_flat = 1.0; G_nb = 7.0; G_cw = HSF/7.0; G_kl = HSF/6.0; G_vs = 0.2/HSF;
   G_ts = 0.5/HSF; G_ar = 0.47;
 }
 // swim: domain warp of a flat lattice point
@@ -408,6 +515,26 @@ vec3 arcsFlat(vec2 g, float eg){
 // for every crossing and starts the next crossing as soon as the head has left, so a head is on screen nearly
 // all the time. The body is a tapered band cut into segments with stepped-diamond markings; the chase runs
 // along the segment index.
+// [serpent-colour> colour modes for the serpents; at the defaults (mode 0, colour depth 1, brightness 1) none of it runs
+uniform float p_serpent_color, p_serpent_hue, p_serpent_hue2, p_serpent_sat, p_serpent_bright;
+vec3 serpHsv(float h, float s){ return mix(vec3(1.0), clamp(abs(fract(h+vec3(0.0, 2.0/3.0, 1.0/3.0))*6.0-3.0)-1.0, 0.0, 1.0), s); }
+vec3 serpColour(float u, float fi, float sr, float idx, float rim, float pat, float gap){
+  float m = floor(p_serpent_color+0.5), key = chaseKey(idx), h1 = p_serpent_hue, h2 = p_serpent_hue2;
+  vec3 a = palette(u*0.9 + fi*0.21 + t*0.02), b = palette(u*0.9 + fi*0.21 + 0.4);        // 0 show palette
+  if (m > 4.5) {                                                     // 5 light chase: a window of light runs head -> tail
+    float w = 1.0 - abs(fract(sr - chasePh) - 0.5)*2.0;
+    key = 0.22 + 1.2*smoothstep(1.0 - p_chase_width, 1.0, w);
+    a = palette(sr*0.5 + chaseCol); b = palette(sr*0.5 + chaseCol + 0.4);
+  } else if (m > 3.5) { float h = h1 + fi*0.381966; a = serpHsv(h, 1.0); b = serpHsv(h+0.07, 0.7); }   // 4 each its own hue
+  else if (m > 2.5) { a = serpHsv(h1+sr, 1.0); b = serpHsv(h1+sr+0.10, 0.8); }                         // 3 rainbow along the body
+  else if (m > 1.5) { a = mix(serpHsv(h1, 1.0), serpHsv(h2, 1.0), sr);                                 // 2 two-tone head -> tail
+                      b = mix(serpHsv(h1+0.05, 0.7), serpHsv(h2+0.05, 0.7), sr); }
+  else if (m > 0.5) { a = serpHsv(h1, 1.0); b = serpHsv(h1+0.05, 0.7); }                               // 1 single hue
+  vec3 c = (a*(rim + 0.12) + b*pat)*gap*key;
+  c = mix(vec3(dot(c, vec3(.299,.587,.114))), c, p_serpent_sat);
+  return max(c, 0.0)*p_serpent_bright;
+}
+// <serpent-colour]
 vec4 serpents(vec2 p){
   float n = floor(p_serpent_count+0.5), segs = floor(p_serpent_segments+0.5);
   float w0 = mix(0.020, 0.085, p_serpent_size), len = mix(0.75, 1.9, p_serpent_size);
@@ -445,6 +572,9 @@ vec4 serpents(vec2 p){
     float idx = fract(seg/segs*2.0 + fi*0.17);
     vec3 pc = palette(seg/segs*0.9 + fi*0.21 + t*0.02);
     vec3 c = (pc*(rim + 0.12) + palette(seg/segs*0.9 + fi*0.21 + 0.4)*(dia+st2))*gap*chaseKey(idx);
+    // [serpent-colour>
+    if (p_serpent_color > 0.5 || p_serpent_sat != 1.0 || p_serpent_bright != 1.0) c = serpColour(seg/segs, fi, sr, idx, rim, dia+st2, gap);
+    // <serpent-colour]
     float eye = smoothstep(0.30, 0.12, length(vec2((sr-0.03)*len/w0*1.2, abs(bn)-0.45)))*step(sr, 0.09);
     c += vec3(1.0,0.95,0.8)*eye;
     acc = acc*(1.0-body) + c*body;
@@ -455,6 +585,7 @@ vec4 serpents(vec2 p){
 
 vec2 sway(float s){ return vec2(sin(s*0.20)+0.5*sin(s*0.46+1.3), cos(s*0.18)+0.5*sin(s*0.40)); }   // period 100 PI
 
+//@TEXT_GLSL
 void main(){
   vec2 asp = vec2(aspect, 1.0);
   vec2 p0 = (v_uv-0.5)*asp, p = p0;
@@ -469,11 +600,19 @@ void main(){
     if (R.z < 0.0) continue;
     vec2 dv = p0 - (R.xy-0.5)*asp; float d = length(dv)+1e-5;
     float x = d - R.z*0.55, w = 0.05+0.04*R.z;
-    float en = exp(-x*x/(w*w))*exp(-R.z*rrate)*smoothstep(0.0, 0.08, R.z)*p_ripple;
+    float en = exp(-x*x/(w*w))*exp(-R.z*rrate)*smoothstep(0.0, 0.08, R.z)*(p_ripple + 2.0*max(p_ripple-0.5, 0.0));   // x3 at 1
     p += dv/d*sin(x*38.0)*en*0.05;
     rglow += en*(0.5+0.5*cos(x*38.0));
   }
   vec2 pscr = p;                                                     // ripple-displaced screen space (serpents, fractal)
+  float amode = p_l_art > 0.0 ? floor(artUse+0.5) : -1.0, emboss = 1.0;
+  if (amode == 4.0) {
+    // art_use 4: the image displaces the pattern (its light and colour push the lattice aside) and embosses it
+    vec3 im = srcImg(srcFit(pscr*(0.94+0.04*sin(srcPh*PI))), 1.5);
+    p += (vec2(dot(im, vec3(.60,.30,.10)), dot(im, vec3(.10,.30,.60))) - 0.42)*p_l_art*0.26;
+    emboss = mix(1.0, 0.70+0.80*dot(im, vec3(.299,.587,.114)), p_l_art);
+  }
+  if (p_l_text > 0.0) p += textWarp(pscr, asp);                      // text modes 1 / 4: the letters bend the pattern
 
   // ---- serpentine warp: segmented bands sliding sideways like a snake's body
   if (p_serpent > 0.0 && smode > 0.5) {
@@ -490,17 +629,18 @@ void main(){
   // ---- camera: pan, tunnel sway, rotate, punch
   p -= vec2(p_pan_x*aspect, p_pan_y)*0.5;
   if (tmode > 0.5 && tmode < 2.5) p += p_tunnel_curve*0.07*sway(trSway+3.0);
-  p = rot(rotPh + 0.2*sin(swS[2]))*p;
+  p = rot(rotPh + spinPh + 0.2*sin(swS[2]))*p;                       // rotate + spin: every topology and travel mode
   float punch = 1.0 + 0.07*bass + 0.05*(breath-0.5)*(0.4+calm) + 0.30*p_punch;
   p /= punch; ps /= punch;
   // ---- bulge / pinch lens, twirl
   float r0 = length(p)+1e-5;
   float bf = pow(r0/0.45+0.02, p_bulge*0.6);
   p *= bf; ps *= bf*(1.0+0.5*abs(p_bulge));
-  float tk = p_twirl*1.1 + (tmode > 2.5 ? 0.8 : 0.0);               // Droste mode adds a standing log spiral (mandala)
+  float tw = p_twirl*1.1 - p_spin_twist*spinV*2.2;                   // spin twist: the far end leads the roll (corkscrew)
+  float tk = tw + (tmode > 2.5 ? 0.8 : 0.0);                         // Droste mode adds a standing log spiral (mandala)
   float soft = 0.15*(1.0-sym)+1e-4;
   vec2 pt = rot(tk*log(r0*bf+soft))*p;                               // mandala gets the spiral; flat Droste has its own
-  vec2 pf_ = rot(p_twirl*1.1*log(r0*bf+soft))*p;
+  vec2 pf_ = rot(tw*log(r0*bf+soft))*p;
   ps *= 1.0+0.35*abs(tk);
 
   float cell = 0.12*pow(0.25, p_density);                            // lattice cell size from density
@@ -668,11 +808,50 @@ void main(){
     cov = max(cov, max3(fc));
   }
 
-  // ---- painting reliefs (art_layer.ArtPass): own colours, no palette tint
-  if (p_l_art > 0.0) {
-    vec3 ac = clamp(texture(texR, pscr/asp+0.5).rgb, 0.0, 1.0)*p_l_art;
-    col = col + ac*(1.0-clamp(col, 0.0, 1.0));
+  // ---- the chosen image (uploaded art or AI texture), used per art_use; amount = l_art
+  if (amode >= 0.0) {
+    vec3 ac = vec3(0);
+    float rK = length(pt)+1e-5, thK = atan(pt.y, pt.x);
+    if (amode == 1.0) {
+      // 1 inside the lines: the pattern is a stencil, the image is the light coming through it
+      vec3 im = srcImg(srcFit(pscr*0.92 + 0.03*vec2(cos(srcPh*PI), sin(srcPh*PI))), 0.0);
+      float m = smoothstep(0.02, 0.28, max3(col));
+      col = mix(col, (im*1.55+0.06)*m*(0.55+0.45*max3(col)), p_l_art);
+    } else if (amode == 2.0) {
+      // 2 kaleidoscope source: a slowly turning slice of the image, mirrored round the fold count
+      float hsK = PI/floor(clamp(p_folds, 2.0, 24.0)+0.5);
+      float vK = abs(fract(thK/(2.0*hsK))-0.5)*2.0*hsK;
+      vec2 kp = rK*vec2(cos(vK+srcPh*PI), sin(vK+srcPh*PI));
+      vec3 im = srcImg(kp*(1.15+0.25*sin(srcPh*PI)) + 0.5, 0.5);
+      ac = im*srcKey(im)*smoothstep(0.012, 0.05, rK);
+    } else if (amode == 3.0) {
+      // 3 tunnel walls: the image wrapped round a log-polar tunnel; travel (and time) scroll it toward the viewer
+      vec3 im = srcImg(vec2(thK/TAU*4.0, log(rK)*0.75 - srcTr), max(0.0, log2(0.55/rK)));
+      ac = im*srcKey(im)*smoothstep(0.02, mix(0.10, 0.45, clamp(p_depth_fog, 0.0, 1.0)), rK);
+    } else if (amode == 5.0 || (amode < 0.5 && srcAI > 0.5)) {
+      // 5 full frame + feedback melt (the echo stage below drips it); also the flat fallback for AI textures in mode 0
+      vec3 im = srcImg(srcFit(pscr*(0.96+0.03*sin(srcPh*PI))), 0.0);
+      ac = im*srcKey(im)*(amode == 5.0 ? 0.40+0.60*exp(-beat_phase*3.0) : 1.0);
+    } else if (amode < 0.5) {
+      ac = texture(texR, pscr/asp+0.5).rgb;                          // 0 fly-through relief (art_layer.ArtPass)
+    }
+    ac = clamp(ac, 0.0, 1.0)*p_l_art;
+    col = col*emboss + ac*(1.0-clamp(col, 0.0, 1.0));
     cov = max(cov, max3(ac));
+  }
+
+  // ---- 3D landscape decks + particle swarm (fx_stack.LandPass): layer amounts are already applied in the pass
+  if (p_l_land > 0.0) {
+    vec3 lc = clamp(texture(texL, pscr/asp+0.5).rgb, 0.0, 1.0);
+    col = col + lc*(1.0-clamp(col, 0.0, 1.0));
+    cov = max(cov, max3(lc));
+  }
+
+  // ---- beings (beings.BeingsPass): rgb = light, a = silhouette; the layer amount is already applied in the pass
+  if (p_l_beings > 0.0) {
+    vec4 bg = clamp(texture(texG, pscr/asp+0.5), 0.0, 1.0);
+    col = col*(1.0-0.92*bg.a) + bg.rgb;
+    cov = max(cov, max(bg.a, max3(bg.rgb)));
   }
 
   // ---- serpents slither over everything
@@ -698,13 +877,16 @@ void main(){
   float hold = clamp(p_freeze, 0.0, 1.0);
   vec2 q = (v_uv-0.5)*asp; float fr = (0.0015+0.002*mid)*(1.0-hold), z = mix(0.9955-0.004*bass, 1.0, hold);
   q = (rot(fr)*q*z)/asp+0.5;
+  float melt = amode == 5.0 ? p_l_art*(1.0-hold) : 0.0;              // art_use 5: the echo runs like wet paint
+  q += (fbm2(v_uv*vec2(5.0, 3.0)+vec2(swN[4], swN[5]))*0.010 + vec2(0.0, 0.0030*(0.4+fbm(v_uv*vec2(22.0, 1.5)))))*melt;
   bool held = hold > 0.999;                                          // fully frozen: copy the texel, no resampling
   vec3 prev = held ? texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb : texture(prevFrame,q).rgb;
   if (nanGuard > 0.5 && !(prev.r >= 0.0 && prev.g >= 0.0 && prev.b >= 0.0)) prev = vec3(0);
-  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)), 0.0, 1.0)*mix(p_trails*0.94, 1.0, hold);
+  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)), 0.0, 1.0)*mix(mix(min(p_trails*0.94 + 1.6*max(p_trails-0.94, 0.0) + 0.30*max(p_l_echo-0.6, 0.0), 0.960), 0.972, melt), 1.0, hold);   // above 0.94 (no factory scene goes higher): long trails, up to 0.96 / frame (longer ones wash out to pastel)
   trail *= mix(smoothstep(0.05, 0.24, max3(trail)), 1.0, hold);
   fbE = vec4(max(col, trail), 1.0);
-  vec3 o = max(col, trail*(0.30+0.25*p_trails)*min(p_l_echo/0.6, 1.6));
+  vec3 o = max(col, trail*mix(min((0.30+0.25*p_trails)*(min(p_l_echo/0.6, 1.0) + 3.0*max(p_l_echo-0.6, 0.0)), 0.95), 0.92, melt));   // echo above its default: x2.2 at 1
+  if (p_l_text > 0.0) textMix(o, cov, pscr, pt, asp, edge);          // text layer (text_layer.SCENE_GLSL): display only
 
   // ---- performance stage (display only; the echo buffer never sees it)
   float mx = max3(o);
@@ -731,6 +913,7 @@ void main(){
   f = nanGuard > 0.5 ? vec4(clamp(o-0.004, 0.0, 1.0), 1.0) : vec4(o, 1.0);   // nanGuard 0 = raw value (NaN tests)
 }
 """
+SCENE_FS = SCENE_FS.replace("//@TEXT_GLSL", TEXT_GLSL)   # the text compositor lives in text_layer.py
 
 OUT_FS = """
 #version 330
@@ -1240,6 +1423,7 @@ class Audio:
 
     def __init__(self, source):
         self.source, self.raw, self.ok, self.running = source, np.zeros(3), False, True
+        self.taps = []                               # recorder.py listens here: fn(block (n, ch) float32, perf_counter t)
         if source != "none":
             threading.Thread(target=self._run, daemon=True).start()
 
@@ -1273,10 +1457,18 @@ class Audio:
                 dev_id, dev = self._open(sc)
                 print(f"[audio] {self.source}: {dev.name}")
                 buf, peak, last_check = np.zeros(n), np.full(3, 1e-3), time.time()
-                with dev.recorder(samplerate=sr, channels=1, blocksize=512) as rec:
+                with dev.recorder(samplerate=sr, channels=2 if self.source == "loopback" else 1, blocksize=512) as rec:
                     self.ok = True
                     while self.running:
-                        data = rec.record(numframes=512)[:, 0]
+                        blk = rec.record(numframes=512)
+                        if self.taps:                # the show recorder shares this stream (one loopback capture)
+                            tb = time.perf_counter()
+                            for fn in list(self.taps):
+                                try:
+                                    fn(blk, tb)
+                                except Exception:
+                                    pass
+                        data = blk.mean(axis=1) if blk.shape[1] > 1 else blk[:, 0]
                         buf = np.roll(buf, -len(data)); buf[-len(data):] = data
                         mag = np.abs(np.fft.rfft(buf * win))
                         e = np.nan_to_num(np.array([np.sqrt(np.mean(mag[m] ** 2)) for m in masks]), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1551,6 +1743,7 @@ SERP_LAPS = 64                                    # a serpent's track sequence r
 SERP_T = np.random.default_rng(11).random((8, SERP_LAPS, 4))   # per serpent, per crossing: heading, offset, bend, wave seed
 SERP_XS = np.linspace(-1.9, 1.9, 191)             # along-track samples used to find where a track is on screen
 SWN_K, SWS_K = (0.21, 0.31, 0.23, 0.17, 0.05, 0.03), (0.9, 0.7, 0.11, 0.2)
+SPIN_RATE = 1.6                                   # radians per second of barrel roll at spin = 1 (a turn in 4 s)
 
 
 def serpent_tracks(idx, laps, size, wiggle, aspect=1.6):
@@ -1598,6 +1791,7 @@ class Phases:
         self.s_hp, self.s_lap = None, np.arange(8) * 8            # serpents: distance along the current crossing, crossing number
         self.T = self.swim = self.serp = self.travel = 0.0        # raw doubles
         self.flowM = self.flowF = self.trU = self.trT = self.trG = self.trZ = self.trSway = self.rot = 0.0
+        self.spin = 0.0                                           # barrel-roll angle (radians, wrapped at TAU)
         self.act = self.tex = 0.0
 
     @staticmethod
@@ -1618,6 +1812,7 @@ class Phases:
         dflow = dts * (vals.get("flow", 0.0) / 0.3) * (0.25 + 0.35 * mid + 0.9 * bass) * 0.10
         self.flowM, self.flowF = (self.flowM + dflow) % pu, (self.flowF + dflow) % pf
         self.rot = (self.rot + dts * vals.get("rotate", 0.0) * 0.3) % (2 * math.pi)
+        self.spin = (self.spin + dts * vals.get("spin", 0.0) * SPIN_RATE) % (2 * math.pi)
         trav = vals.get("travel", 0.0)
         dtr = dts * trav * 0.6 * (1.0 + 1.2 * bass)
         if abs(trav) > 0.02:
@@ -1690,6 +1885,7 @@ class Phases:
             sb[:, 2], sb[:, 3] = cur[:, 5], prev[:, 5]
         return dict(
             t=self.T, rotPh=self.rot + k * tau, travelAct=self.act,
+            spinPh=self.spin + k * tau, spinV=min(max(vals.get("spin", 0.0), -1.0), 1.0),
             swN=np.array([(self.swim * c) % NOISE_P + k * NOISE_P for c in SWN_K], dtype="f4"),
             swS=np.array([(self.swim * c) % tau + k * tau for c in SWS_K], dtype="f4"),
             aiDrift=(self.swim * 0.008) % 1.0 + k,
@@ -1707,6 +1903,7 @@ def main():
     ap.add_argument("--audio", default="loopback", choices=["loopback", "mic", "none"])
     ap.add_argument("--textures", default=str(HERE / "textures"))
     ap.add_argument("--videos", default=str(HERE / "videos"), help="folder of video loops for the video layer")
+    ap.add_argument("--art", default=str(HERE / "art"), help="folder of uploaded art pieces for the art layer")
     ap.add_argument("--cycle", type=float, default=12.0, help="seconds per AI texture")
     ap.add_argument("--spout", action="store_true")
     ap.add_argument("--limit-mean", type=float, default=LIMIT_MEAN, help="brightness ceiling: mean peak-channel level 0..1 the frame may reach")
@@ -1725,14 +1922,24 @@ def main():
                     help="headless: add K whole wrap periods to every wrapped phase (the picture must not change)")
     ap.add_argument("--no-nan-guard", action="store_true", help="headless: shader outputs raw values, NaN guards off (tests)")
     ap.add_argument("--live-controller", action="store_true", help="headless: use control.Controller instead of the static one")
+    ap.add_argument("--text", default=None, help="headless: words for the text layer (| = new line); raise l_text with --set")
     ap.add_argument("--gallery", action="store_true",
                     help="headless: every look / contortion / trigger / travel mode -> test_frames/gallery/contact_sheet.png")
     ap.add_argument("--batch", default=None, metavar="JOBS.json",
                     help="headless: render a list of jobs [{name, sets, frames, script}] in one process -> <out>/<name>.png + batch.json")
+    ap.add_argument("--surfaces", default=None, metavar="FILE.json",
+                    help="headless: render through this surfaces file (read-only; the show always uses surfaces.json)")
     ap.add_argument("--remote", action="store_true", help="start the touch remote web page (Ctrl+W toggles it at runtime)")
     ap.add_argument("--remote-port", type=int, default=8765)
     ap.add_argument("--remote-token", default=None, help="panel token (default: persistent, stored in .remote_token)")
     ap.add_argument("--panel", action="store_true", help="open the control panel in a browser on this laptop (implies --remote)")
+    ap.add_argument("--governor", default=None, choices=["off", "suggest", "auto"],
+                    help="resource governor mode (show default: saved setting, else suggest; headless: not started unless given)")
+    ap.add_argument("--record", nargs="?", const=0.0, type=float, default=None, metavar="SECONDS",
+                    help="start recording at launch (recordings/); with SECONDS stop after that long (headless --test: run until written)")
+    ap.add_argument("--record-opts", default=None, metavar="K=V,...",
+                    help="recorder settings, e.g. source=program|projector,fps=30|60,res=native|1080p,audio=off|laptop|mic,quality=draft|standard|high")
+    ap.add_argument("--record-dir", default=None, help="folder for recordings (default recordings/)")
     args = ap.parse_args()
     rw, rh = map(int, args.render.split("x"))
     headless = bool(args.test or args.gallery or args.batch)
@@ -1818,8 +2025,27 @@ def main():
 
     unit_sq = UNIT_SQ
     map_file = HERE / "mapping.json"
-    corners = load_corners(map_file)
+    # multi-surface mapping. The show reads / autosaves surfaces.json (a missing one starts from the old
+    # mapping.json corner pin as surface #1). Headless runs never touch the show's file: --surfaces FILE
+    # read-only, else just the corner pin as before. `corners` stays the old BL BR TR TL view of ONE surface
+    # (the only one, or the selected one), so the old commands and mouse calibration keep working.
+    mapper = surf_model.Mapper(path=(args.surfaces if headless else HERE / "surfaces.json"), legacy=map_file,
+                               output=(rw, rh), writable=not headless)
+    surf_draw = guarded("map", SurfaceRenderer, ctx) if SurfaceRenderer is not None else None
+    print(f"[map] {len(mapper.set.surfaces)} surface(s), {mapper.set.status}"
+          + ("" if surf_draw is not None else " (multi-surface output unavailable: corner pin only)"))
+    corners = mapper.corners()
     hinv = inverse_homography(corners)
+    map_ref = dict(c=[list(p) for p in corners], id=mapper.target_id(), fails=0, drag_n=0)
+
+    def map_pull():                                # the model -> the old corner view
+        corners[:] = mapper.corners()
+        map_ref.update(c=[list(p) for p in corners], id=mapper.target_id())
+
+    def map_push(g="legacy"):                      # old corner edits (remote `corner` / `nudge` / `reset`, mouse) -> the model
+        if corners != map_ref["c"]:
+            mapper.push_corners(corners, map_ref["id"], g)
+            map_pull()
 
     test_dir = Path(args.out) if args.out else HERE / "test_frames"
     if headless:
@@ -1840,13 +2066,33 @@ def main():
         obj = None
         if cls is not None and pname in PARAMS:
             try:
-                obj = cls(ctx, (rw, rh), folder=HERE / "art") if pname == "l_art" else cls(ctx, (rw, rh))
+                obj = cls(ctx, (rw, rh), folder=Path(args.art)) if pname == "l_art" else cls(ctx, (rw, rh))
             except Exception as ex:
                 print(f"[{pname}] disabled: {ex}")
         extra.append(dict(param=pname, uniform=uname, unit=unit, obj=obj, fails=0))
+    if LandPass is not None and "l_land" in PARAMS:      # one texture carries both layers; the shader only gates on it
+        try:
+            extra.append(dict(param="l_land", keys=("l_land", "l_swarm"), gate=1.0, uniform="texL", unit=7,
+                              obj=LandPass(ctx, (rw, rh)), fails=0))
+        except Exception as ex:
+            print(f"[l_land] disabled: {ex}")
+    if BeingsPass is not None and "l_beings" in PARAMS:  # the pass applies l_beings itself; the shader only gates on it
+        try:
+            extra.append(dict(param="l_beings", gate=1.0, uniform="texG", unit=6, obj=BeingsPass(ctx, (rw, rh)), fails=0))
+        except Exception as ex:
+            print(f"[l_beings] disabled: {ex}")
+    if TextPass is not None and "l_text" in PARAMS:      # letter field (unit 10) + its trail buffer (unit 11)
+        try:
+            extra.append(dict(param="l_text", uniform="texT", unit=10, obj=TextPass(ctx, (rw, rh)), fails=0))
+        except Exception as ex:
+            print(f"[l_text] disabled: {ex}")
+    preview = guarded("preview", PreviewTap, ctx) if PreviewTap is not None and not headless else None
 
     controller = make_controller(headless, args.live_controller)
     print(f"[control] {type(controller).__name__}")
+    gov = None                                   # resource governor (show mode, or headless with --governor)
+    if gov_mod is not None and not sheet and (args.governor or not headless):
+        gov = guarded("governor", gov_mod.for_engine, ctx, controller, args.governor)
     DEF = defaults()
 
     def apply_start(ctl):
@@ -1932,6 +2178,9 @@ def main():
                 if not st["calib"]:
                     st["drag"] = None
             elif key == glfw.KEY_W: remote.toggle()
+            elif key == glfw.KEY_R and st["calib"]: mapper.command(dict(op="reset", id=mapper.target_id()))
+            elif key == glfw.KEY_R and recorder is not None: recorder.command({"cmd": "rec", "op": "toggle"})
+            elif key == glfw.KEY_Z and st["calib"]: mapper.command(dict(op="undo"))
         elif glfw.KEY_1 <= key <= glfw.KEY_9: controller.set("folds", float(FOLDS[key - glfw.KEY_1]))
         elif key == glfw.KEY_M: set_preset(st["preset"] + 1)
         elif key == glfw.KEY_P: set_palette(int(round(v["palette"])) + 1)
@@ -1945,8 +2194,7 @@ def main():
         elif key in (glfw.KEY_COMMA, glfw.KEY_PERIOD): controller.tap()
         elif key == glfw.KEY_SPACE: st["next"] = True
         elif key == glfw.KEY_V: video.next()
-        elif key == glfw.KEY_R and st["calib"]: corners[:] = [list(map(float, c)) for c in unit_sq]
-        elif key == glfw.KEY_S: save_mapping(map_file, corners)
+        elif key == glfw.KEY_S: mapper.save()
 
     def mouse_uv(w):
         x, y = glfw.get_cursor_pos(w); ww, wh = glfw.get_window_size(w)
@@ -1960,13 +2208,20 @@ def main():
             st["drag"] = None
             if action == glfw.PRESS:             # ripple where the pointer is, in content space (through the corner pin)
                 u, v = mouse_uv(w)
+                if surf_draw is not None and not mapper.set.trivial():   # several surfaces: the one under the pointer
+                    hit = mapper.ripple_uv(u, v)
+                    if hit is not None:
+                        controller.ripple(float(hit[0]), float(hit[1]))
+                    return
                 q = st["hinv"] @ np.array([u, v, 1.0])
                 if abs(q[2]) > 1e-9 and 0.0 <= q[0] / q[2] <= 1.0 and 0.0 <= q[1] / q[2] <= 1.0:
                     controller.ripple(float(q[0] / q[2]), float(q[1] / q[2]))
             return
         if action == glfw.PRESS:
             u, v = mouse_uv(w)
-            st["drag"] = int(np.argmin([(c[0] - u) ** 2 + (c[1] - v) ** 2 for c in corners]))
+            _, st["drag"] = mapper.nearest_corner(u, v)      # nearest corner of any surface; that surface gets selected
+            map_ref["drag_n"] += 1
+            map_pull()
         else:
             st["drag"] = None
 
@@ -2012,6 +2267,9 @@ def main():
             print(f"[spout] disabled: {ex}")
 
     audio = Audio("none" if headless else args.audio)
+    recorder = None                              # show recorder (recorder.py): panel REC, Ctrl+R, MIDI target "rec"
+    if rec_mod is not None and not sheet:
+        recorder = guarded("rec", rec_mod.for_engine, ctx, audio, (rw, rh), args, headless)
     sm, smr = np.zeros(3), np.zeros(3)           # smoothed bands; smr = what the shader sees (held while frozen)
     ph = Phases(rw / rh)
     chase = 0.0                                  # chase phase in sweeps (double)
@@ -2049,8 +2307,37 @@ def main():
 
         start_job(0)
 
+    def art_pick(c, now):
+        """{"cmd": "art_pick", "source": "art" | "ai", "name": file name (optional), "use": mode 0..5 (optional)}:
+        choose the image the art layer uses, by name. Unknown names leave the current image alone."""
+        name, source = str(c.get("name") or ""), str(c.get("source") or "art").lower()
+        if source == "ai":
+            controller.set("art_source", 1.0)
+            if name:
+                st["show"] = (name, now + 10.0)
+        else:
+            controller.set("art_source", 0.0)
+            obj = next((e["obj"] for e in extra if e["param"] == "l_art"), None)
+            names = obj.library() if obj is not None else []
+            hit = next((i for i, n in enumerate(names) if n == name or Path(n).stem == name), None)
+            if hit is not None:
+                controller.set("art_index", float(hit))
+        use = c.get("use")
+        if isinstance(use, (int, float)) and not isinstance(use, bool) and math.isfinite(use):
+            controller.set("art_use", float(use))
+
+    def text_show(c):
+        """{"cmd": "text_show" | "text", "text", "font", "align", "warm"}: the words the text layer draws."""
+        obj = next((e["obj"] for e in extra if e["param"] == "l_text"), None)
+        if obj is not None:
+            obj.set_text(c.get("text"), c.get("font"), c.get("align"), warm=c.get("warm"), wait=headless)
+
+    if args.text:
+        text_show(dict(text=args.text.replace("|", chr(10))))
+
     def run_action(a):
-        if a[0] == "trigger": controller.trigger(a[1], a[2])
+        if a[0] == "text": text_show(dict(text=a[1], font=a[2] if len(a) > 2 else None))
+        elif a[0] == "trigger": controller.trigger(a[1], a[2])
         elif a[0] == "ripple": controller.ripple(a[1], a[2])
         elif a[0] == "set": controller.set(a[1], a[2])
 
@@ -2098,6 +2385,7 @@ def main():
 
             # ---- commands: the controller takes what it owns (call it every frame: MIDI- and AI-raised
             # commands come out of it too); corner pin / grid / textures / snapshot stay here
+            map_pull()
             cmds = guarded("remote", remote.drain, default=[]) if remote.running else []
             rest = guarded("control", controller.apply, cmds, default=[])
             own = []
@@ -2106,12 +2394,21 @@ def main():
                     continue
                 kind = c.get("cmd") or c.get("type")
                 if kind == "snapshot": st["snap"] = True
+                elif kind == "art_pick": guarded("art_pick", art_pick, c, now)
                 elif kind == "show_texture": st["show"] = (str(c.get("name", "")), now + 10.0)
                 elif kind == "next_video": guarded("video", video.next)
+                elif kind == "gov":
+                    if gov: guarded("governor", gov.command, c)
+                elif kind == "rec":
+                    if recorder is not None: guarded("rec", recorder.command, c)
+                elif kind in ("text_show", "text"): guarded("text", text_show, c)
+                elif kind == "surf": guarded("map", mapper.command, c)
                 elif isinstance(c.get("cmd"), str): own.append(c)
             if own:
-                if "save" in (guarded("remote", apply_commands, own, st, corners, len(FOLDS), len(PALETTES), default=None) or ()):
-                    save_mapping(map_file, corners)
+                acts = guarded("remote", apply_commands, own, st, corners, len(FOLDS), len(PALETTES), default=None) or ()
+                guarded("map", map_push)
+                if "save" in acts:
+                    guarded("map", mapper.save)
 
                 def legacy():                    # old touch-remote commands -> params
                     if st["fold_i"] is not None: controller.set("folds", float(FOLDS[min(max(int(st["fold_i"]), 0), len(FOLDS) - 1)]))
@@ -2128,6 +2425,7 @@ def main():
             fz = vals["freeze"]
             smr += (sm - smr) * (1.0 - fz)
             dts, dtf = ph.advance(dt, vals, smr)
+            clock["spin_phase"] = ph.spin            # accumulated barrel roll (radians, 0..TAU) for the offscreen passes
             if fz < 0.5:
                 clk = clock                      # beat-synced accents hold their value while frozen
             bar = clock["beat"] / 4.0
@@ -2173,12 +2471,15 @@ def main():
                         state.update(controller.state())
                     except Exception as ex:
                         state["control_error"] = str(ex)
+                    state.update(surfaces=mapper.set.state())
                     state.update(grid=st["grid"], calib=st["calib"], corners=corners, res=list(glfw.get_framebuffer_size(win)),
                                  fps=(frame - pub_frame) / (now - pub_t), bands=[float(x) for x in sm],
                                  bass=float(sm[0]), mid=float(sm[1]), high=float(sm[2]),
                                  tex=texs[tj if fade_t0 is not None else ti][0], video=video.name, limiter=round(limiter.value, 3),
                                  projector=bool(st["proj"]), palettes=[n for n, _ in PALETTES],
                                  palette_colors=[[list(c) for c in stops] for _, stops in PALETTES])
+                    if gov: state["gov"] = gov.status()
+                    if recorder is not None: state["rec"] = recorder.state()
                     remote.publish_state(state)
 
                 guarded("publish", publish)
@@ -2226,6 +2527,8 @@ def main():
                 trial[st["drag"]] = list(mouse_uv(win))
                 if corners_ok(trial):                # refuse moves that fold the quad (singular homography)
                     corners[st["drag"]] = trial[st["drag"]]
+                    guarded("map", map_push, f"mouse{map_ref['drag_n']}")
+            guarded("map", mapper.tick)              # autosave once mapping edits have been quiet for a moment
 
             # ---- projector hot-plug + cursor (show mode only)
             if proj_mode:
@@ -2241,37 +2544,64 @@ def main():
                     time.sleep(0.05)
                     continue
 
+            if gov:                                  # resource governor: frame time + (faded, reversible) reductions
+                guarded("governor", gov.frame, vals, getattr(controller, "base", None)); gov.timer.begin_frame()
             # ---- video loop + optional offscreen passes (only when their layer is up: zero cost otherwise)
             has_video = video.update(dts, now, active=vals.get("l_video", 0.0) > 0.001, wait=2.0 if headless else 0.0)
             layer_on = {}
+            # art_use: 0 = the relief fly-through pass (uploaded art only); 1..5 = the compositor uses the flat image
+            # (uploaded piece or, with art_source 1 / no art loaded, the AI texture on show)
+            art_mode, src_ai, src_asp = int(round(vals.get("art_use", 0.0))), vals.get("art_source", 0.0) > 0.5, 1.0
             for ex in extra:
-                amount = vals.get(ex["param"], 0.0)
+                amount = max(vals.get(k, 0.0) for k in ex.get("keys", (ex["param"],)))
                 layer_on[ex["param"]] = 0.0
+                if ex["param"] == "l_art" and amount > 0.001 and (art_mode != 0 or src_ai or ex["obj"] is None or ex["fails"] >= 5):
+                    got = None
+                    if not src_ai and ex["obj"] is not None:
+                        got = guarded("art", ex["obj"].source, vals, dts, default=None)
+                    if got:
+                        got[0].use(8)
+                        src_asp = got[1]
+                    else:
+                        src_ai = True                    # nothing uploaded (yet): the AI texture stands in
+                    layer_on["l_art"] = amount
+                    continue
                 if ex["obj"] is None or amount <= 0.001 or ex["fails"] >= 5:
                     continue
                 try:
-                    if ex["param"] == "l_fractal":
-                        tex = ex["obj"].render(vals, clock, T, ph.travel, [tuple(map(float, c)) for c in pal])
+                    if gov: gov.timer.start(ex["param"])
+                    if ex["param"] == "l_fractal":           # it integrates its own roll from rotate: spin is added as a rate
+                        fvals = dict(vals, rotate=vals["rotate"] + vals.get("spin", 0.0) * SPIN_RATE / 0.6)
+                        tex = ex["obj"].render(fvals, clock, T, ph.travel, [tuple(map(float, c)) for c in pal])
+                    elif ex["param"] == "l_beings":
+                        tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0), clock, T, dts, smr, pal)
+                    elif ex["param"] == "l_text":
+                        tex = ex["obj"].render(vals, clock, T, dts, smr, pal)
+                    elif ex["param"] == "l_land":
+                        tex = ex["obj"].render(vals, clock, T, ph.travel, None, pal, smr, spin_phase=ph.spin)
                     else:
-                        tex = ex["obj"].render(vals, clock, T, ph.travel, dts)
+                        tex = ex["obj"].render(dict(vals, spin_phase=ph.spin), clock, T, ph.travel, dts)
                     tex.use(ex["unit"])
-                    layer_on[ex["param"]], ex["fails"] = amount, 0
+                    layer_on[ex["param"]], ex["fails"] = ex.get("gate", amount), 0
                 except Exception as err:
                     ex["fails"] += 1
                     print(f"[{ex['param']}] render failed ({ex['fails']}/5): {err}")
+                if gov: gov.timer.stop()             # close this pass's GPU timer (success or failure)
 
             # ---- scene pass (ping-pong feedback)
             src, dst = frame % 2, (frame + 1) % 2
             fbos[dst].use()
             ctx.viewport = (0, 0, rw, rh)
             texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
-            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, mixAB=mix,
+            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, mixAB=mix,
                        bass=smr[0], mid=smr[1], high=smr[2], aspect=rw / rh, pxh=1.0 / rh,
                        hasVideo=1.0 if has_video else 0.0, limiter=limiter.value, nanGuard=0.0 if args.no_nan_guard else 1.0,
                        chasePh=chase % 1.0, chaseCol=(chase * 0.15) % 1.0, breath=breath, calm=calm,
                        beat=clk["beat"] % 4096.0, beat_phase=clk["beat_phase"],
                        bar_phase=clk["bar_phase"], phrase_phase=clk["phrase_phase"])
             uni.update(ph.uniforms(vals, args.phase_offset if headless else 0))
+            uni.update(texS=8, artUse=float(art_mode), srcAI=1.0 if src_ai else 0.0, srcAsp=src_asp,
+                       srcPh=(ph.swim * 0.035) % 2.0, srcTr=(ph.travel * 0.45 + ph.T * 0.04) % 2.0)
             for name, v in vals.items():
                 uni[f"p_{name}"] = v
             uni["p_blackout"] = bo
@@ -2286,7 +2616,9 @@ def main():
                 scene_prog["pal"].write(np.ascontiguousarray(pal, dtype="f4").tobytes())
             if "rip" in scene_prog:
                 scene_prog["rip"].write(ripples.tobytes())
+            if gov: gov.timer.start("scene")
             scene_vao.render(moderngl.TRIANGLE_STRIP)
+            if gov: gov.timer.stop()
 
             if spout:
                 try:
@@ -2299,6 +2631,9 @@ def main():
                         print("[spout] disabled after repeated failures")
                         spout = None
 
+            if preview is not None and remote.running:   # panel monitor + layer panel (only while a panel is watching):
+                # output frame, preview-only layer mix, or one layer thumbnail; never touches the projector frame
+                guarded("preview", preview.service, remote, disp, scene_prog, scene_vao, uni)
             if st["snap"]:                           # one readback per request, PNG encode off the GL thread
                 st["snap"] = False
                 try:
@@ -2310,19 +2645,38 @@ def main():
                 except Exception as ex:
                     LOG("snapshot", f"failed: {ex}")
 
-            # ---- output pass with corner pin
+            # ---- output pass. One plain corner-pinned surface = the old path, pixel for pixel. Anything more
+            # (several surfaces, masks, glow, feather, spans, the find-it overlay) = every surface drawn from the
+            # one rendered frame, black everywhere else.
             hinv = inverse_homography(corners, hinv)
             st["hinv"] = hinv
             target = test_fbo if headless else ctx.screen
-            target.use()
             fw, fh = (rw, rh) if headless else glfw.get_framebuffer_size(win)
-            ctx.viewport = (0, 0, fw, fh)
-            disp.use(0)
-            out_prog["scene"].value = 0
-            out_prog["Hinv"].write(hinv.T.astype("f4").tobytes())
-            out_prog["grid"].value = 1.0 if st["grid"] else 0.0
-            out_prog["corners"].write(np.array(corners, dtype="f4").tobytes())
-            out_vao.render(moderngl.TRIANGLE_STRIP)
+            multi = surf_draw is not None and map_ref["fails"] < 5 and not mapper.set.trivial()
+            if multi:
+                try:
+                    surf_draw.render(mapper.set, disp, target, (fw, fh), T, float(smr[0]), grid=st["grid"])
+                    map_ref["fails"] = 0
+                except Exception as ex:
+                    map_ref["fails"] += 1
+                    multi = False
+                    print(f"[map] surface output failed ({map_ref['fails']}/5), corner pin only this frame: {ex}")
+            if not multi:
+                target.use()
+                ctx.viewport = (0, 0, fw, fh)
+                disp.use(0)
+                out_prog["scene"].value = 0
+                out_prog["Hinv"].write(hinv.T.astype("f4").tobytes())
+                out_prog["grid"].value = 1.0 if st["grid"] else 0.0
+                out_prog["corners"].write(np.array(corners, dtype="f4").tobytes())
+                out_vao.render(moderngl.TRIANGLE_STRIP)
+
+            if recorder is not None:                 # show recorder: async PBO readback, never waits on the encoder
+                guarded("rec", recorder.frame, {"program": ((fbos[dst], 0), (rw, rh)), "projector": ((target, 0), (fw, fh))})
+                if headless and recorder.active:     # headless recording: real-time pace, since t = frame / 60
+                    lag = (frame + 1) / 60.0 - (time.perf_counter() - t0)
+                    if lag > 0:
+                        time.sleep(lag)
 
             # ---- brightness meter (every 4th frame), on the PRE-limiter level the scene pass left in the echo
             # buffer's alpha: 64x40 box-filtered blocks -> mean level and near-black fraction -> limiter target.
@@ -2379,7 +2733,7 @@ def main():
                     img = Image.frombytes("RGB", (rw, rh), test_fbo.read(components=3)).transpose(Image.FLIP_TOP_BOTTOM)
                     img.save(test_dir / f"frame_{frame:04d}.png")
                     io_time += time.perf_counter() - s0
-                if frame >= args.test:
+                if frame >= args.test and not (recorder is not None and recorder.auto_pending()):
                     ctx.finish()
                     el = time.perf_counter() - t0 - io_time
                     tail = lim_hist[-600:]                # the last 10 s
@@ -2393,12 +2747,18 @@ def main():
     finally:
         # release everything even when an exception is on its way out: GL / context failures are not swallowed,
         # so the process exits non-zero and the watchdog restarts it (ESC / a confirmed close exits 0)
-        for fn in (remote.stop, controller.close, video.close):
+        for fn in (remote.stop, controller.close, video.close, mapper.flush):
             guarded("exit", fn)
+        if gov:
+            guarded("exit", gov.close)
         for ex in extra:
+            if headless and hasattr(ex["obj"], "draws"):          # tests: a layer at 0 must not have drawn at all
+                print(f"[{ex['param']}] draws={ex['obj'].draws}")
             close = getattr(ex["obj"], "close", None) or getattr(ex["obj"], "release", None)
             if close:
                 guarded("exit", close)
+        if recorder is not None:                     # finalize the MP4 (Shift+Esc, crash unwinding, test end)
+            guarded("exit", recorder.close)
         audio.running = False
         glfw.terminate()
 

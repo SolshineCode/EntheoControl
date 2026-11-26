@@ -41,8 +41,39 @@ OPTIONS = {
     "fractal_mode": ["Crystal KIFS", "Mandelbox tunnel", "Hyperbolic tiling", "Apollonian", "Julia jewels", "4D polytope"],
     "serpent_count": [],
     "palette": ["Aya Jewel", "Cosmic Gold/Violet", "Gorge Twilight", "Emerald Shipibo", "Spectral"],
+    # TouchVDMX merge (fx_stack.LandPass)
+    "land_a": ["Sacred corridor", "Torus wormhole", "Prismatic vortex", "Hex dome"],
+    "land_b": ["Sacred corridor", "Torus wormhole", "Prismatic vortex", "Hex dome"],
+    "land_blend": ["Mix", "Add", "Screen", "Difference", "Multiply", "Exclusion", "Divide", "Luma mask"],
+    "land_cam": ["Cruise", "Orbit", "Audio dive"],
+    "land_style": ["Electric chapel", "Floral glass", "Neon gears"],
+    "land_mirror": ["Off", "On"],
+    "art_use": ["Fly-through relief", "Inside the lines", "Kaleidoscope", "Tunnel walls", "Displace pattern", "Full frame melt"],
+    "art_source": ["Art piece", "AI texture"],
 }
-OPTIONS = {k: v for k, v in OPTIONS.items() if k in PARAMS}
+
+
+def merge_options(base, extra, known):
+    """Option labels for stepped params: control's own table plus params.OPTIONS (if a module declares names next
+    to its params). Later wins; unknown params and anything that is not a list of labels are dropped."""
+    out = {}
+    for src in (base, extra if isinstance(extra, dict) else {}):
+        for k, v in src.items():
+            if k in known and isinstance(v, (list, tuple)):
+                out[k] = [str(x)[:40] for x in v]
+    return out
+
+
+import params as _params  # noqa: E402  (params.OPTIONS is optional)
+try:                                                 # text layer: the words / phrase list state and its commands
+    import text_layer as _textlayer                  # (the pure-python part of text_layer.py; no GL is imported)
+except ImportError:
+    _textlayer = None
+try:                                                 # ONLINE plugin hooks (pure python; the plugin itself is only
+    from plugins.online import protocol as _online   # imported when the performer switches ONLINE on)
+except Exception:
+    _online = None
+OPTIONS = merge_options(OPTIONS, getattr(_params, "OPTIONS", None), PARAMS)
 # stepped params: no slew, snap at the morph midpoint (palette is fractional by contract, so it glides)
 DISCRETE = [n for n in OPTIONS if n != "palette"] + [n for n in ("art_index",) if n in PARAMS]
 MAX_PROMPT = 500
@@ -103,7 +134,7 @@ def valid_target(t):
     if not isinstance(t, str) or len(t) > 48:
         return False
     if t in ("tap", "autopilot", "drift", "resync", "shift", "panic", "bpm", "next_video", "next", "art_prev",
-             "art_next"):
+             "art_next", "xfade", "rec"):
         return True
     p = t.split(":")
     try:
@@ -119,6 +150,8 @@ def valid_target(t):
             return 0 <= float(p[1]) <= 64
         if p[0] == "quantize" and len(p) == 2:
             return p[1] in QUANT
+        if p[0] == "bypass" and len(p) == 2:
+            return p[1] in BYPASS_COVER
         if p[0] == "ripple" and len(p) == 3:
             return 0 <= float(p[1]) <= 1 and 0 <= float(p[2]) <= 1
     except ValueError:
@@ -224,6 +257,61 @@ def _v_gen(c):
     return out
 
 
+SEQ_STEPS = 16
+SEQ_DEFAULT = dict(vals=[0.85, 0.2, 0.5, 0.3, 0.9, 0.4, 0.65, 0.25, 0.8, 0.35, 0.55, 0.45, 0.95, 0.3, 0.7, 0.5],
+                   gates=[1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0])
+
+
+def _clean_seq(raw):
+    """Step sequencer pattern from untrusted JSON; anything malformed falls back to the default per field."""
+    out = dict(vals=list(SEQ_DEFAULT["vals"]), gates=list(SEQ_DEFAULT["gates"]))
+    if isinstance(raw, dict):
+        v, g = raw.get("vals"), raw.get("gates")
+        if isinstance(v, list) and len(v) == SEQ_STEPS and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in v):
+            out["vals"] = [min(1.0, max(0.0, float(x))) for x in v]
+        if isinstance(g, list) and len(g) == SEQ_STEPS and all(x in (0, 1, True, False) for x in g):
+            out["gates"] = [int(bool(x)) for x in g]
+    return out
+
+
+def _v_seq(c):
+    out = {"cmd": "seq", "i": _int(c, "i", 0, SEQ_STEPS - 1)}
+    if "v" in c:
+        out["v"] = _num(c, "v", 0.0, 1.0)
+    if "g" in c:
+        out["g"] = _bool(c, "g")
+    if len(out) == 2:
+        raise ValueError("'seq' needs 'v' (step value) or 'g' (gate)")
+    return out
+
+
+def _v_xfade(c):
+    """Scene A/B crossfader: a / b = deck slots (-1 = empty), x = fader 0 (A) .. 1 (B). Any subset, at least one."""
+    out = {"cmd": "xfade"}
+    for k in ("a", "b"):
+        if k in c:
+            out[k] = _int(c, k, -1, N_SCENES - 1)
+    if "x" in c:
+        out["x"] = _num(c, "x", 0.0, 1.0)
+    if len(out) == 1:
+        raise ValueError("'xfade' needs 'a', 'b' or 'x'")
+    return out
+
+
+# BYPASS: a layer / tab switched off and on again to exactly the same settings (tables: params.NEUTRAL etc.)
+BYPASS_COVER = _params.bypass_cover()
+BYPASS_FADE, BYPASS_FADE_MAX = 0.3, 5.0          # s; 0 = instant
+
+
+def _v_bypass(c):
+    """{"cmd": "bypass", "key": layer / tab / "fx", "on": bool}; without "on" it toggles."""
+    out = {"cmd": "bypass", "key": _name(c, BYPASS_COVER, "key")}
+    if "on" in c and c["on"] is not None:
+        out["on"] = _bool(c, "on")
+    return out
+
+
 def passthrough(kind, **extra):
     """A command for the render engine. Carries both "cmd" and "type" so either key can be matched."""
     return dict(extra, cmd=kind, type=kind)
@@ -262,7 +350,16 @@ _VALIDATORS = {
     "midi_learn": _v_learn,
     "midi_clear": _v_clear,
     "midi_defaults": lambda c: {"cmd": "midi_defaults"},
+    "seq": _v_seq,
+    "seq_rand": lambda c: {"cmd": "seq_rand"},
+    "xfade": _v_xfade,
+    "bypass": lambda c: _v_bypass(c),
+    "bypass_fade": lambda c: {"cmd": "bypass_fade", "v": _num(c, "v", 0.0, BYPASS_FADE_MAX)},
 }
+if _textlayer is not None:                           # text, text_phrases, text_add, text_del, text_go, text_cycle
+    _VALIDATORS.update(_textlayer.VALIDATORS)
+if _online is not None:                              # {"cmd": "online", "op": ...}: plugins/online/protocol.py
+    _VALIDATORS["online"] = _online.validate
 CONTROL_CMDS = frozenset(_VALIDATORS)
 
 
@@ -348,7 +445,9 @@ def meta():
                      stepped=n in DISCRETE) for n, v in PARAMS.items()],
         groups=list(dict.fromkeys(v[3] for v in PARAMS.values())),
         triggers=list(TRIGGERS), sources=list(MOD_SOURCES), n_scenes=N_SCENES, quantize=list(QUANT),
-        clock_sources=list(CLOCK_SOURCES), cue_cc={str(k): v for k, v in CUE_CC.items()})
+        clock_sources=list(CLOCK_SOURCES), cue_cc={str(k): v for k, v in CUE_CC.items()},
+        bypass=dict(keys=list(BYPASS_COVER), cover={k: list(v) for k, v in BYPASS_COVER.items()},
+                    group_key=dict(_params.BYPASS_GROUP_KEY)))
 
 
 # ------------------------------------------------------------------ factory scenes
@@ -377,15 +476,15 @@ def factory_scenes():
     s[3] = _scene("Crawl", symmetry=0.0, flow=0.6, flow_dir=0.125, density=0.65, l_kene=1.0, l_beads=0.3,
                   l_lines=0.2, swim=0.4, palette=3,
                   mods={"flow_dir": [_m("lfo_sine", 0.08, 32)], "wave": [_m("mid", 0.5)]})
-    s[4] = _scene("Jewel pulse", folds=6, density=0.7, chase=0.9, saturation=1.25, l_beads=1.0, l_kene=0.5,
-                  palette=0, mods={"zoom": [_m("bass", 0.15)], "chase": [_m("lfo_saw", 0.3, 4)]})
+    s[4] = _scene("Jewel pulse", folds=6, density=0.7, chase=0.75, chase_width=0.35, saturation=1.25, l_beads=1.0, l_kene=0.5,
+                  palette=0, mods={"zoom": [_m("bass", 0.15)], "chase": [_m("lfo_saw", 0.3, 4)]})   # was chase 0.9: near-black
     s[5] = _scene("Vortex", travel=0.3, travel_mode=3, twirl=0.7, rotate=-0.3, folds=10, zoom=0.2, swim=0.6, trails=0.94, palette=4,
                   mods={"twirl": [_m("lfo_sine", 0.3, 16)], "hue": [_m("lfo_saw", 0.5, 32)]})
     s[6] = _scene("Serpent liquid", serpent=0.7, serpent_mode=2, serpent_wiggle=0.7, symmetry=0.5, swim=0.9, wave=0.6, bulge=0.3, speed=0.8, l_ai=0.9, l_kene=0.6,
                   palette=2, mods={"bulge": [_m("lfo_sine", 0.4, 8)], "swim": [_m("mid", 0.3)]})
-    s[7] = _scene("Peak", folds=16, speed=1.5, rotate=0.4, density=0.8, chase=1.0, saturation=1.3, trails=0.8,
+    s[7] = _scene("Peak", folds=16, speed=1.5, rotate=0.4, density=0.8, chase=0.8, chase_width=0.35, saturation=1.3, trails=0.8,
                   palette=1, mods={"zoom": [_m("bass", 0.3), _m("lfo_saw", 0.15, 4)], "twirl": [_m("random", 0.3, 4)],
-                                   "hue": [_m("high", 0.15)]})
+                                   "hue": [_m("high", 0.15)]})                                      # was chase 1.0: near-black
     return s
 
 
@@ -558,6 +657,14 @@ class Controller:
         self._rand = {}                                # (name, slot) -> (cycle, value) sample-and-hold
         self._pal_speed = 0.0
         self._pal_target = self.base["palette"]
+        self.seq = _clean_seq(None)                    # 16-step sequencer feeding the "seq" / "seq_gate" mod sources
+        self.xfade = dict(a=-1, b=-1, x=0.0)           # scene A/B crossfader (decks are scene slots)
+        self.text = _textlayer.TextState() if _textlayer is not None else None   # words on show, font, phrase list + auto-cycle
+        self._xside = None
+        self._xf_cc, self._xf_live = None, False       # MIDI crossfader pickup state
+        self.bypass = set()                            # bypassed keys (BYPASS_COVER): outputs pulled to params.NEUTRAL
+        self.bypass_fade = BYPASS_FADE                 # s to cross-fade a bypass in / out
+        self._byp = {}                                 # key -> level 0..1 (the fade)
 
         # clock
         self.bpm = min(BPM_MAX, max(BPM_MIN, float(bpm)))
@@ -616,8 +723,13 @@ class Controller:
         here = Path(__file__).resolve().parent
         self.ai = AIClient([self.dir / ".remote_token", here / ".remote_token"], url=ai_url, start=bool(ai))
 
+        self.ext = {}                                  # settings owned by other modules (governor.py: ext.governor.mode)
+        self.edits, self.panics = {}, 0                # per-param count of direct set() moves; PANIC count
         self.restored = self._restore() if restore else False
         self._save_t = self.now()
+        self.online = None                             # plugins/online: loaded only while ext.online.on is true
+        if _online is not None:
+            _online.boot(self)
 
     # ================================================================ public API (params.StaticController)
 
@@ -631,6 +743,7 @@ class Controller:
         if not math.isfinite(v):
             return
         self.base[name] = clamp(name, v)
+        self.edits[name] = self.edits.get(name, 0) + 1  # direct moves only (governor.py: the user wins)
         if self._morph:
             self._morph["names"].discard(name)         # a hand on the fader overrides the morph
 
@@ -698,6 +811,7 @@ class Controller:
 
     def panic(self):
         """Failover: clear every trigger, cancel pending recalls / morphs, snap to the safe scene."""
+        self.panics += 1                               # governor.py drops a pending suggestion / countdown
         for n in TRIGGERS:
             self.held[n] = False
             self.base[n] = PARAMS[n][2]
@@ -706,6 +820,8 @@ class Controller:
         self.learn = None
         self.auto["on"] = False                        # nothing may move the look away from the safe scene
         self._auto_next = None
+        if _online is not None:
+            _online.on_panic(self)                     # drops the assistant's queue, its autopilot -> suggest
         safe = self.scenes[self.safe] if 0 <= self.safe < N_SCENES else None
         if safe:
             self._start_recall(self.safe, 0.0)
@@ -720,6 +836,8 @@ class Controller:
 
     def close(self):
         self._autosave()
+        if _online is not None:
+            _online.close(self)
         for part in (self.midi, self.ai, self.linkb):
             try:
                 part.close()
@@ -746,6 +864,14 @@ class Controller:
             return self.bands[1]
         if src == "high":
             return self.bands[2]
+        if src in ("seq", "seq_gate"):                 # the 16 steps span rate * 4 beats (rate 1 = sixteenths, one bar)
+            pos = beat * 4.0 / m["rate"] + m["phase"] * SEQ_STEPS
+            i = int(math.floor(pos)) % SEQ_STEPS
+            f = pos - math.floor(pos)
+            if src == "seq_gate":
+                return math.exp(-6.0 * f) if self.seq["gates"][i] else 0.0
+            a, b = self.seq["vals"][i - 1], self.seq["vals"][i]
+            return b if f >= 0.15 else a + (b - a) * (f / 0.15)        # short glide into each step: no clicks
         ph = beat / m["rate"] + m["phase"]
         cyc = math.floor(ph)
         f = ph - cyc
@@ -776,7 +902,61 @@ class Controller:
                 total += m["amt"] * self._source(m, name, slot, beat)
         return total
 
+    # ---------------------------------------------------------------- bypass
+
+    def set_bypass(self, key, on=None):
+        """Switch a layer / tab / "fx" off (on=True means bypassed) or back on; on=None toggles."""
+        if key not in BYPASS_COVER:
+            return
+        if on is None:
+            on = key not in self.bypass
+        (self.bypass.add if on else self.bypass.discard)(key)
+
+    def _step_bypass(self, dt):
+        """Advance the fades; returns {param: weight 0..1 towards neutral}."""
+        step = 1.0 if self.bypass_fade <= 0 else dt / self.bypass_fade
+        for key in set(self._byp) | self.bypass:
+            lvl = self._byp.get(key, 0.0)
+            lvl = min(1.0, lvl + step) if key in self.bypass else max(0.0, lvl - step)
+            if lvl <= 0.0 and key not in self.bypass:
+                self._byp.pop(key, None)
+            else:
+                self._byp[key] = lvl
+        w = {}
+        for key, lvl in self._byp.items():
+            for n in BYPASS_COVER[key]:
+                if lvl > w.get(n, 0.0):
+                    w[n] = lvl
+        return w
+
     # ---------------------------------------------------------------- scenes
+
+    def set_xfade(self, a=None, b=None, x=None):
+        """Scene A/B crossfader: the faders sit at a hand-set blend of two saved scenes. Continuous params
+        interpolate; stepped params and the modulation set flip at the middle. Empty decks leave the look alone."""
+        xf = self.xfade
+        if a is not None:
+            xf["a"] = int(a)
+        if b is not None:
+            xf["b"] = int(b)
+        if a is not None or b is not None:
+            self._xside = None
+        if x is None:
+            return
+        xf["x"] = x = min(1.0, max(0.0, float(x)))
+        sa = self.scenes[xf["a"]] if 0 <= xf["a"] < N_SCENES else None
+        sb = self.scenes[xf["b"]] if 0 <= xf["b"] < N_SCENES else None
+        if sa is None or sb is None:
+            return
+        self.pending = self._morph = None
+        for n in CONT:
+            va, vb = sa["base"][n], sb["base"][n]
+            self.base[n] = (vb if x >= 0.5 else va) if n in DISCRETE else va + (vb - va) * x
+        side = "b" if x >= 0.5 else "a"
+        if side != self._xside:
+            self._xside = side
+            self.mods = _copy_mods((sb if side == "b" else sa)["mods"])
+        self.cur = xf["a"] if x <= 0.0 else xf["b"] if x >= 1.0 else -1
 
     def scene_save(self, i):
         if not 0 <= i < N_SCENES:
@@ -906,7 +1086,10 @@ class Controller:
     def _settings(self):
         return dict(bpm=round(self.bpm, 3), clock_src=self.clock_src, strobe_rate=self.strobe_rate,
                     latch=dict(self.latch), morph=self.morph_bars, quantize=self.quantize, glide=self.glide_bars,
-                    safe=self.safe, cue_ch=self.cue_ch, autopilot=dict(self.auto))
+                    safe=self.safe, cue_ch=self.cue_ch, autopilot=dict(self.auto),
+                    seq=dict(vals=list(self.seq["vals"]), gates=list(self.seq["gates"])),
+                    text=self.text.to_json() if self.text is not None else None,
+                    bypass=sorted(self.bypass), bypass_fade=self.bypass_fade, ext=dict(self.ext))
 
     def _autosave(self):
         if not self.autosave:
@@ -940,6 +1123,17 @@ class Controller:
                     self._do(validate(cmd))
                 except Exception:
                     pass                               # one bad field does not spoil the rest
+            self.seq = _clean_seq(s.get("seq"))
+            if isinstance(s.get("ext"), dict):         # other modules' settings (small JSON dicts, keyed by module)
+                self.ext = {k: v for k, v in s["ext"].items() if isinstance(k, str) and isinstance(v, dict)}
+            if self.text is not None:
+                self.text.restore(s.get("text"))
+            if isinstance(s.get("bypass"), list):      # come back already bypassed: no fade-out on the projector
+                self.bypass = {k for k in s["bypass"] if isinstance(k, str) and k in BYPASS_COVER}
+                self._byp = {k: 1.0 for k in self.bypass}
+            f = s.get("bypass_fade")
+            if isinstance(f, (int, float)) and not isinstance(f, bool) and math.isfinite(f):
+                self.bypass_fade = min(BYPASS_FADE_MAX, max(0.0, float(f)))
             if isinstance(s.get("latch"), dict):
                 for n in TRIGGERS:
                     if isinstance(s["latch"].get(n), bool):
@@ -1042,15 +1236,38 @@ class Controller:
             self.midi.clear(c["target"])
         elif cmd == "midi_defaults":
             self.midi.reset_defaults()
+        elif cmd == "seq":
+            if "v" in c:
+                self.seq["vals"][c["i"]] = c["v"]
+            if "g" in c:
+                self.seq["gates"][c["i"]] = int(c["g"])
+        elif cmd == "seq_rand":
+            self.seq = dict(vals=[round(self.rng.random(), 3) for _ in range(SEQ_STEPS)],
+                            gates=[int(self.rng.random() > 0.45) for _ in range(SEQ_STEPS)])
+        elif cmd == "bypass":
+            self.set_bypass(c["key"], c.get("on"))
+        elif cmd == "bypass_fade":
+            self.bypass_fade = c["v"]
+        elif self.text is not None and cmd in _textlayer.TEXT_CMDS:
+            self.text.do(c)
+        elif cmd == "xfade":
+            self.set_xfade(c.get("a"), c.get("b"), c.get("x"))
+            self._xf_cc, self._xf_live = None, False   # the panel moved it: a MIDI fader must pick it up again
         elif cmd == "gen":
             job = {k: v for k, v in c.items() if k != "cmd"}
-            if job["init"] == "snapshot":              # the engine writes snapshots/current.png first
+            if _online is not None and _online.take_gen(self, job):
+                pass                                   # Nano Banana engine (ONLINE on); falls back to self.ai itself
+            elif job["init"] == "snapshot":            # the engine writes snapshots/current.png first
                 self._out.append(passthrough("snapshot"))
                 self.ai.submit(job, delay=0.3)
             else:
                 self.ai.submit(job)
         elif cmd == "gen_cancel":
             self.ai.cancel()
+            if _online is not None:
+                _online.cancel_gen(self)
+        elif cmd == "online":
+            _online.do(self, c)
         elif cmd == "art_step":
             self.art_step(c["d"])
         elif cmd == "art_deleted":                     # piece i left the library: keep the same piece on screen
@@ -1141,6 +1358,16 @@ class Controller:
         elif target == "bpm":
             if kind == "cc":
                 self.set_bpm(60.0 + 120.0 * val / 127.0)
+        elif p[0] == "bypass":
+            if press:                                  # a pad kills / restores a layer or a tab
+                self.set_bypass(p[1])
+        elif target == "xfade":
+            if kind == "cc":                           # soft takeover: a physical fader that is somewhere else does
+                v, last, cur = val / 127.0, self._xf_cc, self.xfade["x"]     # nothing until it reaches the position
+                self._xf_cc = v
+                if self._xf_live or abs(v - cur) <= 0.05 or (last is not None and (last - cur) * (v - cur) <= 0):
+                    self._xf_live = True
+                    self.set_xfade(x=v)
         elif not press:
             return                                     # everything below fires on press only
         elif p[0] == "scene":
@@ -1165,6 +1392,8 @@ class Controller:
             self.panic()
         elif target in ("next_video", "next"):
             self._out.append(passthrough(target))
+        elif target == "rec":                          # show recorder start / stop (recorder.py)
+            self._out.append(passthrough("rec", op="toggle"))
         elif target in ("art_prev", "art_next"):
             self.art_step(-1 if target == "art_prev" else 1)
 
@@ -1300,6 +1529,11 @@ class Controller:
                 m += self._drift[n][1] * drift_amt * 0.5
             vals[n] = min(hi, max(lo, self._sm[n] + m * (hi - lo)))
 
+        # bypass: the finished values of covered params are pulled to neutral; nothing stored is touched
+        if self.bypass or self._byp:
+            for n, w in self._step_bypass(dt).items():
+                vals[n] += (_params.NEUTRAL[n] - vals[n]) * w
+
         decay = math.exp(-dt / ENV_TAU)
         for n in self.env:
             self.env[n] = 1.0 if self.held[n] else (self.env[n] * decay if self.env[n] > 2e-3 else 0.0)
@@ -1324,8 +1558,21 @@ class Controller:
             except Exception:
                 pass
 
+        if self.text is not None:                      # phrase auto-cycle on the beat; new words go to the engine
+            try:
+                self.text.tick(self.beat)
+                show = self.text.pop_show()
+                if show is not None:
+                    self._out.append(passthrough("text_show", **show))
+            except Exception:
+                pass
         for name in self.ai.pop_shown():               # a finished "show when ready" job: crossfade to it
             self._out.append(passthrough("show_texture", name=name))
+        if self.online is not None:                    # ONLINE plugin: finished assistant replies / online images
+            try:
+                _online.tick(self)
+            except Exception:
+                pass
 
         ev, self.events = self.events, []
         return Frame(values=dict(self.values), events=ev, clock=self._clock())
@@ -1365,4 +1612,9 @@ class Controller:
                       last=self.midi_last, cue_ch=self.cue_ch, n=len(self.midi.bindings),
                       bound=self.midi.targets()),
             ai=self.ai.status(),
+            seq=dict(vals=[r(x) for x in self.seq["vals"]], gates=list(self.seq["gates"])),
+            xfade=dict(self.xfade),
+            text=self.text.state() if self.text is not None else None,
+            bypass=sorted(self.bypass), bypass_fade=self.bypass_fade,
+            online=_online.state(self) if _online is not None else dict(on=False, missing=True),
         )
