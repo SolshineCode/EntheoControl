@@ -56,7 +56,8 @@ HIST_DT = 1.0 / 30.0          # ring cadence (time based, so the smear length do
 GRID_LONG, GRID_SHORT = 320, 200
 FOV_DEG = 38.0
 DETAIL_GAIN = 0.14            # how much luminance emboss rides on top of the base depth
-UNIT0 = 9                     # texture units 9..15 are used and left bound (the compositor uses 0..5)
+UNIT0 = 9                     # texture units 9..15 are used and left bound: a compositor sampler must not live there
+                              # (live_visuals: 0..5 scene, 6 beings, 7 land, 8 flat art; tests/test_beings.py checks beings)
 
 # copy of live_visuals.PALETTES (5 RGB stops each): only used by the optional light chase
 PALETTES = [
@@ -887,6 +888,25 @@ def _clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
+DISPLACERS = ("art_melt", "art_liquify", "art_slices", "art_smear")   # they move pixels: their sum is what turns to mush
+REMAPS = ("art_fold", "art_droste")                                   # structural: they re-map the picture, kept as set
+
+
+def limit_distortion(values):
+    """Internal limiter for the art distortions -> {name: effective amount 0..1} for the six of them.
+
+    Any one displacer at full, or two at 0.75, plays exactly as set. Beyond a combined budget of 1.5 (less when
+    fold / Droste are up: 0.8 with both at full) the displacers are scaled down together, keeping their
+    proportions, so the piece stays legible however many faders are pushed. Continuous: nothing jumps."""
+    out = {k: _clamp(_f(values, k), 0.0, 1.0) for k in DISPLACERS + REMAPS}
+    total = sum(out[k] for k in DISPLACERS)
+    budget = 1.5 - 0.35 * (out["art_fold"] + out["art_droste"])
+    if total > budget:
+        for k in DISPLACERS:
+            out[k] *= budget / total
+    return out
+
+
 # ----------------------------------------------------------------------------------------------------------
 # the pass
 # ----------------------------------------------------------------------------------------------------------
@@ -1068,6 +1088,22 @@ class ArtPass:
                 if data is not None or bad:
                     self._result = (key, data)
                 self._busy = None
+
+    def source(self, values, dt):
+        """Keep the library / uploads going without drawing the relief -> (colour texture, aspect) of the piece
+        on show, or None while there is none. For the compositor's other ways of using the image (art_use)."""
+        try:
+            dt = _clamp(float(dt) if math.isfinite(float(dt)) else 0.0, 0.0, 0.25)
+            self._update_library(values, dt)
+            key = self._b if (self._fading and self._b and self._mixv > 0.5) else self._a
+            piece = self._cache.get(key) if key else None
+            if piece is None and self._a:
+                piece = self._cache.get(self._a)
+            self._hist_valid = 0                                   # the relief's slit-scan history is stale when it comes back
+            return (piece.color, float(piece.aspect)) if piece is not None else None
+        except Exception as ex:
+            self.stats["error"] = repr(ex)
+            return None
 
     def library(self):
         """Names currently in the library, in art_index order."""
@@ -1304,7 +1340,8 @@ class ArtPass:
         self._chase_ph = (self._chase_ph + dbeat / 4.0 * _f(values, "chase_rate")) % 64.0
         kick = math.exp(-4.0 * (bphase % 1.0))
         self._pulse += (kick - self._pulse) * (1.0 - math.exp(-adt / 0.035)) if adt > 0 else 0.0
-        melt, liq = _clamp(_f(values, "art_melt"), 0, 1), _clamp(_f(values, "art_liquify"), 0, 1)
+        lim = limit_distortion(values)                             # many distortions at once share one budget
+        melt, liq = lim["art_melt"], lim["art_liquify"]
         self._flow_t = (self._flow_t + adt * (0.10 + 0.10 * melt + 0.08 * liq)) % 1024.0
         self._fold_rot = (self._fold_rot + adt * 0.12 * _f(values, "rotate")) % math.tau
         dtravel = 0.0 if self._last_travel is None else travel_z - self._last_travel
@@ -1328,9 +1365,14 @@ class ArtPass:
         yaw_a = yaw * 0.95 + drift * 0.24 * math.sin(t * 0.23)
         pitch_a = pitch * 0.75 + drift * 0.15 * math.sin(t * 0.31 + 1.0)
         roll_a = roll * math.pi * 0.5 + drift * 0.05 * math.sin(t * 0.17 + 2.0)
+        try:                                                       # the engine's barrel roll (param "spin", already an angle)
+            spin = float(values.get("spin_phase", 0.0))
+            roll_a += spin if math.isfinite(spin) else 0.0
+        except (TypeError, ValueError):
+            pass
         relief = _clamp(_f(values, "art_relief"), 0, 1)
         breathe = _clamp(_f(values, "art_breathe"), 0, 1)
-        slices = _clamp(_f(values, "art_slices"), 0, 1)
+        slices = lim["art_slices"]
         amp = relief * 0.85 * (1.0 + breathe * (0.55 * self._pulse - 0.12 + 0.10 * math.sin(t * 0.8)))
         tanf = math.tan(math.radians(FOV_DEG) * 0.5)
         d0 = 1.0 / (tanf * 0.95)
@@ -1401,7 +1443,7 @@ class ArtPass:
 
         # ---- output
         pp = self._post_prog
-        for k, v in dict(u_smear=_clamp(_f(values, "art_smear"), 0, 1), u_valid=float(self._hist_valid),
+        for k, v in dict(u_smear=lim["art_smear"], u_valid=float(self._hist_valid),
                          u_head=float(self._hist_head), u_age=self._hist_acc / HIST_DT).items():
             if k in pp:
                 pp[k].value = v

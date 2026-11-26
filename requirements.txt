@@ -16,3 +16,9 @@ transformers>=4.45
 accelerate>=1.0
 # Tests
 pytest>=8
+# Health monitor
+psutil>=5.9
+# Online plugin (optional): ConPTY for the agy CLI backend
+pywinpty>=2.0
+# Panel browser tests (optional)
+playwright>=1.40

@@ -30,6 +30,7 @@ class AIClient:
         self._wake = threading.Event()
         self._thread = None
         self.enabled = bool(start)
+        self.hold = False               # governor.py: True = keep new jobs queued here (sent once released)
         if start:
             self._thread = threading.Thread(target=self._run, name="ai-link", daemon=True)
             self._thread.start()
@@ -40,6 +41,13 @@ class AIClient:
             if len(self._jobs) < 32:
                 self._jobs.append((time.monotonic() + max(0.0, delay), dict(job)))
         self._wake.set()
+
+    def set_hold(self, on):
+        """Resource governor: hold (True) or release new jobs. Releasing wakes the link so queued jobs go now."""
+        with self._lock:
+            self.hold = bool(on)
+        if not on:
+            self._wake.set()
 
     def cancel(self):
         with self._lock:
@@ -101,16 +109,24 @@ class AIClient:
             raise ValueError("unexpected reply")
         return out
 
+    def _take_due(self, now):
+        """Pop the jobs whose time has come (none while held by the resource governor)."""
+        with self._lock:
+            if self.hold:
+                return []
+            due = [j for t, j in self._jobs if t <= now]
+            self._jobs = [(t, j) for t, j in self._jobs if t > now]
+            return due
+
     def _run(self):
         next_poll = 0.0
         while not self._stop.is_set():
             try:
                 now = time.monotonic()
+                due = self._take_due(now)
                 with self._lock:
-                    due = [j for t, j in self._jobs if t <= now]
-                    self._jobs = [(t, j) for t, j in self._jobs if t > now]
                     cancel, self._cancel = self._cancel, False
-                    wait = min([t - now for t, _ in self._jobs] + [self.poll_s])
+                    wait = min([t - now for t, _ in self._jobs if not self.hold] + [self.poll_s])
                 if cancel:
                     self._try(lambda: self._http("/cancel", {}), "cancel")
                     with self._lock:

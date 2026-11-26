@@ -26,7 +26,15 @@ It was built for and tested on a GTX 1650 Ti (4 GB) driving a 1280x800 short-thr
   - flash, strobe, freeze, blackout and a PANIC button
   - MIDI learn, with default maps for the APC mini mk2 and Launch Control XL
   - gamepad flying
-- **Mapping:** corner-pin keystone that you drag from the panel.
+- **Beings:** 17 living and supernatural forms (anaconda spirit, feathered dragon, jaguar spirit, jellyfish, all-seeing eyes, whale, kittens and more), with colour modes for beings and serpents.
+- **3D decks** (from a TouchDesigner/VDMX-style prototype merge): four raymarched worlds on an A/B deck with blend modes, a particle swarm, a step sequencer, a scene crossfader, and an output monitor.
+- **Art and AI image modes:** relief, stencil, kaleidoscope, tunnel walls, displace and melt, from uploaded art or AI images. Spin and corkscrew work in every travel mode.
+- **Text layer:** SDF text with any installed font, movement modes, and weave/mask/knockout/warp integration.
+- **Multi-surface mapping:** boxes and sculpture faces, with angle and edge readouts, masks, edge glow, spanned or whole-frame content, and undo.
+- **Power buttons:** every tab and layer turns fully off and back on to identical settings. ALL FX turns everything off at once.
+- **Health monitor:** fps, GPU, VRAM, temperature and battery, with suggest/auto degradation that restores itself.
+- **Recording:** MP4 via NVENC, laptop audio on or off, a replay buffer, and a choice of program or projector output.
+- **Online plugin (off by default):** a Claude Code / agy assistant that drives the show through a validated, photosensitive-safe command allowlist, plus optional Nano Banana image generation.
 - **Local AI (optional):**
   - `ai_worker.py` runs SD-Turbo for prompt-to-texture in about 2.5 s on a 4 GB card.
   - It can also dream from the current frame.
@@ -42,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File run_show.ps1
 ```
 - **Projector:** extend your desktop onto it first. The show opens on monitor 1 and the panel opens in your browser.
 - **Quit:** Shift+Esc.
-- **More:** see [QUICKSTART.md](QUICKSTART.md) for setup, panel tabs, keys and a first mapping exercise.
+- **More:** [WALKTHROUGH.md](WALKTHROUGH.md) is a 45-minute guided first session. [QUICKSTART.md](QUICKSTART.md) is the full reference.
 - **Headless checks:**
   - `python live_visuals.py --test 90` renders 90 frames and reports fps and frame health.
   - `--gallery` renders sample stills.

@@ -1,0 +1,137 @@
+"""OnlinePlugin: the object behind the ONLINE switch. Created by protocol._load() when the switch goes ON,
+closed (worker threads stopped, child processes killed) when it goes OFF. Importing this module is what makes
+subprocess-capable code reachable; control.py never imports it directly.
+"""
+import os
+import time
+from pathlib import Path
+
+from . import protocol
+from .assistant import Assistant, OnlineLog
+from .backends import AgyBackend, ClaudeBackend
+from .images import AgyImageProvider, GeminiApiProvider, GeminiNanoProvider, KeyStore, NanoBanana
+
+PRIVACY_NOTE = ("ONLINE is on: chat messages + the current settings go to the chosen assistant (Anthropic / Google); "
+                "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.")
+CLI_NOTE = ("Driving Google's CLIs (agy / gemini CLI) from other software may not be allowed by Antigravity's terms "
+            "(https://antigravity.google/terms): read them and decide before ticking this.")
+TEX_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def list_names(folder, cap=24, prefix=None):
+    """Image file names in a folder, newest first (plain os.scandir: a few dozen entries, microseconds)."""
+    out = []
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                n = e.name
+                if (e.is_file() and n.lower().endswith(TEX_EXT) and not n.lower().endswith(".depth.png")
+                        and not n.startswith(".") and (prefix is None or n.startswith(prefix))):
+                    out.append((e.stat().st_mtime, n))
+    except OSError:
+        return []
+    return [n for _, n in sorted(out, reverse=True)[:cap]]
+
+
+class OnlinePlugin:
+    def __init__(self, root, art_dir=None, settings=None, backends=None, image_providers=None, log_dir="auto",
+                 tex_dir=None, snapshot=None, work_root=None, clock=time.monotonic, sync=False):
+        self.root = Path(root)
+        self.tex_dir = Path(tex_dir) if tex_dir else self.root / "textures"
+        self.art_dir = Path(art_dir) if art_dir else self.root / "art"
+        s = dict(protocol.DEFAULTS, **(settings or {}))
+        self.engine, self.cli_google = s["engine"], bool(s.get("cli_google"))
+        self.keys = KeyStore(self.root / "online_keys.json")
+        self._fixed_providers = image_providers is not None
+        self.log = OnlineLog(self.root / "logs" if log_dir == "auto" else log_dir)
+        work = Path(work_root) if work_root else self.root / "logs" / "online_work"
+        if backends is None:
+            backends = {"claude": ClaudeBackend(model=os.environ.get("ONLINE_CLAUDE_MODEL") or "sonnet"),
+                        "agy": AgyBackend(work, model=os.environ.get("ONLINE_AGY_MODEL") or None)}
+        self.assistant = Assistant(backends, log=self.log, lister=self._lister, clock=clock, sync=sync,
+                                   mode=s["mode"], backend=s["backend"])
+        self.images = NanoBanana(self.tex_dir, Path(snapshot) if snapshot else self.root / "snapshots" / "current.png",
+                                 work, providers=image_providers if self._fixed_providers else self._providers(),
+                                 log=self.log, clock=clock, sync=sync)
+        self.assistant.optin = {} if self.cli_google else {"agy": CLI_NOTE}
+        self.log.log("online", on=True, mode=s["mode"], backend=s["backend"], engine=s["engine"])
+
+    def _lister(self):
+        return list_names(self.tex_dir), list_names(self.art_dir)
+
+    def _providers(self):
+        """Recommended: the Gemini API with the user's own key. Google's CLIs only after the explicit opt-in."""
+        out = [GeminiApiProvider(self.keys)]
+        if self.cli_google:
+            out += [GeminiNanoProvider(), AgyImageProvider()]
+        return out
+
+    def configure(self, s):
+        self.assistant.mode, self.assistant.backend, self.engine = s["mode"], s["backend"], s["engine"]
+        if bool(s.get("cli_google")) != self.cli_google:
+            self.cli_google = bool(s.get("cli_google"))
+            self.assistant.optin = {} if self.cli_google else {"agy": CLI_NOTE}
+            if not self._fixed_providers:
+                self.images.set_providers(self._providers())
+        self.log.log("settings", mode=s["mode"], backend=s["backend"], engine=s["engine"], cli_google=self.cli_google)
+
+    # ---------------------------------------------------------------- hooks (GL thread)
+    def command(self, ctl, c):
+        op = c["op"]
+        a = self.assistant
+        if op == "ask":
+            a.ask(ctl, c["text"], c.get("backend"))
+        elif op == "apply":
+            a.apply(ctl, c["id"])
+        elif op == "dismiss":
+            a.dismiss(c["id"])
+        elif op == "undo":
+            a.undo(ctl, c["id"])
+        elif op == "cancel":
+            a.cancel()
+            self.images.cancel()
+        elif op == "clear":
+            a.clear()
+        elif op == "key":
+            ok = self.keys.set(c["key"])
+            self.images.set_providers(self.images.providers)          # availability changed
+            self.log.log("key", saved=bool(c["key"]) and ok, forgotten=not c["key"])   # never the key itself
+
+    def tick(self, ctl):
+        self.assistant.tick(ctl)
+        self.images.tick(ctl)
+
+    def take_gen(self, ctl, job):
+        """AI DREAM image job: True = Nano Banana has it (it falls back to ctl.ai by itself on any failure)."""
+        if self.engine != "nano":
+            return False
+        delay = 0.0
+        if job.get("init") == "snapshot":                # the engine writes snapshots/current.png first
+            import control
+            ctl._out.append(control.passthrough("snapshot"))
+            delay = 0.6
+        self.images.submit(job, delay=delay)
+        return True
+
+    def cancel_gen(self):
+        self.images.cancel()
+
+    def on_panic(self, ctl):
+        self.assistant.on_panic()
+        s = protocol.settings(ctl)
+        s["mode"] = "suggest"
+        ctl.ext["online"] = s
+
+    def state(self):
+        st = self.assistant.state()
+        st.update(on=True, engine=self.engine, nano=self.images.state(), privacy=PRIVACY_NOTE,
+                  cli_google=self.cli_google, cli_note=CLI_NOTE, has_key=self.keys.has())
+        return st
+
+    def close(self):
+        self.log.log("online", on=False)
+        for part in (self.assistant, self.images, self.log):
+            try:
+                part.close()
+            except Exception:
+                pass

@@ -16,6 +16,7 @@ HTTP API (every request needs the token: `?k=<token>` or header `X-Token`):
   GET  /state              last published state as JSON
   GET  /params             control.meta(): params, groups, options, mod sources
   POST /cmd                one command object or a list of them, e.g. {"cmd":"set","name":"zoom","v":0.4}
+                           mapping: {"cmd":"surf","op":"corner","id":1,"i":0,"x":64,"y":40} (ops: see surfaces.py)
   GET  /tex/<name>         one image from textures/ (AI results)
   GET  /art                art library listing, in art_index order
   GET  /art-thumb/<name>   small cached JPEG of one art piece
@@ -43,6 +44,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import control
+import governor
+import recorder
+import surfaces
 
 HERE = Path(__file__).resolve().parent
 MAX_BODY = 16384       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB
@@ -54,6 +58,12 @@ MAX_CONNS = 32                # simultaneous client connections
 UPLOAD_WAIT = 20.0            # s a second upload waits for the one in progress before it gets a 503
 _UPLOAD_GATE = threading.BoundedSemaphore(1)   # one image is read + decoded at a time
 THUMB_SIDE = 256
+# layer panel rows: every l_* layer plus serpents (l_swarm lives inside the l_land texture)
+LAYER_KEYS = [n for n in control.PARAMS if (n.startswith("l_") and n != "l_swarm") or n == "serpent"]
+# thumbnail schedule: layers drawn inside the scene shader refresh every round, offscreen-pass layers every third
+_FAST = [n for n in LAYER_KEYS if n in ("l_kene", "l_beads", "l_lines", "l_ai", "l_video", "serpent")]
+_SLOW = [n for n in LAYER_KEYS if n not in _FAST]
+THUMB_ORDER = (_FAST + _SLOW + _FAST + _FAST) or list(LAYER_KEYS)
 TEX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(png|jpg|jpeg|webp)$", re.I)
 IMG_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 MAX_NUDGE = 0.1        # largest relative corner step per command (UV units)
@@ -101,8 +111,36 @@ def validate_command(c):
         return control.validate(c)
     if cmd in ("next", "save", "reset"):
         return {"cmd": cmd}
+    if cmd == "gov":                                 # resource governor (governor.py): validated there
+        return governor.validate_command(c)
+    if cmd == "rec":                                 # show recorder (recorder.py): validated there
+        return recorder.validate_cmd(c)
     if cmd == "next_video":                          # passed through to the render engine
         return control.passthrough(cmd)
+    if cmd == "surf":                                # multi-surface mapping: {"cmd": "surf", "op": ...} (surfaces.py)
+        return surfaces.validate_cmd(c)
+    if cmd == "art_pick":                            # source picker -> engine (live_visuals.art_pick): choose by name
+        out = {"source": c.get("source", "art")}
+        if out["source"] not in ("art", "ai"):
+            raise ValueError("'source' must be \"art\" or \"ai\"")
+        if c.get("name") not in (None, ""):
+            name = c["name"]
+            # art files are hand-dropped too (spaces, unicode): the engine only ever matches the name against its own
+            # library listing, so anything that cannot be a path is acceptable here
+            if (not isinstance(name, str) or len(name) > 200 or name in (".", "..") or any(ch in name for ch in '/\\:\0')
+                    or any(ord(ch) < 32 for ch in name)):
+                raise ValueError("'name' must be an image file name")
+            if out["source"] == "ai" and not TEX_NAME.match(name):
+                raise ValueError("'name' must be a texture file name")
+            out["name"] = name
+        if "use" in c and c["use"] is not None:
+            out["use"] = _int(c, "use", 0, 15)
+        return control.passthrough(cmd, **out)
+    if cmd == "show_texture":                        # source picker: cross-fade to this file in textures/
+        name = c.get("name")
+        if not isinstance(name, str) or not TEX_NAME.match(name) or ".." in name:
+            raise ValueError("'name' must be a texture file name")
+        return control.passthrough(cmd, name=name)
     if cmd == "fold":
         return {"cmd": cmd, "i": _int(c, "i", 0, 63)}
     if cmd == "mode":
@@ -280,6 +318,59 @@ def art_thumb(art_dir, name):
             os.replace(tmp, cache)
         except OSError:
             pass
+        return data
+    except Exception:
+        return None
+
+
+def tex_listing(tex_dir, cap=64):
+    """[{name, ai, t}] for the source picker: image files in textures/, newest first (the engine keeps the same 64)."""
+    out = []
+    try:
+        for f in Path(tex_dir).iterdir():
+            if TEX_NAME.match(f.name) and f.is_file():
+                out.append((f.stat().st_mtime, f.name))
+    except OSError:
+        return []
+    out.sort(key=lambda x: (-x[0], x[1]))
+    return [dict(name=n, ai=n.lower().startswith("gen_"), t=round(t, 1)) for t, n in out[:cap]]
+
+
+_TEX_THUMBS = {}                # name -> (mtime, jpeg); kept in memory so nothing extra lands in textures/
+_TEX_THUMBS_LOCK = threading.Lock()
+_TEX_DECODE = threading.BoundedSemaphore(2)      # a picker opening fires 64 requests: never 64 decodes next to a show
+
+
+def tex_thumb(tex_dir, name):
+    """Small JPEG of one texture, or None. `name` must already match TEX_NAME."""
+    try:
+        from PIL import Image
+        folder = Path(tex_dir)
+        src = folder / name
+        if not src.is_file() or src.resolve().parent != folder.resolve():
+            return None
+        mt = src.stat().st_mtime
+        with _TEX_THUMBS_LOCK:
+            hit = _TEX_THUMBS.get(name)
+        if hit and hit[0] == mt:
+            return hit[1]
+        with _TEX_DECODE:
+            with _TEX_THUMBS_LOCK:                       # someone else may have made it while we waited
+                hit = _TEX_THUMBS.get(name)
+            if hit and hit[0] == mt:
+                return hit[1]
+            with Image.open(src) as im:
+                if im.size[0] * im.size[1] > MAX_ART_PIXELS:
+                    return None
+                im = im.convert("RGB")
+                im.thumbnail((THUMB_SIDE, THUMB_SIDE))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=78)
+            data = buf.getvalue()
+        with _TEX_THUMBS_LOCK:
+            if len(_TEX_THUMBS) > 160:
+                _TEX_THUMBS.clear()
+            _TEX_THUMBS[name] = (mt, data)
         return data
     except Exception:
         return None
@@ -477,6 +568,46 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, control.meta())
         elif path == "/art":
             self._send(200, {"ok": True, "art": art_listing(self.server.rc.art_dir)})
+        elif path == "/sources":                     # source picker: uploaded art + AI / seed textures
+            rc = self.server.rc
+            self._send(200, {"ok": True, "art": art_listing(rc.art_dir), "tex": tex_listing(rc.tex_dir)})
+        elif path == "/fonts":                       # text layer: installed fonts + the project's fonts/ folder
+            try:
+                import text_layer
+                fonts = [dict(name=f["name"], user=f["user"]) for f in text_layer.list_fonts()]
+                self._send(200, {"ok": True, "fonts": fonts, "default": (text_layer.resolve_font("") or {}).get("name", "")})
+            except Exception as ex:
+                self._send(200, {"ok": False, "fonts": [], "error": str(ex)[:200]})
+        elif path.startswith("/font-preview/"):      # the font's name set in that font (small PNG, white on clear)
+            try:
+                import text_layer
+                data = text_layer.font_preview_png(unquote(path[14:])[:80])
+            except Exception:
+                data = None
+            if data is None:
+                self._send(404, {"ok": False, "error": "not found"})
+            else:
+                self._send(200, data, "image/png")
+        elif path.startswith("/tex-thumb/"):
+            name = unquote(path[11:])
+            data = tex_thumb(self.server.rc.tex_dir, name) if TEX_NAME.match(name) and ".." not in name else None
+            if data is None:
+                self._send(404, {"ok": False, "error": "not found"})
+            else:
+                self._send(200, data, "image/jpeg")
+        elif path.startswith("/layer-thumb/"):       # layer panel: small JPEG of one layer alone
+            data = self.server.rc.thumb_bytes(unquote(path[13:]))
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
+        elif path == "/preview":                     # panel monitor: latest small JPEG of the output, if any
+            q = parse_qs(urlsplit(self.path).query)
+            data = self.server.rc.preview_bytes(q["solo"][0].split(",") if "solo" in q else ())
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")   # nothing captured yet (not an error: keeps the console clean)
         elif path.startswith("/tex/"):
             self._image(self.server.rc.tex_dir, unquote(path[5:]), thumb=False)
         elif path.startswith("/art-thumb/"):
@@ -616,7 +747,20 @@ class RemoteControl:
         self.token = str(token) if token else secrets.token_urlsafe(6)  # 8 chars, 48 bits
         self._q = queue.Queue(maxsize=2000)
         self._state = b"{}"
+        self._state_obj = None          # latest published state, not yet serialised (see publish_state)
+        self.state_published = self.state_encoded = 0
         self._lock = threading.Lock()
+        self._views = {}                # solo key (() = real output) -> [last GET time, latest JPEG]
+        self._thumb_shot = -1e9
+        self._thumb_i = 0
+        self.thumb_interval = 0.6       # s between layer thumbnails while a layer panel is on screen
+        self._preview_asked = -1e9      # monotonic time of the last GET /preview
+        self._preview_shot = -1e9       # ... of the last capture the engine started
+        self.preview_interval = 0.33    # s between captures while a panel is watching
+        self.preview_linger = 3.0       # s after the last GET before captures stop (no watcher = no cost)
+        self._thumbs = {}               # layer name -> JPEG
+        self._thumbs_asked = -1e9
+        self._job_i = 0
         self._server = self._thread = None
 
     # -- lifecycle
@@ -700,16 +844,96 @@ class RemoteControl:
 
     def publish_state(self, state):
         """Snapshot `state` (a JSON-able dict; numpy scalars ok) for the page's next GET /state."""
-        try:
-            data = json.dumps(state, default=_jsonable, allow_nan=False).encode()
-        except (TypeError, ValueError):
-            return  # keep the previous good snapshot
+        # Lazy: the engine publishes several times a second, show or no show. Turning the dict into JSON is the
+        # expensive part, so it happens in GET /state (the HTTP thread) and not at all while no panel is connected.
+        # `state` must be a dict the caller does not mutate afterwards (both callers build a fresh one each time).
         with self._lock:
-            self._state = data
+            self._state_obj = state
+        self.state_published += 1
 
     def _state_bytes(self):
         with self._lock:
+            obj, self._state_obj = self._state_obj, None
+        if obj is not None:
+            try:
+                data = json.dumps(obj, default=_jsonable, allow_nan=False).encode()
+            except (TypeError, ValueError, RuntimeError):
+                data = None                          # keep the previous good snapshot
+            if data is not None:
+                self.state_encoded += 1
+                with self._lock:
+                    self._state = data
+        with self._lock:
             return self._state
+
+    # -- output monitor
+    def _solo_key(self, names):
+        return tuple(n for n in (names or ()) if isinstance(n, str) and n in LAYER_KEYS)[:32]
+
+    def preview_bytes(self, solo=()):
+        """Called by GET /preview[?solo=a,b]: marks THAT view as watched and returns its latest JPEG (b"" if none).
+        Each solo set has its own picture, so two panels with different solos never see each other's view."""
+        key = self._solo_key(solo)
+        t = time.monotonic()
+        with self._lock:
+            if key not in self._views:
+                self._preview_shot = -1e9                # a new view: capture it at once
+                if len(self._views) >= 6:                # a handful of panels at most; drop the stalest view
+                    del self._views[min(self._views, key=lambda k: self._views[k][0])]
+                self._views[key] = [t, b""]
+            self._views[key][0] = t
+            self._preview_asked = t
+            return self._views[key][1]
+
+    def preview_due(self, now=None):
+        """True when a panel asked recently and the capture interval has passed; calling it claims the slot."""
+        t = time.monotonic()
+        if t - self._preview_asked > self.preview_linger or t - self._preview_shot < self.preview_interval:
+            return False
+        self._preview_shot = t
+        return True
+
+    # -- layer panel: preview-only mix (never touches the projector) + one thumbnail per layer
+    def thumb_bytes(self, name):
+        if name not in LAYER_KEYS:
+            return b""
+        self._thumbs_asked = time.monotonic()
+        with self._lock:
+            return self._thumbs.get(name, b"")
+
+    def set_thumb(self, name, data):
+        if name in LAYER_KEYS and isinstance(data, (bytes, bytearray)) and 0 < len(data) <= 1 << 20:
+            with self._lock:
+                self._thumbs[name] = bytes(data)
+
+    def preview_job(self):
+        """What the engine should capture now: None, ("out", None), ("mix", layer names) or ("thumb", layer).
+        Monitor views (every preview_interval, round-robin over the watched solo sets) and layer thumbnails (every
+        thumb_interval while a layer panel asks for them) run on separate timers; at most one job per call."""
+        t = time.monotonic()
+        with self._lock:
+            for k in [k for k, v in self._views.items() if t - v[0] > self.preview_linger]:
+                del self._views[k]
+            live = list(self._views)
+        if live and t - self._preview_shot >= self.preview_interval:
+            self._preview_shot = t
+            self._job_i += 1
+            key = live[self._job_i % len(live)]
+            return ("mix", key) if key else ("out", None)
+        if t - self._thumbs_asked <= self.preview_linger and t - self._thumb_shot >= self.thumb_interval:
+            self._thumb_shot = t
+            self._thumb_i += 1
+            return ("thumb", THUMB_ORDER[self._thumb_i % len(THUMB_ORDER)])
+        return None
+
+    def set_preview(self, data, solo=()):
+        if isinstance(data, (bytes, bytearray)) and 0 < len(data) <= 2 << 20:
+            key = self._solo_key(solo)
+            with self._lock:
+                if key in self._views:
+                    self._views[key][1] = bytes(data)
+                elif not key:                            # the plain output is always kept (first GET gets a picture)
+                    self._views[key] = [time.monotonic() - self.preview_linger * 0.5, bytes(data)]
 
 
 def _qr_text(url):
@@ -768,7 +992,8 @@ def _demo():
         raise SystemExit(1)
     ctl = control.Controller(state_dir, restore=True, midi=args.midi, ai=False, art_dir=art_dir)
     st = dict(fold_i=3, mode=2, fb=True, fbAmt=0.88, grid=False, calib=False, next=False, palette=0)
-    corners = [list(p) for p in UNIT_SQ]
+    mapper = surfaces.Mapper(state_dir / "surfaces.json")      # multi-surface mapping, saved in the demo folder
+    corners = mapper.corners()
     tex_i, t0, last, pub = 0, time.perf_counter(), time.perf_counter(), 0.0
     print("[demo] Ctrl+C to quit")
     try:
@@ -778,8 +1003,17 @@ def _demo():
             rest = ctl.apply(rc.drain())
             for c in rest:
                 print("[demo] to engine:", c)
-            if "save" in apply_commands([c for c in rest if c.get("cmd") in _LEGACY], st, corners):
-                print("[demo] save requested (not written in demo):", corners)
+            for c in rest:
+                if c.get("cmd") == "surf":
+                    mapper.command(c)
+            corners, tid = mapper.corners(), mapper.target_id()
+            before = [list(p) for p in corners]
+            acts = apply_commands([c for c in rest if c.get("cmd") in _LEGACY], st, corners)
+            if corners != before:
+                mapper.push_corners(corners, tid)
+            if "save" in acts:
+                mapper.save()
+            mapper.tick()
             if st["next"]:
                 st["next"], tex_i = False, tex_i + 1
             beat = ctl.beat % 1.0
@@ -787,8 +1021,8 @@ def _demo():
             ctl.update(dt, bands)
             if now - pub > 0.12:
                 pub = now
-                rc.publish_state(dict(grid=st["grid"], calib=st["calib"], corners=corners, res=[1280, 800], fps=60.0,
-                                      bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
+                rc.publish_state(dict(grid=st["grid"], calib=st["calib"], corners=mapper.corners(), res=[1280, 800], fps=60.0,
+                                      surfaces=mapper.set.state(), bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
                                       ctl=ctl.state()))
             time.sleep(1 / 60)
     except KeyboardInterrupt:

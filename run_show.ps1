@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Continue'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 $py = Join-Path $here '.venv\Scripts\python.exe'
-$showArgs = if ($args.Count -gt 0) { $args } else { @('--monitor', '1', '--panel') }
+$showArgs = if ($args.Count -gt 0) { $args } else { @('--monitor', '1', '--panel', '--governor', 'suggest') }
 $logDir = Join-Path $here 'logs'
 New-Item -ItemType Directory -Force $logDir | Out-Null
 # AI worker (prompt -> textures) runs as its own low-priority process for the whole show.
@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $ai = $null
 if (-not $env:NO_AI) {
     $aiLog = Join-Path $logDir ("ai_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
-    $ai = Start-Process -FilePath $py -ArgumentList '-u', 'ai_worker.py' -WorkingDirectory $here `
+    $ai = Start-Process -FilePath $py -ArgumentList '-u', 'ai_worker.py', '--no-preload' -WorkingDirectory $here `
           -RedirectStandardOutput $aiLog -RedirectStandardError ($aiLog + '.err') -WindowStyle Hidden -PassThru
     Write-Host "[watchdog] AI worker started (pid $($ai.Id), log: $aiLog)"
 }
