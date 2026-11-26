@@ -535,7 +535,9 @@ class Decider:
                 continue
             s = self.st.get(k)
             if s is None:
-                s = self.st[k] = dict(s=0.0, t=None, over=None, rearm=True, last=-1e9)
+                # a new tag (or one seen for the first time after ARM) is not re-armed yet: music that is ALREADY
+                # playing never fires; the tag fires when its music arrives (drops under, then comes over)
+                s = self.st[k] = dict(s=0.0, t=None, over=None, rearm=False, last=-1e9)
             if k in sims:
                 x = float(sims[k])
                 if s["t"] is None:
@@ -546,6 +548,9 @@ class Decider:
                 s["t"] = now
             thr = threshold(cfg.get("sens", 0.5))
             v = s["s"]
+            if s["t"] is None:                              # no similarity yet: nothing to decide on
+                meters.append([k, 0.0, round(thr, 3), 4 if not cfg.get("on", True) else 0])
+                continue
             if v >= thr:
                 if s["over"] is None:
                     s["over"] = now

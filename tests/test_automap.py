@@ -338,9 +338,9 @@ def test_vision_from_plugin_is_gated():
     class Plug:
         keys, cli_google, root, log = Keys(), False, Path("."), None
     assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api"]
-    Plug.cli_google = True                                    # the old opt-in no longer adds any CLI route
-    assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api"]
-    assert not hasattr(V, "AgyVisionProvider")
+    Plug.cli_google = True                                    # "Allow Google CLI tools": agy joins, after the API route
+    assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api", "agy"]
+    assert hasattr(V, "AgyVisionProvider")
 
 
 class FakeProv:

@@ -8,9 +8,13 @@ Providers are tried in order:
   GeminiApiProvider    RECOMMENDED. Google's Gemini API (Interactions endpoint) with an API key the USER typed into the
                        panel, kept in the user's app-data folder (see KeyStore). Uses the google-genai SDK when it is
                        installed in the venv, plain HTTPS otherwise. NOT yet exercised against the live API.
-There is NO CLI provider. The agy route (and before it the gemini CLI + nanobanana route) was removed: those CLIs
-are coding agents without a tool-less mode, so a prompt written by a panel user or by the assistant LLM would reach an
-agent that can read and edit files on this laptop.
+  AgyImageProvider     Antigravity CLI (`agy`), Nano Banana through the user's agy login. Only after the local
+                       "Allow Google CLI tools" opt-in. Confined like every agy call (backends.py): fresh sandbox
+                       folder under the system temp folder, deleted afterwards; constant command line; the image
+                       prompt in prompt.txt under the answer-only rules; read-only plan mode. Only an IMAGE FILE is
+                       collected (from the sandbox or from agy's own artifact folder) and re-encoded by save_texture;
+                       nothing agy prints is executed or followed.
+The gemini CLI + nanobanana extension is not used (it only works with every tool auto-approved).
 If every provider fails, is missing, or the rate limit is hit, the job goes to the local worker unchanged
 (`ctl.ai.submit`) and the panel says so.
 
@@ -33,7 +37,7 @@ from pathlib import Path
 
 import control
 
-from .backends import BackendError, fresh_dir
+from .backends import AGY_MODE, BackendError, agy_pty, drop_sandbox, fresh_dir, sandbox, write_prompt
 
 MAX_N = 2                    # images per job on this engine (each one is a metered online call)
 IMG_LIMIT = (6, 60.0)        # online images per window; beyond it jobs fall back to the local engine
@@ -203,6 +207,61 @@ class GeminiApiProvider:
         out = Path(work) / "api_out.png"
         out.write_bytes(base64.b64decode(data))
         return out
+
+
+AGY_TASK = ("Read the file prompt.txt in the current folder. Follow the rules at the top of that file. Below the line it "
+            "holds an image description. Use your image generation tool to create exactly one image of it. "
+            "Reply with only the path of the saved image.")
+AGY_FRAME = " Use the file frame.png in the current folder as the input image and transform it."
+
+
+def is_image(path):
+    """True only for a file PIL can verify as an image: whatever else an agent leaves behind is never touched."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
+class AgyImageProvider:
+    name = "agy"
+
+    def __init__(self, timeout=600.0, exe=None, model="gemini-4-hydrogen-low", artifacts=None, runner=None, make_sandbox=None):
+        # the model here is only the AGENT that dispatches agy's built-in image tool (Nano Banana): the cheapest one
+        self.timeout, self._exe, self.model = float(timeout), exe, model
+        # in plan mode agy cannot copy its picture into our folder: it stays in agy's own artifact folder
+        self.artifacts = Path(artifacts) if artifacts else Path.home() / ".gemini" / "antigravity-cli" / "brain"
+        self._run = runner or agy_pty
+        self._sandbox = make_sandbox or (lambda: sandbox("image"))
+
+    def exe(self):
+        return self._exe or shutil.which("agy")
+
+    def available(self):
+        return bool(self.exe())
+
+    def generate(self, prompt, init, work, cancel=None):
+        d = self._sandbox()                              # NOT `work` (that is inside the project): a temp sandbox
+        try:
+            write_prompt(d, clean_prompt(prompt))        # never on the command line
+            task = AGY_TASK
+            if init is not None:
+                shutil.copyfile(init, d / "frame.png")
+                task += AGY_FRAME
+            t0 = time.time() - 2.0
+            screen = self._run(self.exe(), task, d, timeout=self.timeout, idle_after=60.0, cancel=cancel,
+                               model=self.model, extra=("--effort", "low"), mode=AGY_MODE)
+            img = newest_image(d, skip=("frame.png",)) or newest_image(self.artifacts, since=t0)
+            if img is None or not is_image(img):
+                raise BackendError(f"agy made no image: {str(screen)[-200:] or 'no output'}")
+            keep = Path(work) / ("agy_out" + img.suffix.lower())     # out of the sandbox before it is deleted
+            shutil.copyfile(img, keep)
+            return keep
+        finally:
+            drop_sandbox(d)
 
 
 class NanoBanana:

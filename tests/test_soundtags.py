@@ -196,9 +196,12 @@ def test_too_short_or_too_quiet_recording_is_refused():
 # ---------------------------------------------------------------- the trigger logic
 
 
-def drive(dec, seq, tags, dt=0.25, **kw):
-    """seq: list of {id: sim} per tick (dt apart). Returns [(t, fired id)]."""
+def drive(dec, seq, tags, dt=0.25, lead=True, **kw):
+    """seq: list of {id: sim} per tick (dt apart), after one tick of 'not this music' (lead) so that a tag is
+    armed by its music ARRIVING (music already playing when a tag first sees it never fires). [(t, fired id)]."""
     out = []
+    if lead:
+        seq = [{k: 0.0 for k in tags}] + list(seq)
     for i, sims in enumerate(seq):
         t = i * dt
         k, _, _ = dec.step(t, sims, tags, **kw)
@@ -237,14 +240,16 @@ def test_cooldown_blocks_a_quick_return():
     assert len(ts) >= 2 and all(b - a >= 30.0 for a, b in zip(ts, ts[1:]))
 
 
-def test_priority_then_similarity_decides():
+def test_priority_then_similarity_decides_between_tags_ready_together():
+    def first(tags, sims):
+        d = S.Decider()
+        drive(d, [sims] * 12, tags, block="flashguard")         # both become ready while held (not used up)
+        return d.step(10.0, sims, tags)[0]
     tags = {"lo": dict(S.TAG_DEFAULTS, hold=1.0, prio=0), "hi": dict(S.TAG_DEFAULTS, hold=1.0, prio=5)}
-    seq = [{"lo": 0.99, "hi": 0.8}] * 20
-    fires = drive(S.Decider(), seq, tags)
-    assert fires[0][1] == "hi"
+    assert first(tags, {"lo": 0.99, "hi": 0.8}) == "hi"          # priority first
     tags = {"a": dict(S.TAG_DEFAULTS, hold=1.0), "b": dict(S.TAG_DEFAULTS, hold=1.0)}
-    fires = drive(S.Decider(), [{"a": 0.8, "b": 0.97}] * 20, tags)
-    assert fires[0][1] == "b"
+    assert first(tags, {"a": 0.8, "b": 0.97}) == "b"             # then the closer match
+    assert first(tags, {"a": 0.9, "b": 0.9}) == "a"              # then a stable order (deterministic)
 
 
 def test_global_gap_between_two_recalls():
@@ -279,6 +284,12 @@ def test_only_with_autopilot_and_disabled_tags():
     assert d.step(9.0, {"a": 0.95}, off)[1][0][3] == 4
 
 
+def test_music_already_playing_when_first_seen_does_not_fire():
+    tags = {"a": dict(S.TAG_DEFAULTS, hold=1.0)}
+    assert drive(S.Decider(), [{}] * 4 + [{"a": 0.95}] * 40, tags, lead=False) == []
+    assert drive(S.Decider(), [{}] * 4 + [{"a": 0.1}] + [{"a": 0.95}] * 40, tags, lead=False)
+
+
 def test_decider_is_deterministic():
     rng = np.random.default_rng(3)
     seq = [{"a": float(x), "b": float(y)} for x, y in rng.random((400, 2))]
@@ -304,21 +315,37 @@ def test_suggest_finds_the_sections_that_come_back():
     assert once == []                                         # nothing came back yet
 
 
+def cpu_ms_per_frame(make_engine, secs=20.0, runs=2):
+    """CPU time of the audio thread's work (thread_time: other processes on a busy laptop do not count), best of
+    `runs`, expressed per 60 fps video frame."""
+    y = song_a(secs).astype(np.float32)
+    blocks = [np.stack([y[i:i + 512]] * 2, axis=1) for i in range(0, len(y) - 511, 512)]
+    best = 1e9
+    for _ in range(runs):
+        e = make_engine()
+        t0 = time.thread_time()
+        for b in blocks:
+            e.feed(b)
+        best = min(best, (time.thread_time() - t0) / secs / 60 * 1000)
+    return best, e
+
+
 def test_cpu_budget_features_and_matching():
     """<= 0.3 ms per 60 fps frame equivalent on the audio thread, with 8 tags x 4 examples (section, key-invariant)."""
     ex = example_of(song_a(15))
-    e = S.SoundTags()
-    e.set_templates({f"t{i}": S.compile_tag([ex] * 4, "section", True) for i in range(8)})
-    e.active = True
-    secs = 20.0
-    feed(e, song_a(secs))
-    per_frame_ms = e.cost_s / secs / 60 * 1000
-    print(f"[soundtags cost] {per_frame_ms:.3f} ms per 60 fps frame, match every {e.match_dt:.2f} s")
-    assert per_frame_ms <= 0.3
+
+    def heavy():
+        e = S.SoundTags()
+        e.set_templates({f"t{i}": S.compile_tag([ex] * 4, "section", True) for i in range(8)})
+        e.active = True
+        return e
+    ms, e = cpu_ms_per_frame(heavy)
+    print(f"[soundtags cost] {ms:.3f} ms CPU per 60 fps frame (8 tags x 4 examples), match every {e.match_dt:.2f} s")
+    assert ms <= 0.3
     assert e.match_dt <= 0.5                                  # still >= 2 Hz with that many tags
-    f = S.SoundTags()
-    feed(f, song_a(secs))
-    assert f.cost_s / secs / 60 * 1000 <= 0.2                  # features alone (no tags, matching off)
+    ms0, _ = cpu_ms_per_frame(S.SoundTags)
+    print(f"[soundtags cost] {ms0:.3f} ms CPU per 60 fps frame, features only")
+    assert ms0 <= 0.2
 
 
 def test_batched_matcher_equals_the_reference_similarity(ex_a):

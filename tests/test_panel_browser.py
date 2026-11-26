@@ -150,7 +150,7 @@ def test_bypass_switches_on_tabs_pages_and_layer_rows(served):
         keys = set(control.BYPASS_COVER)
         tabs = page.eval_on_selector_all("#tabs button[data-tab]", "els => els.map(e => [e.dataset.tab, !!e.querySelector('.pw')])")
         for t, has in tabs:
-            want = t in keys and t != "layers"     # LAYERS has no header icon: one click there blacked out everything (Opus review A2)
+            want = t in keys                       # every tab, LAYERS included (there it needs a confirming second tap)
             assert has == want, f"tab {t}: power switch {'missing' if want else 'unexpected'}"
         assert dict(tabs)["motion"] and not dict(tabs)["mapping"] and not dict(tabs)["perform"]
         base = dict(ctl.base)

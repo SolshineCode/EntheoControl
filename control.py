@@ -645,6 +645,12 @@ _NOT_EDITS = frozenset(("tap", "trigger", "ripple", "panic", "show", "preset", "
 _TL_TRANSPORT = frozenset(("play", "stop", "seek", "home", "rec", "rec_mode", "ovr_mode", "reenable", "release", "hold"))
 
 
+def mark_local(c):
+    """remote_control: this validated command came from a panel opened on the laptop itself. Only the ONLINE plugin
+    cares (its "Allow Google CLI tools" opt-in cannot be given from the network)."""
+    return _online.mark_local(c) if _online is not None else c
+
+
 def validate(c):
     """Normalized copy of one control command (clamped, unknown keys dropped); ValueError if malformed."""
     if not isinstance(c, dict) or not isinstance(c.get("cmd"), str) or c["cmd"] not in _VALIDATORS:

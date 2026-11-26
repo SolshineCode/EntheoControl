@@ -998,6 +998,7 @@ class _Handler(BaseHTTPRequestHandler):
             # connection AND the Host it asked for; cross-site / rebinding POSTs were refused by _same_site above)
             if flashguard.is_local_request(self.client_address[0], self.headers.get("Host")):
                 cmds = [flashguard.mark_local(c) for c in cmds]
+                cmds = [control.mark_local(c) for c in cmds]   # ONLINE: "Allow Google CLI tools" is laptop-only too
         except (ValueError, RecursionError) as ex:  # JSONDecodeError / UnicodeDecodeError are ValueErrors
             return self._send(400, {"ok": False, "error": str(ex)[:200]})
         try:

@@ -62,7 +62,7 @@ It was built for and tested on a 4 GB GTX 1650 Ti laptop driving a 1280 x 800 sh
 
 ### AI and online
 - **Local AI (optional)**: SD-Turbo makes textures from a prompt in about 2.5 s on a 4 GB card, can dream from the current frame, and makes depth maps for uploaded art. **Dreamify** runs a real DeepDream on any image in the library.
-- **Online (off by default)**: an assistant that adjusts the show from plain-language requests through a validated, photosensitive-safe command list, and Gemini image generation with your own key. Nothing touches the internet while ONLINE is off.
+- **Online (off by default)**: an assistant that adjusts the show from plain-language requests through a validated, photosensitive-safe command list, and Gemini image generation with your own key. Optionally (a separate opt-in, off by default) the `agy` CLI can serve as a second assistant and as a Nano Banana image / AUTO MAP vision provider. Nothing touches the internet while ONLINE is off.
 
 ## Install (Windows 10 / 11)
 

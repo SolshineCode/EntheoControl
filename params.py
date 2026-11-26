@@ -292,8 +292,8 @@ OPTIONS = {
 #      shows, credit and collaborate with the originating communities. ("l_kene" above is the unrelated Folding Blocks.)
 PARAMS.update({
     "l_kene_shipibo":  (0.0, 1.0, 0.0, "layers", "Kené study (Shipibo-Konibo inspired)"),
-    "l_kene_hunikuin": (0.0, 1.0, 0.0, "layers", "Bead study (Huni Kuin inspired)"),
-    "kene_style":   (0.0, 4.0, 0.0, "kene", "Medium"),            # rounded: OPTIONS (light on black, mud-dyed cloth, ...)
+    "l_kene_hunikuin": (0.0, 1.0, 0.0, "layers", "Bead study (Huni Kuin / Yawanawá inspired)"),
+    "kene_style":   (0.0, 7.0, 0.0, "kene", "Medium"),            # rounded: OPTIONS (light on black, mud-dyed cloth, ...)
     "kene_colors":  (0.0, 5.0, 2.0, "kene", "Colours"),           # rounded: 0 follows the show palette
     "kene_layout":  (0.0, 4.0, 0.0, "kene", "Field"),             # rounded: single panel, panels, band, medallion, follow the show
     "kene_seed":    (0.0, 31.0, 0.0, "kene", "Design"),           # rounded: every number is a different generated design
@@ -308,16 +308,22 @@ PARAMS.update({
     "kene_breathe": (0.0, 1.0, 0.3, "kene", "Breathing"),
     "kene_glow":    (0.0, 1.0, 0.4, "kene", "Glow"),
     "kene_chase":   (0.0, 1.0, 0.0, "kene", "Follow light chase"),
-    "hk_motif":     (0.0, 4.0, 0.0, "kene", "Bead motif (study)"),        # rounded: OPTIONS (names as in the reference README)
-    "hk_medium":    (0.0, 2.0, 0.0, "kene", "Bead medium"),       # rounded: glass beads, woven, painted
-    "hk_colors":    (0.0, 5.0, 1.0, "kene", "Bead colours"),      # rounded: 5 follows the show palette
+    "hk_motif":     (0.0, 8.0, 0.0, "kene", "Bead motif (study)"),        # rounded: OPTIONS (names as in the reference README)
+    "hk_medium":    (0.0, 3.0, 0.0, "kene", "Bead medium"),       # rounded: glass beads, woven, painted
+    "hk_colors":    (0.0, 9.0, 1.0, "kene", "Bead colours"),      # rounded: 5 follows the show palette
     "hk_cycle":     (0.0, 3.0, 0.0, "kene", "Motif morph"),       # rounded: morph to the next motif every N bars
     "hk_size":      (0.0, 1.0, 0.5, "kene", "Bead count"),
     "hk_seq":       (0.0, 1.0, 0.5, "kene", "Beads light in sequence"),
     "hk_glow":      (0.0, 1.0, 0.4, "kene", "Bead glow"),
+    # appended 2026-11-26
+    "kene_form":    (0.0, 1.0, 1.0, "kene", "Line forms"),         # rounded: 0 outlined regions only, 1 + free arms with
+                                                                   #          terminals (arrowhead, T-bar, end-cap) and accent blocks
+    "hk_ombre":     (0.0, 1.0, 0.0, "kene", "Ombré cycling"),      # the bead colour ramp slides ring by ring (1 = a step per 2 bars)
 })
 OPTIONS.update({     # the same lists as kene_real.OPTIONS (tests/test_kene_real.py keeps them equal)
-    "kene_style": ["Light on black", "Mud-dyed cloth", "Embroidery", "Ceramic", "Beadwork"],
+    "kene_style": ["Light on black", "Mud-dyed cloth", "Embroidery", "Ceramic", "Beadwork",
+                   "Painted kené (study)", "Cloth kené (study)", "Embroidered kené (study)"],
+    "kene_form": ["Outlined regions", "Regions + arms and terminals"],
     "kene_colors": ["Follow show palette", "Cotton white", "Magenta / gold / red", "Gold / white / green",
                     "Turquoise / white / magenta", "Red / violet / lime"],
     "kene_layout": ["Single panel", "Panels", "Band", "Medallion", "Follow the show"],
@@ -325,10 +331,12 @@ OPTIONS.update({     # the same lists as kene_real.OPTIONS (tests/test_kene_real
     "kene_pen": ["Off (Drawn fader)", "Draw in: 4 bars", "Draw in: 8 bars", "Draw in: 16 bars", "Draw in: 32 bars"],
     "kene_pen_new": ["Same design", "New design each time"],
     "hk_motif": ["txede bedu (study)", "dunu kenê (study)", "inu tae (study)", "inu tae txede bedu (study)",
-                 "kapë hina (study)"],
-    "hk_medium": ["Glass beads", "Woven", "Painted"],
+                 "kapë hina (study)", "Woven band (Huni Kuin-inspired study)", "Bead tiles (Huni Kuin-inspired study)",
+                 "Bead straps (Yawanawá-inspired study)", "Key-fret beadwork (study)"],
+    "hk_medium": ["Glass beads", "Woven", "Painted", "Glass beads, staggered rows"],
     "hk_colors": ["Black & white", "Red / yellow / white", "Blue / turquoise / orange", "Green / yellow / red",
-                  "All eight bead colours", "Follow show palette"],
+                  "All eight bead colours", "Follow show palette", "Rainbow ombré", "Blue ombré", "Green ombré",
+                  "Black / white / orange"],
     "hk_cycle": ["Hold", "Morph every 8 bars", "Morph every 16 bars", "Morph every 32 bars"],
 })
 

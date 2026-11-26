@@ -114,8 +114,16 @@ Nothing you switch off is lost. Power buttons never edit your faders.
 3. Click **SET SAFE…** and then pad 9: that is now where PANIC goes.
 4. Switch **AUTOPILOT** on (top bar) and watch it step through your scenes. Switch it off again.
 
-<!-- TODO(themes+sound-tags): add a short "pick a theme, tag a scene with a sound" step here once themes and sound tags land. -->
-*Themes and sound tags are coming soon; this step will grow when they land.*
+## 10b. Themes and sound tags (5 min)
+
+1. Open **LAYERS**, make the beings look the way you like, and tap the small camera on the Beings row.
+   You should see a new card in the THEMES box on PERFORM, named "Beings", the time and the palette.
+2. Change the beings completely. Tap the card: they glide back on the next bar. Change them again and **hold** the card: they snap back at once. Nothing else on the wall moved.
+3. Play a song through the laptop. Open the **THEMES** tab, select the card and press **TAG** (10 s). Let it listen.
+4. Press **LEARN / TEST** and watch the meter: high while that song plays, low for other music.
+5. Switch **SOUND TAGS ARMED** on, change the beings, play another song, then go back to the first one.
+   You should see the beings come back by themselves a few seconds after the first song returns. Touch any fader and it holds off for 20 s: you always win.
+6. Tap the star to keep the theme in PRESETS. Switch SOUND TAGS off again for now.
 
 ## 11. Timeline (5 min)
 

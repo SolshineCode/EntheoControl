@@ -76,7 +76,7 @@ def test_primary_lines_form_a_real_network(seed):
 def test_quadrant_topology_and_central_eye(seed):
     """Square panels are organised round the centre: the line network is unchanged by a half turn (and usually by a
     quarter turn or mirrors), and the centre carries an eye node (a small square of its own)."""
-    lab = kr.shipibo_design(seed, 10, 10)[..., 0].astype(int)
+    lab = kr.shipibo_design(seed, 10, 10, form=0)[..., 0].astype(int)
     ve, he = boundary_edges(lab)
     assert np.array_equal(ve, ve[::-1, ::-1]) and np.array_equal(he, he[::-1, ::-1]), "not symmetric about the centre"
     c = lab.shape[0] // 2
@@ -98,7 +98,7 @@ def test_three_tiers_fill_the_field(seed):
 
 
 def test_pen_order_travels_along_the_lines():
-    d = kr.shipibo_design(3, 14, 14)
+    d = kr.shipibo_design(3, 14, 14, form=0)
     order = d[..., 3].astype(int)
     lab, bits = d[..., 0], d[..., 1]
     ring = (bits & 16) == 0
@@ -134,7 +134,7 @@ def test_hk_motif_names_come_from_the_readme():
 def test_hk_tiles_are_periodic_diagonal_and_balanced():
     atlas = kr.hk_atlas(0)
     T = kr.HK_T
-    assert atlas.shape == (T, T * len(kr.HK_MOTIFS), 2) and atlas.dtype == np.uint8
+    assert atlas.shape == (T, T * kr.NF, 2) and atlas.dtype == np.uint8
     tiles = [atlas[:, k * T:(k + 1) * T, 0] for k in range(len(kr.HK_MOTIFS))]
     for k, t in enumerate(tiles):
         fig = t > 0
@@ -150,10 +150,11 @@ def test_hk_tiles_are_periodic_diagonal_and_balanced():
 
 
 def test_hk_tile_is_seamless_when_repeated():
-    for fam in range(len(kr.HK_MOTIFS)):
-        small = kr.hk_tile(fam, 0, kr.HK_T)
-        big = kr.hk_tile(fam, 0, kr.HK_T * 2)
-        assert np.array_equal(np.tile(small, (2, 2, 1))[..., 0], big[..., 0]), kr.HK_MOTIFS[fam]
+    for fam in range(kr.NF):
+        for seed in (0, 1):
+            small = kr.hk_tile(fam, seed, kr.HK_T)
+            big = kr.hk_tile(fam, seed, kr.HK_T * 2)
+            assert np.array_equal(np.tile(small, (2, 2, 1))[..., 0], big[..., 0]), kr.HK_FAMILIES[fam]
 
 
 # ------------------------------------------------------------------ colour conventions per medium
@@ -181,11 +182,11 @@ def test_styles_follow_the_documented_colour_conventions():
 
 def test_hk_colourways_use_the_documented_bead_colours():
     for name, cols in zip(kr.HK_COLOR_NAMES, kr.HK_COLORWAYS):
-        assert cols is None or len(cols) == 6, name
+        assert cols is None or len(cols) == 8, name
     hk = kr.hk_colours(dict(params.defaults(), hk_colors=0), None)
     assert all(abs(c[0] - c[1]) < 0.1 and abs(c[1] - c[2]) < 0.12 for c in hk), "black & white colourway"
     pal = [(1.0, 0.2, 0.6)] * 5
-    follow = kr.hk_colours(dict(params.defaults(), hk_colors=len(kr.HK_COLOR_NAMES) - 1), pal)
+    follow = kr.hk_colours(dict(params.defaults(), hk_colors=kr.HK_COLOR_NAMES.index("Follow show palette")), pal)
     assert np.allclose(follow[0], pal[0], atol=0.02)
 
 
@@ -215,7 +216,10 @@ def test_option_labels_match_the_module_and_the_ranges():
         lo, hi = params.PARAMS[name][0], params.PARAMS[name][1]
         assert lo == 0.0 and hi == len(labels) - 1, name
         assert all(len(s) <= 40 for s in labels), name                    # control.merge_options cuts at 40
-    assert params.OPTIONS["hk_motif"] == [n + " (study)" for n in kr.HK_MOTIFS], "the dropdown says study"
+    assert params.OPTIONS["hk_motif"][:5] == [n + " (study)" for n in kr.HK_MOTIFS], "the dropdown says study"
+    assert all("study" in x for x in params.OPTIONS["hk_motif"]) and len(params.OPTIONS["hk_motif"]) == kr.NF
+    assert all("study" in x for x in params.OPTIONS["kene_style"][5:]), "the new media are labelled as studies"
+    assert not any(n in kr.HK_EXTRA for n in kr.HK_MOTIFS), "the added families carry descriptive names, not README names"
     assert "study" in params.PARAMS["hk_motif"][4].lower()
 
 
@@ -294,25 +298,26 @@ def test_gl_off_draws_nothing(gl):
         kp.release()
 
 
-@pytest.mark.parametrize("style", range(5))
+@pytest.mark.parametrize("style", range(len(kr.STYLES)))
 @pytest.mark.parametrize("layout", range(5))
 def test_gl_every_style_and_layout_renders(gl, style, layout):
     img = shot(gl, (640, 400), l_kene_shipibo=1.0, kene_style=style, kene_layout=layout, symmetry=1.0 if layout == 4 else 0.0)
     assert img.shape == (400, 640, 4) and img[..., :3].max() > 120, "nothing was drawn"
     assert blown_frac(img) < 0.02, "white-out"
-    if kr.STYLES[style] not in ("Mud-dyed cloth", "Ceramic"):                # textile grounds are lit on purpose
+    if not kr.style_uniforms(dict(params.defaults(), kene_style=style), None)["ground_on"]:   # lit grounds are on purpose
         assert black_frac(img) >= 0.25, f"true black {black_frac(img):.2f}"
 
 
-@pytest.mark.parametrize("motif", range(len(kr.HK_MOTIFS)))
-@pytest.mark.parametrize("medium", range(3))
+@pytest.mark.parametrize("motif", range(kr.NF))
+@pytest.mark.parametrize("medium", range(len(kr.HK_MEDIA)))
 def test_gl_hunikuin_renders(gl, motif, medium):
     img = shot(gl, (640, 400), l_kene_hunikuin=1.0, hk_motif=motif, hk_medium=medium)
     assert img[..., :3].max() > 120 and blown_frac(img) < 0.02
-    assert black_frac(img) >= 0.25, f"true black {black_frac(img):.2f}"
+    if not (medium in (1, 2) and motif >= 6):            # flat paint / woven floats of an all-colour study have no bead gaps
+        assert black_frac(img) >= 0.25, f"true black {black_frac(img):.2f}"
     lit = img[..., :3][img[..., :3].max(axis=2) > 80].astype(float)
     assert len(lit) > 500
-    if medium == 0:
+    if medium == 0 and motif < 5:
         sat = (lit.max(axis=1) - lit.min(axis=1)) / lit.max(axis=1)
         assert sat.mean() > 0.45, "bead colours are saturated"
 
@@ -542,3 +547,241 @@ def test_gl_palette_follow_and_alpha(gl):
     half = shot(gl, (320, 200), l_kene_shipibo=0.5, kene_flow=0.0)
     full = shot(gl, (320, 200), l_kene_shipibo=1.0, kene_flow=0.0)
     assert half[..., :3].mean() == pytest.approx(full[..., :3].mean() * 0.5, rel=0.12), "the fader is the opacity"
+
+
+# ------------------------------------------------------------------ GRAMMAR_SPEC primitives (H2 - H4) and the 7 studies
+
+@pytest.mark.parametrize("diagonal", [False, True])
+@pytest.mark.parametrize("width", [1, 2, 3])
+def test_fret_is_interlocking_and_complementary(diagonal, width):
+    """The negative space of the fret is the same fret: shifting by one cell swaps figure and ground exactly."""
+    P = 12
+    j, i = np.meshgrid(np.arange(-24, 48), np.arange(-24, 48), indexing="ij")
+    f = kr.fret(i, j, P, width, diagonal)
+    shift = (P, P) if diagonal else (P, 0)
+    assert np.array_equal(kr.fret(i + shift[0], j + shift[1], P, width, diagonal), 1 - f), "not complementary"
+    assert np.array_equal(kr.fret(i + (4 if diagonal else 2) * P, j, P, width, diagonal), f), "not periodic"
+    if diagonal:                                                            # staircase strokes hang together (4-connected)
+        lone = (f == 1) & (np.roll(f, 1, 0) == 0) & (np.roll(f, -1, 0) == 0) & (np.roll(f, 1, 1) == 0) & (np.roll(f, -1, 1) == 0)
+        assert lone[2:-2, 2:-2].mean() < 0.01, "the diagonal fret falls apart into single cells"
+    assert f.mean() == pytest.approx(0.5, abs=0.02), "figure and ground carry equal weight"
+    assert not np.array_equal(kr.fret(i, j, P, width, diagonal, hand=-1), f), "handedness changes the spiral"
+
+
+def test_fret_is_a_spiral_not_concentric_rings():
+    """The break joins ring k to ring k + 2: over the tiled plane the fret hangs together in far fewer pieces than
+    the concentric rings it is cut from, and so does its negative space."""
+    def pieces(a):
+        a, n = a.copy().astype(bool), 0
+        while a.any():
+            n += 1
+            stack = [tuple(np.argwhere(a)[0])]
+            while stack:
+                y, x = stack.pop()
+                if 0 <= y < a.shape[0] and 0 <= x < a.shape[1] and a[y, x]:
+                    a[y, x] = False
+                    stack += [(y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)]
+        return n
+    for P, w in ((12, 1), (16, 2), (24, 2)):
+        j, i = np.meshgrid(np.arange(4 * P), np.arange(4 * P), indexing="ij")
+        f = kr.fret(i, j, P, w)
+        cu, cv = i // P, j // P
+        x, y = (i - cu * P) - (P - 1) / 2, (j - cv * P) - (P - 1) / 2
+        rings = (np.floor((np.maximum(np.abs(x), np.abs(y)) + 0.5) / w).astype(int) + cu + cv) % 2
+        assert pieces(f) < 0.7 * pieces(rings) and pieces(1 - f) < 0.7 * pieces(1 - rings), (P, w, pieces(f), pieces(rings))
+        runs = [len(r) for row in f[P:2 * P] for r in "".join(map(str, row)).replace("0", " ").split()]
+        assert min(runs) >= 1 and max(runs) <= P + 2 * w
+
+
+def test_ombre_ramp_is_exact():
+    d = np.arange(-3, 12)
+    assert kr.ombre(d, 6).tolist() == [1, 1, 1, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6], "one cell per step, held at the ends"
+    assert kr.ombre(d, 4, start=2).tolist() == [1, 1, 1, 1, 1, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4]
+    # in the bead tile study the corner rings step through the whole ramp, one bead each, along a diagonal
+    t = kr.hk_tile(6, 0)[..., 0].astype(int)
+    row = t[1, 1:11].tolist()                                               # along a tile's edge row, corner to middle
+    assert sorted(set(row)) == [1, 2, 3, 4, 5, 6] and all(b - a in (0, 1) for a, b in zip(row, row[1:])), row
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_meander_fills_arbitrary_cells(seed):
+    """No gaps, no crossings: every tile of an arbitrary cell is on a path (or is a lone dot), paths never branch,
+    never leave the cell, never link two different cells."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:40, 0:56]
+    blob = ((xx - 28) ** 2 / 500.0 + (yy - 20) ** 2 / 260.0 + 0.25 * np.sin(xx * 0.5 + seed) * np.cos(yy * 0.4) < 1.0)
+    blob &= ~(((xx - 20) ** 2 + (yy - 18) ** 2) < 30)                        # with a hole
+    lab = (xx > 30).astype(int)                                             # and two cells side by side
+    for lo, hi in ((3, 7), (8, 26)):
+        bits = kr.meander_fill(blob, rng, lo, hi, lab=lab).astype(int)
+        assert not bits[~blob].any(), "the fill left its cell"
+        deg = sum(((bits & m) > 0).astype(int) for m in (1, 2, 4, 8))
+        assert deg.max() <= 2, "a fill line branches or crosses"
+        assert (deg[blob] == 0).mean() < 0.12, f"gaps: {(deg[blob] == 0).mean():.2f} of the cell has no line"
+        for dj, di, mb, tb in ((1, 0, 1, 4), (0, 1, 2, 8)):
+            a = (bits[:40 - dj, :56 - di] & mb) > 0
+            b = (bits[dj:, di:] & tb) > 0
+            assert np.array_equal(a, b), "a half-drawn connection"
+            assert not (a & (lab[:40 - dj, :56 - di] != lab[dj:, di:])).any(), "the fill crossed a primary line"
+        # no gap wider than the line spacing: every tile of the cell holds a line or dot at its centre, and an
+        # empty (dot) tile always touches a tile with a line
+        dots = blob & (deg == 0)
+        near = np.zeros_like(dots)
+        for dj, di in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            near |= np.roll(deg > 0, (dj, di), (0, 1))
+        assert (near | ~dots).mean() > 0.995
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_arms_terminals_and_accent_blocks(seed):
+    gx, gy, _nv, _wrap = kr.grid_dims(0, 0.7, 1.6, dense=True)
+    assert gy > kr.grid_dims(0, 0.7, 1.6)[1] * 1.5, "the painted / embroidered studies use a much finer lattice"
+    d = kr.shipibo_design(seed, gx, gy)
+    s = kr.design_stats(d)
+    assert {kr.ARROW, kr.TBAR, kr.CAP} <= set(s["terminals"]), f"terminal vocabulary: {s['terminals']}"
+    assert 0.04 < s["arms"] < 0.35 and s["reciprocal"] and s["cross_label"] == 0
+    assert 0.015 < s["block_frac"] < 0.10, f"accent blocks cover {s['block_frac']:.3f}: small, never whole cells"
+    bits, code = d[..., 1].astype(int), d[..., 2].astype(int) & 7
+    arm, block = (bits & 32) > 0, (bits & 64) > 0
+    assert not (arm & block).any() and ((bits[arm | block] & 16) > 0).all(), "arms and blocks live inside the cells"
+    assert ((bits[block] & 15) == 0).all(), "no fill line runs through an accent block"
+    # mirror symmetry: the arms repeat under a half turn like the primary network does
+    assert np.array_equal(arm, arm[::-1, ::-1]) and np.array_equal(block, block[::-1, ::-1])
+    plain = kr.design_stats(kr.shipibo_design(seed, gx, gy, form=0))
+    assert plain["arms"] == 0.0 and plain["blocks"] == 0
+    assert (code[block] == 3).any() or seed >= 0                            # (the stepped centre cross needs a roomy centre)
+
+
+def test_some_designs_have_the_stepped_centre_cross():
+    gx, gy = kr.grid_dims(0, 0.7, 1.6, dense=True)[:2]
+    n = 0
+    for seed in range(10):
+        d = kr.shipibo_design(seed, gx, gy)
+        cross = ((d[..., 1] & 64) > 0) & ((d[..., 2] & 7) == 3)
+        if cross.any():
+            n += 1
+            jj, ii = np.nonzero(cross)
+            assert abs(jj.mean() - (d.shape[0] - 1) / 2) < 0.6 and abs(ii.mean() - (d.shape[1] - 1) / 2) < 0.6
+            assert 8 <= len(jj) <= 24
+    assert n >= 3
+
+
+def test_new_studies_follow_the_spec_colours():
+    v = params.defaults()
+    a = kr.style_uniforms(dict(v, kene_style=kr.STYLES.index("Painted kené (study)")), None)
+    assert a["ground_on"] and min(a["ground"]) > 0.7 and max(a["cols"][0]) < 0.25 and a["dense"] and a["form"] == kr.F_LATTICE
+    assert a["w"][0] > 3.5 * a["w"][2] and a["w"][1] == 0.0 and a["hair"], "bold line with a hairline, fine fill"
+    assert 2.5 <= 1.0 / (2 * a["w"][2]) <= 4.5, "fill spacing is about 3 - 4 line widths (GRAMMAR_SPEC A2.3)"
+    assert a["acc"][0][0] > 2 * a["acc"][0][2] and a["acc_on"] == 1.0 and not a["knob"]
+    b = kr.style_uniforms(dict(v, kene_style=kr.STYLES.index("Cloth kené (study)")), None)
+    assert b["frame"] is not None and max(b["frame"]) < 0.3 and b["acc_on"] == 0.0 and b["wob"] > a["wob"] and b["form"] == kr.F_SPINE
+    c = kr.style_uniforms(dict(v, kene_style=kr.STYLES.index("Embroidered kené (study)")), None)
+    r, g, bl = c["ground"]
+    assert r > 0.6 and r > 3 * g and bl > g, "raspberry ground"
+    assert c["cols"][0][2] > c["cols"][0][0] and c["stitch"] and c["border"] and c["twig"] and c["form"] == kr.F_CELLS
+    assert c["cols"][1][1] < c["echo2"][1], "outer outline orange, inner yellow"
+    assert c["cols"][2][2] > c["cols"][2][0] > c["cols"][2][1], "blue-violet fill"
+    assert c["w"][2] >= 0.18, "the fill line is about half its spacing: dense and visible"
+
+
+def test_painted_lattice_study_structure():
+    """A: medallions on a rhombic lattice (d2), bulbs (C-loops ending in an arrowhead), junction gems, red channel
+    runs, bowtie blocks, and ONE uniform labyrinth fill reaching every cell."""
+    gx, gy = kr.grid_dims(0, 0.6, 1.6, 2.2)[:2]
+    found_bulb = found_bow = 0
+    for seed in range(4):
+        d = kr.shipibo_design(seed, gx, gy, False, kr.F_LATTICE)
+        lab, bits, cb = d[..., 0].astype(int), d[..., 1].astype(int), d[..., 2].astype(int)
+        ve, he = boundary_edges(lab)
+        assert np.array_equal(ve, ve[::-1]) and np.array_equal(ve, ve[:, ::-1]), "mirror symmetric on both axes"
+        assert {1, 2, 3, 4} <= set(np.unique(lab)), "centre + rhombic + edge medallions"
+        interior, arm, block = (bits & 16) > 0, (bits & 32) > 0, (bits & 64) > 0
+        ring = ~interior
+        assert ((cb & 8) > 0)[ring].sum() >= 8, "junction gems where channels meet"
+        assert ((cb & 7) == 1)[ring].sum() >= 10, "red channel runs"
+        deg = sum(((bits & m) > 0).astype(int) for m in (1, 2, 4, 8))
+        fill = interior & ~arm & ~block
+        assert (deg[fill] == 0).mean() < 0.06 and (deg[fill] == 2).mean() > 0.70, "one uniform wandering line, few ends"
+        s = kr.design_stats(d)
+        assert s["reciprocal"] and s["cross_label"] == 0
+        # a bulb is an arm that turns the same way three times (a C) and ends in an arrowhead
+        found_bulb += int(((cb & 7)[arm & (deg == 1)] == kr.ARROW).sum() >= 4)
+        found_bow += int((block & ((cb & 7) == 3)).sum() >= 40)
+    assert found_bulb >= 3 and found_bow >= 2
+
+
+def test_cloth_spine_study_structure():
+    """B: portrait 1 : 2, a spine on the axis with lozenge and diamonds, outline arrowheads, hooks ending in open
+    squares, dumbbells; mirrored left / right and top / bottom; fill edge to edge."""
+    gx, gy = kr.grid_dims(0, 0.5, 1.6, False, kr.F_SPINE)[:2]
+    assert gy >= 1.8 * gx, "portrait"
+    for seed in range(5):
+        d = kr.shipibo_design(seed, gx, gy, False, kr.F_SPINE)
+        ny, nx = d.shape[:2]
+        lab, bits, code = d[..., 0].astype(int), d[..., 1].astype(int), d[..., 2].astype(int) & 7
+        arm = (bits & 32) > 0
+        assert np.array_equal(arm, arm[:, ::-1]) and np.array_equal(arm, arm[::-1]), "mirrored on both axes"
+        assert np.array_equal(lab, lab[:, ::-1]) and np.array_equal(lab, lab[::-1])
+        assert lab[ny // 2, nx // 2] == 2 and len(np.unique(lab)) >= 3, "lozenge at the centre, diamonds on the spine"
+        assert arm[:, nx // 2].sum() >= 0.3 * ny, "a spine down the central column"
+        ends = set(code[arm].tolist())
+        assert {kr.ARROW_OPEN, kr.CAP, kr.TBAR} <= ends, f"outline arrowheads, open squares, dumbbells: {ends}"
+        assert kr.ARROW not in ends and (bits & 64).sum() == 0, "no filled arrowheads, no colour blocks"
+        deg = sum(((bits & m) > 0).astype(int) for m in (1, 2, 4, 8))
+        assert ((bits & 16) > 0).mean() > 0.9 and (deg[~arm] == 0).mean() < 0.12, "coarse fill everywhere, edge to edge"
+
+
+def test_embroidered_cells_study_structure():
+    """C: many small cells packed edge to edge, twig colours ON the channels only, eye dots, no arms inside cells."""
+    gx, gy = kr.grid_dims(0, 0.4, 1.6, 1.25)[:2]
+    d = kr.shipibo_design(2, gx, gy, False, kr.F_CELLS)
+    lab, bits, cb = d[..., 0].astype(int), d[..., 1].astype(int), d[..., 2].astype(int)
+    interior = (bits & 16) > 0
+    assert len(np.unique(lab)) >= 9 and not (bits & 32).any()
+    assert 0.2 < ((cb & 7) > 0)[~interior].mean() < 0.8, "coloured twig runs along the channels"
+    assert len(set((cb & 7)[~interior].tolist()) - {0}) >= 4, "several twig colours"
+    assert 1 <= ((bits & 64) > 0).sum() <= 40, "eye dots"
+
+
+def test_bead_studies_follow_the_spec_structures():
+    W, T = kr.WHITE_ROLE, kr.HK_T
+    woven = kr.hk_tile(5, 0)[..., 0].astype(int)                            # D: three colours, three band types of 16 rows
+    assert set(np.unique(woven)) == {0, 1, 2}
+    bands = [woven[(np.arange(T) + 8) // 16 % 3 == k] for k in range(3)]
+    assert all(b.shape[0] == 16 for b in bands) and len({b.tobytes() for b in bands}) == 3
+    for b in bands:
+        assert 0.3 < (b > 0).mean() < 0.7
+    assert (woven == 2).any(axis=1).sum() >= 10, "orange in every band"
+    tiles = kr.hk_tile(6, 0)[..., 0].astype(int)                            # E: four different tiles with gaps between
+    quads = [tiles[a:a + 24, b:b + 24] for a in (0, 24) for b in (0, 24)]
+    assert len({q.tobytes() for q in quads}) == 4
+    for q in quads:
+        assert not q[0].any() and not q[:, 0].any() and not q[-1].any(), "a dark gap round every tile"
+    key = quads[0] == W
+    ys, xs = np.nonzero(key)
+    assert np.ptp(xs) >= 10 and np.ptp(ys) >= 10, "the S-fret is large: it spans the inner diamond"
+    runs = [len(r) for row in key for r in "".join("1" if v else " " for v in row).split()]
+    assert np.mean(np.array(runs) >= 2) > 0.3, "a two-bead stroke"
+    assert (tiles == 7).any() and (tiles == W).sum() > 100
+    strap = kr.hk_tile(7, 0)[..., 0].astype(int)                            # F: three different straps, dark between
+    cols = [strap[:, k * 16:(k + 1) * 16] for k in range(3)]
+    assert len({c.tobytes() for c in cols}) == 3
+    for c in cols:
+        assert not c[:, 0].any() and not c[:, 14:].any() and c[:, 1:14].any(), "13 beads, then dark ground"
+        assert np.array_equal(c[:, 1:14], c[:, 1:14][:, ::-1]), "mirrored about the strap's axis"
+        assert np.array_equal(c[:16], c[16:32]), "repeats every 16 rows"
+    assert {1, 2, 3, 4} <= set(np.unique(cols[0])) and W in cols[0] and W in cols[1] and 7 in cols[2]
+    assert {1, 2, 3, 4, 5, 6} <= set(np.unique(cols[2])), "the rays run through the whole rainbow ramp"
+    fretp = kr.hk_tile(8, 0)[..., 0].astype(int)                            # G: red / green frets with dark separators
+    panel = fretp[:10, :6]
+    assert {0, 7, 8} <= set(np.unique(fretp[:12, :12])), "two key colours and separators"
+    assert abs(int((panel == 7).sum()) - int((panel == 8).sum())) <= 16
+    line = fretp[0, 19:24]                                                  # the chevron band next to the panel
+    assert line.tolist() == [1, 2, 3, 4, 5], f"white peak next to the panel, then down the blue ramp: {fretp[0, 15:26]}"
+    blue = kr.hk_colours(dict(params.defaults(), hk_colors=kr.HK_COLOR_NAMES.index("Blue ombré")), None)
+    lum = [0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2] for c in blue[:6]]
+    assert lum == sorted(lum, reverse=True), "the blue ramp runs white -> navy"
+    assert "hk_ombre" in params.PARAMS and params.PARAMS["hk_ombre"][2] == 0.0
+    # bead-by-bead lighting follows the fret: the 'along' channel changes steadily along the spiral
+    al = kr.fret_along(*np.meshgrid(np.arange(12), np.arange(12)), 12, 2)
+    assert 0.0 <= al.min() and al.max() < 1.0 and len(np.unique(np.round(al, 2))) > 20

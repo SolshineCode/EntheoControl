@@ -19,6 +19,7 @@ research/streamdiffusion_lowvram.md        # StreamDiffusion on 4 GB notes
 research/PUBLIC_MANIFEST.txt               # this file
 
 ## NEVER PUBLISH: research/ (internal: AI review transcripts, agent scratch notes, hardware profile, CLI recipes)
+research/kene_reference/user_refs/          # user-supplied private study references (copyrighted)
 research/kene_reference/images/            # study photos (already in .gitignore); licences listed in README 5.1
 research/neon_pr1_review.md
 research/neon_pr2_review.md
@@ -41,6 +42,7 @@ research/effects_spec_videos.md            # the owner's private descriptions of
 research/mapping_geometry_unapplied_patch.py.txt
 
 ## NEVER PUBLISH: the rest of the working folder
+tools/agy_neon_runner.py                   # local dev helper (drives agy for Neon reviews)
 HANDOFF.md                                 # agent coordination log (local paths, hardware, session notes)
 NotesTowardsStartingProjectionMappingPsychedelicArt.txt   # the owner's private notes
 touchvdmx_explorer.html                    # owner-supplied, Gemini-generated prototype (see THIRD_PARTY_NOTICES.md 1.4)

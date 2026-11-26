@@ -201,5 +201,11 @@ def test_themes_capture_round_trip_real_backend(served):
         page.locator(".thq .thc[data-id]").first.click()
         page.wait_for_timeout(500)
         page.screenshot(path=str(SHOTS / "real_backend.png"))
+        with lock:
+            tray = list(ctl.themes.tray)
+            log = [x[1] for x in ctl.themes.log]
+        assert len(tray) == 1 and tray[0]["scope"]["kind"] == "look"        # the tap captured the look ...
+        assert "restore" in log                                              # ... and the chip tap restored it
+        page.wait_for_function("window.__themes.doc() && window.__themes.doc().tray.length === 1", timeout=8000)
         br.close()
     assert not errors, errors

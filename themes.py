@@ -420,7 +420,7 @@ class ThemeManager:
         self._blob = (0, b"{}")
         self._panics = getattr(ctl, "panics", 0)
         self._panic_until = -1e9
-        self._manual_until = -1e9
+        self._manual_t = -1e9
         self._edits = None
         self._byp_seen = None
         self._eng = None
@@ -482,7 +482,7 @@ class ThemeManager:
             print(f"[soundtags] {kind} {th['name'] if th else '-'} sim={sim if sim is None else round(sim, 3)} {note}")
 
     # ---- capture
-    def capture_data(self, scope):
+    def capture_data(self, scope, missing_ok=False):
         ctl = self.ctl
         names = scope_names(scope)
         data = {"values": {n: ctl.base[n] for n in names},
@@ -495,6 +495,9 @@ class ThemeManager:
             data["stack_ph"] = {str(x["id"]): self._ph(x["id"]) for x in st.layers}
         if st is not None and scope["kind"] == "stack":
             lay = st.find(scope["key"])
+            if lay is None and missing_ok:                    # undo of bringing a deleted stack layer back
+                data["stack_absent"] = scope["key"]
+                return data
             if lay is None:
                 raise ValueError(f"there is no stack layer #{scope['key']}")
             data["stack_layer"] = copy.deepcopy(lay)
@@ -509,7 +512,8 @@ class ThemeManager:
                          mods={k: v for k, v in j.get("mods", {}).items() if _skin_env(k) not in LAND_ENVS_EXCLUDE})
             data["skins"] = copy.deepcopy(j)
         if text and ctl.text is not None:
-            data["text"] = copy.deepcopy(ctl.text.to_json())
+            t = ctl.text.to_json()
+            data["text"] = {k: copy.deepcopy(t[k]) for k in ("text", "font", "align", "phrases", "cycle") if k in t}
         if media and self.media.get("tex"):
             data["media"] = {"tex": self.media["tex"]}
         return data
@@ -654,7 +658,7 @@ class ThemeManager:
             bars = max(bars, AUTO_MIN_BARS)
         if hist and not ctl._tl_firing and not ctl._hist_mute:
             ctl.history.append(dict(key=ctl._hkey_once(), t=ctl.now(), old={}, comp=None, mods=None, stack=None,
-                                    theme=dict(scope=dict(scope), data=self.capture_data(scope))))
+                                    theme=dict(scope=dict(scope), data=self.capture_data(scope, missing_ok=True))))
             ctl._redo = []
         if scope["kind"] == "look":
             ctl._comp_clear()                                 # like a snapshot recall: no clip is on air any more
@@ -764,9 +768,16 @@ class ThemeManager:
 
     def undo_apply(self, snap):
         """Controller.undo of a theme restore: put the pre-restore capture back (a cut). Returns the inverse."""
-        inv = dict(scope=dict(snap["scope"]), data=self.capture_data(snap["scope"]))
+        inv = dict(scope=dict(snap["scope"]), data=self.capture_data(snap["scope"], missing_ok=True))
         self.ctl._lane_morph.pop("theme", None)
-        self.apply(dict(id=None, scope=snap["scope"], data=snap["data"]), cut=True, hist=False)
+        gone = snap["data"].get("stack_absent")
+        st = self.ctl.stack
+        if gone is not None and st is not None:               # the restore had brought that layer back: remove it
+            st.layers = [x for x in st.layers if x["id"] != gone]
+            st.mods = {k: v for k, v in st.mods.items() if not k.startswith(f"{gone}:")}
+            st.edits += 1
+        else:
+            self.apply(dict(id=None, scope=snap["scope"], data=snap["data"]), cut=True, hist=False)
         return inv
 
     def restore_preset(self, p, opts):
@@ -789,7 +800,7 @@ class ThemeManager:
     # ---- performer / media / engine notes from the controller
     def manual(self, now=None):
         now = self.ctl.now() if now is None else now
-        self._manual_until = now + self.override_s
+        self._manual_t = now                                  # held while now < _manual_t + override (live setting)
         if self.pending and self.pending.get("auto"):
             self._log("block", self.find(self.pending["id"]), note="performer moved: pending recall dropped")
             self.pending = None
@@ -797,7 +808,7 @@ class ThemeManager:
     def saw(self, c):
         """A validated command from the panel / assistant (Controller.apply)."""
         cmd = c.get("cmd")
-        if cmd in PERFORMER_CMDS or (cmd == "theme" and c.get("op") in ("restore", "capture", "recapture")):
+        if cmd in PERFORMER_CMDS or (cmd == "theme" and c.get("op") == "restore"):     # a capture moves nothing
             self.manual()
 
     def note_media(self, cmds):
@@ -899,7 +910,7 @@ class ThemeManager:
                 or (ctl.values or {}).get("blackout", 0.0) > 0.05 or "layers" in ctl.bypass
                 or ctl.base.get("master", 1.0) < 0.02 or "blackout" in ctl._tl_trig):
             return "blackout"
-        if now < self._manual_until:
+        if now < self._manual_t + self.override_s:
             return "performer"
         if getattr(ctl, "fg_hold", False):
             return "flashguard"
@@ -1089,7 +1100,7 @@ class ThemeManager:
         if self.block and (self.armed or self.meters):
             out["block"] = self.block
             if self.block == "performer":
-                out["susp"] = round(self._manual_until - now, 1)
+                out["susp"] = round(self._manual_t + self.override_s - now, 1)
         if self._last_fire:
             t, i, name, sim, auto = self._last_fire
             out["last"] = [round(time.time() - t, 1), i, name, round(sim, 3), auto]

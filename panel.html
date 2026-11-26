@@ -2202,13 +2202,25 @@ document.addEventListener('contextmenu',function(e){if(!typing(e))e.preventDefau
 /* ---------------- BYPASS switches: tab header, top of each tab, ALL FX OFF */
 (function(){
   var PW='<svg viewBox="0 0 16 16"><path d="M8 1.5v6M4.2 4a5.6 5.6 0 1 0 7.6 0"/></svg>',items=[];
+  /* every tab can be switched fully off and on again, LAYERS included. Off there means a BLACK projector, so the
+     first tap only arms it (3 s) and says so; the second tap does it. Switching back ON is always one tap, and
+     PANIC clears it. While it is off a red banner stays on every tab. */
+  var armT=0,armEl=null;
+  function armLayers(el){var n=Date.now();if(armEl===el&&n-armT<3000){armT=0;armEl=null;el.classList.remove('arm');return true;}
+    if(armEl)armEl.classList.remove('arm');armT=n;armEl=el;el.classList.add('arm');
+    banner('ALL LAYERS OFF makes the projector black. Tap again within 3 s to confirm.',3000);
+    setTimeout(function(){if(armEl===el&&Date.now()-armT>=3000){el.classList.remove('arm');armEl=null;}},3100);return false;}
+  var allOff=h('button');allOff.id='alloff';allOff.textContent='ALL LAYERS OFF: the projector is black. Tap here (or PANIC) to bring the layers back.';
+  allOff.style.cssText='display:none;position:fixed;left:0;right:0;top:0;z-index:40;min-height:44px;border:0;border-radius:0;background:var(--warn);color:#fff;font-weight:800;font-size:16px';
+  allOff.addEventListener('click',function(){if(!learnMode)setByp('layers',false);});document.body.appendChild(allOff);
+  var st2=document.createElement('style');st2.textContent='#tabs button .pw.arm,.pwbar button.arm{background:var(--warn);border-color:var(--warn);color:#fff}';document.head.appendChild(st2);
   [].forEach.call($('tabs').querySelectorAll('button[data-tab]'),function(b){
     var t=b.dataset.tab;if(BYP.indexOf(t)<0||!pages[t])return;         /* perform / scenes / mapping ... have nothing to bypass */
     var pw=h('i','pw');pw.innerHTML=PW;pw.dataset.mt='bypass:'+t;pw.title='switch everything on this tab off / on again (settings are kept)';
-    pw.addEventListener('click',function(e){if(learnMode)return;e.stopPropagation();setByp(t);});
-    if(t!=='layers')b.appendChild(pw);       /* every layer off = black: not one small click away in the tab strip */
+    pw.addEventListener('click',function(e){if(learnMode)return;e.stopPropagation();if(t==='layers'&&!isByp(t)&&!armLayers(pw))return;setByp(t);});   /* LAYERS off = a black projector: it takes a second, confirming tap */
+    b.appendChild(pw);
     var bar=h('div','pwbar'),sw=h('button'),tx=h('span');sw.dataset.mt='bypass:'+t;
-    sw.addEventListener('click',function(){if(!learnMode)setByp(t);});
+    sw.addEventListener('click',function(){if(learnMode)return;if(t==='layers'&&!isByp(t)&&!armLayers(sw))return;setByp(t);});
     add(bar,sw,tx);pages[t].insertBefore(bar,pages[t].firstChild);
     items.push([t,b,bar,sw,tx,b.textContent.replace(/F\d+$/,'')]);
   });
@@ -2222,6 +2234,7 @@ document.addEventListener('contextmenu',function(e){if(!typing(e))e.preventDefau
       setTxt(it[4],off?it[5]+' is switched OFF on the projector. Every fader, mod and scene value is kept (and still editable): click to bring it back exactly.'
         :it[5]+' is ON. Click to switch this whole tab off; nothing is changed or lost.');});
     if(fx){var o=isByp('fx');fx.classList.toggle('on',o);setTxt(fx,o?'ALL FX OFF':'ALL FX');}
+    allOff.style.display=isByp('layers')?'block':'none';
   });
 })();
 
@@ -2517,7 +2530,7 @@ function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cl
 function send(c){c.cmd='online';if(window.__panel&&window.__panel.send)window.__panel.send(c);}
 var O={on:false,mode:'suggest',backend:'claude',engine:'local'},have=false;
 var PRIV='Prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.';
-var CHATPRIV='While ONLINE is on, your message and the current settings are sent to the chosen assistant (the Claude Code CLI, with its own login on this laptop). Nothing is sent while ONLINE is off.';
+var CHATPRIV='While ONLINE is on, your message and the current settings are sent to the chosen assistant (the Claude Code CLI, or agy if you allowed the Google CLI tools; each uses its own login on this laptop). Nothing is sent while ONLINE is off.';
 function toggle(){send({op:'enable',on:!O.on});}
 function ask(inp){var t=(inp.value||'').trim();if(!t)return;if(!O.on){note('Switch ONLINE on first');return;}
   send({op:'ask',text:t.slice(0,1000)});inp.value='';}
@@ -2535,13 +2548,18 @@ var pg=$('pg-assistant'),ui={};
 if(pg){
   var c=el('div','card grow onlc');c.style.flexBasis='640px';c.appendChild(el('h2',null,'Online assistant: describe what you want, it proposes the changes'));
   var r=el('div','row');ui.sw=el('button','big onl-sw','ONLINE OFF');ui.sw.id='onlbig';ui.sw.addEventListener('click',toggle);
-  ui.be=seg([['claude','CLAUDE CODE']],O.backend,function(v){send({op:'backend',backend:v});});ui.be.id='onlbe';   /* chat is Claude Code only: Google's CLIs are coding agents with no tool-less mode */
+  ui.be=seg([['claude','CLAUDE CODE'],['agy','AGY (GEMINI)']],O.backend,function(v){
+    if(v==='agy'&&!O.cli_google){note('agy is opt-in: tick Allow Google CLI tools first (on the laptop itself)');return;}send({op:'backend',backend:v});});ui.be.id='onlbe';
   ui.mo=seg([['suggest','SUGGEST'],['autopilot','AUTOPILOT']],O.mode,function(v){send({op:'mode',mode:v});});ui.mo.id='onlmode';
   var can=el('button',null,'CANCEL');can.addEventListener('click',function(){send({op:'cancel'});});
   var clr=el('button',null,'CLEAR CHAT');clr.addEventListener('click',function(){send({op:'clear'});});
   [ui.sw,ui.be,ui.mo,can,clr].forEach(function(x){r.appendChild(x);});c.appendChild(r);
   ui.hint=el('div','dim','SUGGEST shows the proposed changes with Apply. AUTOPILOT applies them at once; every batch can be undone below. The assistant can move faders, pick palettes / scenes / images, switch layers, set text and start AI images. It can never flash, strobe, black out, PANIC or touch the mapping.');c.appendChild(ui.hint);
   c.appendChild(el('div','priv',CHATPRIV));
+  var ol=el('label','onl-opt');ui.cli=el('input');ui.cli.type='checkbox';ui.cli.id='onlcli';
+  ui.cli.addEventListener('change',function(){if(!O.on){ui.cli.checked=false;note('Switch ONLINE on first');return;}send({op:'cli_google',on:ui.cli.checked});});
+  ol.appendChild(ui.cli);ui.cliT=el('span',null,'Allow Google CLI tools (agy): agy as a second chat assistant, Nano Banana images without an API key, and AUTO MAP vision. WARNING: agy is a coding AGENT, not a plain model. It is run read-only (plan mode) in a throw-away folder and told to answer only, but treat it as a program with access to this laptop. Antigravity\'s terms (antigravity.google/terms) may not permit other software driving the CLI: read them first. Off by default; it can only be ticked in a panel opened on the laptop itself (address 127.0.0.1) or in online_local.json.');
+  ui.cliT.id='onlcliT';ol.appendChild(ui.cliT);c.appendChild(ol);
   ui.log=el('div','onl-log');ui.log.id='onllog';c.appendChild(ui.log);
   ui.stat=el('div','dim');ui.stat.id='onlstat';c.appendChild(ui.stat);
   var inr=el('div','onl-in');ui.ta=el('textarea');ui.ta.id='onlta';ui.ta.rows=2;ui.ta.maxLength=1000;
@@ -2601,7 +2619,8 @@ function draw(){
   var on=!!O.on,lab=on?'ONLINE ON':'ONLINE OFF';
   if(tbB){tbB.textContent=lab;tbB.classList.toggle('on',on);}
   if(ui.sw){ui.sw.textContent=lab;ui.sw.classList.toggle('on',on);ui.be._set(O.backend);ui.mo._set(O.mode);
-    var bk=O.backends||{};[].forEach.call(ui.be.children,function(b){var i=bk[b.dataset.v];if(i){b.title=!i.ok?(i.why||'not available'):'';b.style.opacity=!i.ok?'.45':'';}});
+    var bk=O.backends||{};[].forEach.call(ui.be.children,function(b){var i=bk[b.dataset.v];if(i){b.title=i.optin?'opt-in: tick Allow Google CLI tools (on the laptop itself)':!i.ok?(i.why||'not available'):'';b.style.opacity=(!i.ok||i.optin)?'.45':'';}});
+    if(document.activeElement!==ui.cli)ui.cli.checked=!!O.cli_google;
     }
   var props={};(O.props||[]).forEach(function(p){props[p.id]=p;});
   if(ui.log){
@@ -2614,7 +2633,7 @@ function draw(){
         ui.log.appendChild(d);if(m.prop!=null&&props[m.prop])ui.log.appendChild(propBox(props[m.prop],false));});
       if(atEnd)ui.log.scrollTop=ui.log.scrollHeight;}
     var b=O.busy,bl=b&&O.backends&&O.backends[b.backend]?O.backends[b.backend].label:(b?b.backend:'');
-    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):(O.notice||O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
+    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(b.backend==='agy'?'  (agy takes 20 s or more)':'')+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):(O.notice||O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
   }
   if(ui.hist){var hk=JSON.stringify(O.history||[]);if(hk!==keyHist){keyHist=hk;ui.hist.textContent='';
     var hs=(O.history||[]).slice().reverse();if(!hs.length)ui.hist.appendChild(el('div','dim','Nothing applied yet.'));
@@ -2634,7 +2653,7 @@ function draw(){
     eng.priv.style.display=on?'':'none';eng.key.style.display=on?'':'none';
     eng.kst.textContent=O.has_key?'Key saved on this laptop (in your user profile, outside the show folder). Recommended route.':'No key saved. The key is kept in your user profile on this laptop; it travels once over your local network to get there.';
     var n=O.nano,t='';
-    if(on&&n){t=!n.available.length?'No online image route yet: save your own Gemini API key above. Until then the local engine is used.'
+    if(on&&n){t=!n.available.length?'No online image route yet: save your own Gemini API key above (recommended), or allow the Google CLI tools on the ASSISTANT tab (from the laptop itself). Until then the local engine is used.'
       :(n.current?'Nano Banana is generating ('+n.current.provider+', '+(+n.current.secs).toFixed(0)+' s)…':n.pending?'Nano Banana: queued':'')+(n.note?(n.current||n.pending?'  ·  ':'')+n.note:'');
       var ld=n.done&&n.done[n.done.length-1];if(!t&&ld)t='Last online image: '+ld.name+' ('+ld.provider+', '+(+ld.secs).toFixed(1)+' s)';}
     eng.stat.textContent=t;eng.stat.style.color=n&&n.note?'#ff8b98':'';}

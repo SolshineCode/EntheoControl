@@ -369,6 +369,9 @@ class Assistant:
         if name not in self.backends:
             self._msg("system", f"Unknown backend '{name}'.")
             return False
+        if name in getattr(self, "blocked", {}):
+            self._msg("system", f"{self.backends[name].label} is switched off. {self.blocked[name]}")
+            return False
         if self._avail is None:
             self._msg("system", "The assistant is still starting: try again in a moment.")
             return False
@@ -623,7 +626,7 @@ class Assistant:
         b = self._busy
         return dict(
             mode=self.mode, backend=self.backend,
-            backends={n: dict(label=getattr(be, "label", n), ok=self.available(n),
+            backends={n: dict(label=getattr(be, "label", n), ok=self.available(n), optin=n in getattr(self, "blocked", {}),
                               why=(getattr(be, "problem", "") or "") if self._avail is not None else "checking")
                       for n, be in self.backends.items()},
             busy=dict(id=b["id"], backend=b["backend"], secs=round(time.monotonic() - b["t0"], 1), chars=b["chars"]) if b else None,

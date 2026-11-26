@@ -10,21 +10,27 @@ button press, the exact image is shown in the panel before it is sent, people ar
 person in it needs an explicit confirmation. Replies are untrusted data: parsed tolerantly, then validated and clamped
 by automap (polygon checks, per-vertex nudge bound).
 
-Provider (the only one; the agy CLI route was removed with the Online plugin's agy route, PR-2 B6):
+Providers, in order:
   GeminiVisionProvider  the USER's own Gemini API key (the plugin's KeyStore), plain HTTPS, Interactions endpoint, text +
                         image in, text out. Model: VISION_MODEL (env ONLINE_VISION_MODEL overrides). NOT yet exercised
                         against the live API (no key on this laptop): request / reply shapes follow images.py.
+  AgyVisionProvider     the agy CLI, only with the local "Allow Google CLI tools" opt-in (plugin.cli_google). agy is a
+                        coding agent, so it is confined like every agy call (backends.py): a fresh sandbox folder under
+                        the system temp folder holding only prompt.txt (the question, under the answer-only rules) and
+                        scene.png, deleted afterwards; constant command line; read-only plan mode. Its answer is text:
+                        parsed as JSON here, then validated and clamped by automap like any other reply.
 Claude Code is not used: in the plugin's locked-down mode it has no file / image access.
 """
 import base64
 import json
 import os
 import re
+import shutil
 import time
 import urllib.error
 import urllib.request
 
-from .backends import BackendError
+from .backends import AGY_MODE, BackendError, agy_pty, drop_sandbox, sandbox, write_prompt
 from .images import API_REVISION, API_URL
 
 VISION_MODEL = os.environ.get("ONLINE_VISION_MODEL") or "gemini-3.1-flash-lite"
@@ -150,6 +156,42 @@ class GeminiVisionProvider:
         return text
 
 
+AGY_VISION_TASK = ("Read the file prompt.txt in the current folder. Follow the rules at the top of that file. Below the "
+                   "line it asks a question about the picture scene.png in the same folder. Look at scene.png and "
+                   "answer the question. Reply with only the JSON answer.")
+
+
+class AgyVisionProvider:
+    name = "agy"
+
+    def __init__(self, timeout=300.0, exe=None, model="gemini-4-hydrogen-low", runner=None, make_sandbox=None):
+        self.timeout, self._exe, self.model = float(timeout), exe, model
+        self._run = runner or agy_pty
+        self._sandbox = make_sandbox or (lambda: sandbox("vision"))
+        self._which, self._which_t = None, -1e9
+
+    def exe(self):
+        if self._exe:
+            return self._exe
+        now = time.monotonic()
+        if now - self._which_t > 30.0:                     # not a PATH search on every status poll
+            self._which, self._which_t = shutil.which("agy"), now
+        return self._which
+
+    def available(self):
+        return bool(self.exe())
+
+    def ask(self, prompt, png, work=None, cancel=None):
+        d = self._sandbox()                                # fresh temp folder: never the project, never the home folder
+        try:
+            write_prompt(d, prompt)                        # the question travels in a file, never on the command line
+            (d / "scene.png").write_bytes(png)
+            return self._run(self.exe(), AGY_VISION_TASK, d, timeout=self.timeout, idle_after=30.0, cancel=cancel,
+                             model=self.model, extra=("--effort", "low"), mode=AGY_MODE)
+        finally:
+            drop_sandbox(d)                                # the picture does not stay on disk
+
+
 class Vision:
     """What automap uses (built from the live Online plugin each time it is needed)."""
 
@@ -160,16 +202,20 @@ class Vision:
     @classmethod
     def from_plugin(cls, plugin):
         """None when ONLINE is off (no plugin). ONE Vision per plugin (kept on it), so the call limit really holds
-        across requests. Gemini API with the user's own key is the only provider."""
+        across requests. Providers: the Gemini API with the user's own key, then agy while the local opt-in is on."""
         if plugin is None:
             return None
         v = getattr(plugin, "_vision", None)
         if v is None:
             v = cls([GeminiVisionProvider(plugin.keys)], log=getattr(plugin, "log", None))
+            v._agy = AgyVisionProvider()
             try:
                 plugin._vision = v
             except AttributeError:
                 pass
+        cli = bool(getattr(plugin, "cli_google", False))  # agy only while "Allow Google CLI tools" is on
+        agy = getattr(v, "_agy", None)
+        v.providers = [p for p in v.providers if p.name != "agy"] + ([agy] if cli and agy is not None else [])
         return v
 
     def available(self):
@@ -187,7 +233,7 @@ class Vision:
         """-> (parsed JSON dict, provider name). Tries each available provider; BackendError if none answers."""
         avail = [p for p in self.providers if p.available()]
         if not avail:
-            raise BackendError("no AI vision route: save your Gemini API key (AI DREAM tab)")
+            raise BackendError("no AI vision route: save your Gemini API key (AI DREAM tab), or allow the Google CLI tools")
         self._allow()
         errs = []
         for p in avail:

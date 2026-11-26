@@ -524,7 +524,7 @@ A show is the whole project: look, 16 scenes, timelines, settings (BPM, clock, m
 ### 11.2 Presets (top bar PRESETS)
 Smaller pieces: LOOK, LAYER, FX (the filter chain), MOD routing, MAPPING, MIDI map. Type a name, **SAVE PRESET** (a thumbnail is grabbed from the output). Click a card to recall it; tick groups first for a partial recall (only COLOR, say) and pick CUT or a morph length. Star = favourite, search finds names and tags, `...` = rename, tags, export (a small `.json`), **+ CUE** (put it on the timeline), delete. **IMPORT PRESET** loads a `.json`.
 
-<!-- TODO(themes+sound-tags): when themes and sound tags land, document them here (how a theme is applied, where tags are set, how they filter presets/scenes). -->
+A starred THEME is a preset too (kind Theme, see 11.4).
 
 ### 11.3 Timeline
 A playhead in bars (follows TAP, MIDI clock or Link) or seconds.
@@ -534,6 +534,21 @@ A playhead in bars (follows TAP, MIDI clock or Link) or seconds.
 - **Live override**: touching a fader the timeline drives hands it to you. TOUCH gives it back 1.5 s after you let go; LATCH keeps it until **RE-ENABLE**. **RELEASE** gives every fader back. FOLLOW keeps the playhead in view.
 - **Audio** (optional): **+ AUDIO** uploads a song (`shows\_media\`), pick it, then press **AUDIO HOST** on the one device that should play it. Use SECONDS units for a song with fixed timing.
 - **Safety**: PANIC stops the timeline. Flashes it plays are held to at most 2.5 per second and brightness lanes cannot swing faster than 0.2 s. Timeline events never switch the webcam, PANIC, ONLINE, mapping or recording.
+
+### 11.4 Themes and sound tags (THEMES tab, PERFORM quick box)
+A **theme** is a snapshot of one part of the picture that you can bring back exactly, any time, while everything else stays as it is.
+- **Capture** (one tap, no dialog): the small camera button on any layer row (LAYERS card, PERFORM live layers, BUILD stack rows) captures that layer; the camera on a tab's ON / OFF bar captures that tab; **LOOK** captures everything visual (not mapping, not MIDI). It lands in the THEMES tray named after the layer, the time and the palette, with a thumbnail.
+- **Restore**: tap a card. It comes back on your Quantize with your Morph length (like a scene). **Hold** a card for half a second for an instant cut. Only that layer or tab changes. **UNDO** (THEMES tab) takes a restore back.
+- What comes back: every fader of that layer or tab, its modulation, its ON / OFF switches, the math-stack layers (same ids, and on a cut the same scroll and spin positions), skins, text, the AI texture, the kené design number, the beings' form and count. What keeps running: anything that moves by itself over time (rotation, travel, serpents and beings wandering, the trail buffer). It comes back in the same state, not at the same moment.
+- **Star** keeps a theme for good: it is saved in PRESETS (kind Theme) and can be a timeline cue. The tray itself survives a restart and is saved with the show. The `...` menu renames, recaptures (overwrite with what is on now) and deletes.
+- **MIDI**: MIDI LEARN, then tap a theme card: the pad restores that slot (`theme:<n>`). Shift + pad captures the look into that slot.
+
+**Sound tags** bring a theme back by themselves when similar music plays.
+1. Pick a theme, play the music you want it to belong to, press **TAG** (5, 10 or 15 s). It listens to the laptop's sound and keeps a short description of it (pitch profile, timbre, brightness, rhythm). It never keeps the audio. Tag again on another part of the song to give it more examples.
+2. Per tag: **SIMILAR VIBE** (same kind of sound, any key) or **SAME SECTION** (same chords in order; tick key-invariant if the DJ may play it in another key), sensitivity, how long the match must hold (default 3 s), cooldown (30 s), quantize (bar), morph, priority, enabled, and "only with autopilot".
+3. **SOUND TAGS ARMED** switches it on. It is off every time the show starts. **LEARN / TEST** shows the live match of every tag against its threshold, without firing anything.
+- A theme fires when its music **arrives**: music that is already playing when you arm does not fire until it comes back. It never fires during PANIC (and holds 30 s after it), blackout or master down, while the flash guard is holding, or when the governor is at critical. **You always win**: any fader, pad or switch you touch holds sound tags for 20 s (HANDS-OFF; change it on the THEMES tab) and uses up a match that was waiting. A sound tag never switches a layer on or off and never cuts (at least one beat of morph). Every recall and every hold is in the THEMES log.
+- **SUGGEST TAGS** looks back over the last 10 minutes for sections that came back, so you can tag one to a theme (or to a new look theme) with one tap.
 
 ---
 
@@ -559,6 +574,7 @@ The show never needs the internet. **ONLINE** in the top bar is OFF by default; 
   - It only calls the model when you press SEND (no background loop). Rate-limited to 6 requests a minute.
 - **Gemini images ("Nano Banana")**: AI DREAM > Image engine > **NANO BANANA** for recognisable subjects (a Buddha, a jaguar). Paste your own Gemini API key (from https://aistudio.google.com) and press **SAVE KEY**. If it fails or you are offline, the local engine makes the image instead. Add "on a pure black background" to prompts.
 - **Privacy**: assistant prompts include the show's parameter names, current values and file names, and go to Anthropic through your Claude Code login. Image prompts (and the frame, for dream-from-frame) and AUTO MAP AI pictures go to Google with your key; usage limits apply. The key is stored in your Windows user profile (`%APPDATA%\PsyProjector\online_keys.json`), never in the show folder, state or logs. It travels once from the panel to the laptop over the local network: on untrusted venue Wi-Fi, type it on the laptop itself.
+- **Allow Google CLI tools (agy)**: a checkbox on the ASSISTANT tab, off by default. With it, your `agy` (Antigravity) login can be used as a second chat assistant (AGY button, about 20 s per answer), for Nano Banana images without an API key (about 30 s each) and for AUTO MAP AI assist. It can only be ticked in a panel opened on the laptop itself (address 127.0.0.1), never from a phone, or by putting `{"cli_google": true}` into `online_local.json` in the show folder. agy is a coding agent, not a plain model: it is run read-only in a throw-away folder and told to answer only, and whatever it answers goes through the same safety checks as Claude's answers, but treat it as a program with access to the laptop. Antigravity's terms (https://antigravity.google/terms) may not permit other programs driving the CLI: read them and decide. Claude Code stays the default assistant.
 - Everything the online features do is logged to `logs\online_<date>.log` (never the key).
 
 ---
@@ -671,7 +687,6 @@ These are planned or in progress and are **not** in the panel yet. See [research
 - **Clip grid with macro knobs**: playable clips per lane (World, Figures, Text, Interact) with 4-8 named macro knobs each, launched from a grid with live thumbnails. The controller-side clip model exists; the panel does not show it yet. <!-- TODO(clips): document the PLAY grid, clip launch/stop, macros and decks when the panel lands. -->
 - **Direct manipulation**: grab and drag on the picture to rotate, move, scale and bend.
 - **Real picture transitions** (dissolve, wipe, portal) between clips.
-- **Themes and sound tags**. <!-- TODO(themes+sound-tags) -->
 - **Layer windowing**: shaped windows, mattes, irises and split screens per layer.
 - **More skins**: beings bodies and the Folding Blocks fill.
 - **A faster AI image engine** for recognisable subjects.
@@ -715,3 +730,6 @@ These are planned or in progress and are **not** in the panel yet. See [research
 | **Surface** | One mapped area on the wall (a box face, a sculpture facet) |
 | **Travel** | Flying into the picture |
 | **Trigger** | A momentary effect: flash, strobe, invert, freeze, blackout, punch |
+- New (2026-11-26) on KENÉ STUDY: Medium "Painted kené (study)", "Cloth kené (study)", "Embroidered kené (study)"; Line forms
+  (arms with arrowheads / T-bars + small colour blocks, on by default); bead motifs "Woven band", "Bead tiles", "Bead straps
+  (Yawanawá-inspired)", "Key-fret beadwork" (all studies); Bead medium "staggered rows"; ombré bead colours + "Ombré cycling".
