@@ -1,0 +1,18 @@
+# Core engine
+moderngl>=5.13
+glfw>=2.11
+numpy>=2.0
+pillow>=11
+SoundCard>=0.4.6
+# Control
+mido>=1.3
+python-rtmidi>=1.5
+aalink>=0.2      # optional: Ableton Link
+SpoutGL>=0.1     # optional: Spout output (Windows)
+# Local AI (optional; install torch with CUDA from pytorch.org first)
+torch
+diffusers>=0.30
+transformers>=4.45
+accelerate>=1.0
+# Tests
+pytest>=8
