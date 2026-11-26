@@ -3,44 +3,61 @@
 control.py calls these hooks (each is a no-op while the plugin is not loaded):
 
     validate(c)        validator for {"cmd": "online", "op": ...}           (control._VALIDATORS)
+    mark_local(c)      called by remote_control for requests from 127.0.0.1 only (see cli_google)
     do(ctl, c)         run one validated "online" command                    (Controller._do)
     boot(ctl)          load the plugin if the saved switch says ON           (end of Controller.__init__)
     tick(ctl)          collect finished jobs, apply autopilot batches        (Controller.update, GL thread)
     state(ctl)         the "online" block of Controller.state()
     take_gen(ctl, job) True = the Nano Banana engine took this image job     (Controller._do "gen")
-    on_panic(ctl)      PANIC: drop everything queued, autopilot -> suggest   (Controller.panic)
+    on_panic(ctl)      PANIC: drop everything queued / in flight, autopilot -> suggest   (Controller.panic)
     close(ctl)         stop worker threads, kill child processes             (Controller.close)
 
-Settings live in ctl.ext["online"] = {on, mode, backend, engine}, saved with live_state.json like the governor's.
+Settings live in ctl.ext["online"] = {on, mode, backend, engine, cli_google}, saved with live_state.json.
 
 Commands (all {"cmd": "online", "op": ...}):
     enable {on: bool}                      the master ONLINE switch (default OFF)
     mode {mode: "suggest" | "autopilot"}   suggest = show a diff with Apply; autopilot = apply, undoable
-    backend {backend: "claude" | "agy"}    which CLI answers the chat
+    backend {backend: "claude"}            which CLI answers the chat (Claude Code only: agy has no tool-less mode)
     engine {engine: "local" | "nano"}      AI DREAM image engine (nano = Nano Banana, only while ONLINE is on)
-    cli_google {on: bool}                  opt-in (default OFF) to driving Google's CLIs (agy / gemini CLI) from this
-                                           plugin: the agy chat backend and the CLI image providers. The user must
-                                           review Antigravity's terms first; without it only Claude Code (chat) and
-                                           the Gemini API with the user's own key (images) are used.
-    key {key: str}                         the user's own Gemini API key for Nano Banana ("" = forget it); kept in
-                                           online_keys.json next to the code, never logged, never sent back to a panel
-    ask {text, backend?}                   chat message (<= MAX_ASK characters)
+    cli_google {on: bool}                  opt-in (default OFF) to the agy CLI as an IMAGE provider. LOCAL ONLY: it is
+                                           honoured when the request came from 127.0.0.1 (remote_control marks it), or
+                                           set by hand in online_local.json next to the code ({"cli_google": true}).
+                                           From any other address it is refused: a panel on the venue Wi-Fi can never
+                                           switch on a tool that acts on this laptop.
+    key {key: str}                         the user's own Gemini API key for Nano Banana ("" = forget it); kept in the
+                                           user's app-data folder, never logged, never sent back to a panel
+    ask {text}                             chat message (<= MAX_ASK characters)
     apply {id} / dismiss {id}              a pending proposal
     undo {id}                              an applied batch (history)
     cancel                                 stop the running request and clear the queue
     clear                                  clear the chat (history of applied batches is kept)
 """
+import json
 import re
 from pathlib import Path
 
 MODES = ("suggest", "autopilot")
-BACKENDS = ("claude", "agy")
+BACKENDS = ("claude",)
 ENGINES = ("local", "nano")
 MAX_ASK = 1000
 MAX_ID = 10 ** 9
 DEFAULTS = dict(on=False, mode="suggest", backend="claude", engine="local", cli_google=False)
 OPS = ("enable", "mode", "backend", "engine", "cli_google", "key", "ask", "apply", "dismiss", "undo", "cancel", "clear")
 KEY_RX = re.compile(r"^[A-Za-z0-9_\-]{20,200}$")
+LOCAL = object()             # identity marker: cannot be produced by JSON, so a network client cannot forge it
+LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+LOCAL_FILE = "online_local.json"
+
+
+def is_loopback(addr):
+    return isinstance(addr, str) and addr in LOOPBACK
+
+
+def mark_local(c):
+    """remote_control calls this for a command that arrived from this laptop itself (client address 127.0.0.1)."""
+    if isinstance(c, dict) and c.get("cmd") == "online":
+        c["_local"] = LOCAL
+    return c
 
 
 def _choice(c, key, allowed):
@@ -63,6 +80,8 @@ def validate(c):
     if not isinstance(op, str) or op not in OPS:
         raise ValueError(f"'op' must be one of {list(OPS)}")
     out = {"cmd": "online", "op": op}
+    if c.get("_local") is LOCAL:                      # only the object remote_control put there survives
+        out["_local"] = LOCAL
     if op in ("enable", "cli_google"):
         if not isinstance(c.get("on"), bool):
             raise ValueError("'on' must be true or false")
@@ -103,20 +122,37 @@ def settings(ctl):
         for key, allowed in (("mode", MODES), ("backend", BACKENDS), ("engine", ENGINES)):
             if raw.get(key) in allowed:
                 s[key] = raw[key]
-    if s["backend"] == "agy" and not s["cli_google"]:
-        s["backend"] = "claude"                       # agy is opt-in
     return s
+
+
+def _root(ctl):
+    opts = getattr(ctl, "online_opts", None) or {}
+    return Path(opts.get("root") or Path(__file__).resolve().parents[2])
+
+
+def _local_file(ctl):
+    """online_local.json next to the code: the by-hand way to give (or withdraw) the cli_google opt-in."""
+    try:
+        d = json.loads((_root(ctl) / LOCAL_FILE).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _load(ctl):
     """Import the real plugin and attach it. Only ever called with the switch ON."""
     if getattr(ctl, "online", None) is not None:
         return ctl.online
+    s = settings(ctl)
+    f = _local_file(ctl)
+    if isinstance(f.get("cli_google"), bool):         # the file on this laptop's disk wins over the saved state
+        s["cli_google"] = f["cli_google"]
+        ctl.ext["online"] = s
     from .plugin import OnlinePlugin                 # subprocess-capable code is imported here and nowhere else
     opts = dict(getattr(ctl, "online_opts", None) or {})
     opts.setdefault("root", Path(__file__).resolve().parents[2])
     opts.setdefault("art_dir", getattr(ctl, "art_dir", None))
-    ctl.online = OnlinePlugin(settings=settings(ctl), **opts)
+    ctl.online = OnlinePlugin(settings=s, **opts)
     return ctl.online
 
 
@@ -140,6 +176,7 @@ def boot(ctl):
 def do(ctl, c):
     s = settings(ctl)
     op = c["op"]
+    p = getattr(ctl, "online", None)
     if op == "enable":
         s["on"] = c["on"]
         ctl.ext["online"] = s
@@ -148,18 +185,18 @@ def do(ctl, c):
         else:
             _unload(ctl)
         return
-    if op in ("mode", "backend", "engine", "cli_google"):
-        if op == "backend" and c["backend"] == "agy" and not s["cli_google"]:
-            return                                    # not opted in: the choice is refused
-        s[op] = c["on"] if op == "cli_google" else c[op]
-        if op == "cli_google" and not c["on"] and s["backend"] == "agy":
-            s["backend"] = "claude"
-        ctl.ext["online"] = s
-        if getattr(ctl, "online", None) is not None:
-            ctl.online.configure(s)
+    if op == "cli_google" and c.get("_local") is not LOCAL:
+        if p is not None:                             # not from this laptop: refused, and said so
+            p.refused("cli_google", "only from the laptop itself (http://127.0.0.1) or online_local.json")
         return
-    if getattr(ctl, "online", None) is not None:      # ask / apply / dismiss / undo / cancel / clear: OFF = ignored
-        ctl.online.command(ctl, c)
+    if op in ("mode", "backend", "engine", "cli_google"):
+        s[op] = c["on"] if op == "cli_google" else c[op]
+        ctl.ext["online"] = s
+        if p is not None:
+            p.configure(s)
+        return
+    if p is not None:                                 # ask / apply / dismiss / undo / cancel / clear / key: OFF = ignored
+        p.command(ctl, c)
 
 
 def tick(ctl):

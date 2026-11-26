@@ -386,7 +386,7 @@ canvas.scope{display:block;width:100%;height:64px;background:#0b0810;border:1px 
 <tr><td><kbd>1</kbd>&hellip;<kbd>0</kbd></td><td>Recall scene 1-10 (<kbd>Ctrl</kbd> = 11-16)</td><td><kbd>Shift</kbd>+<kbd>1</kbd>&hellip;</td><td>Save scene</td></tr>
 <tr><td><kbd>B</kbd></td><td>Blackout (hold)</td><td><kbd>Esc</kbd> hold 0.5 s</td><td>PANIC: safe scene, triggers off</td></tr>
 <tr><td><kbd>F</kbd> <kbd>S</kbd> <kbd>I</kbd> <kbd>Z</kbd> <kbd>P</kbd></td><td>Flash / Strobe / Invert / Freeze / Punch (hold)</td><td><kbd>R</kbd></td><td>Ripple from the centre</td></tr>
-<tr><td><kbd>F1</kbd>&hellip;<kbd>F10</kbd></td><td>Tabs</td><td><kbd>L</kbd></td><td>MIDI learn mode</td></tr>
+<tr><td><kbd>F1</kbd>&hellip;<kbd>F10</kbd></td><td>Tabs (the number is printed on each tab; BUILD has none, LAYERS is still F5)</td><td><kbd>L</kbd></td><td>MIDI learn mode</td></tr>
 <tr><td><kbd>N</kbd> / <kbd>V</kbd> / <kbd>[</kbd> <kbd>]</kbd></td><td>Next texture / video clip / previous, next art piece</td><td><kbd>?</kbd></td><td>This sheet</td></tr>
 <tr><td>Fader</td><td colspan="3">drag = set &middot; <kbd>Shift</kbd>-drag = fine &middot; wheel = nudge &middot; double-click = default &middot; MOD = modulation &middot; teal line = live value</td></tr>
 <tr><td>Scene pad</td><td colspan="3">click = recall (quantized, morphed) &middot; <kbd>Shift</kbd>-click or long-press = save &middot; <kbd>Alt</kbd>-click = recall now</td></tr>
@@ -572,7 +572,7 @@ function segm(box,opts,get,set){          /* opts: [[value,label],...] */
 function lseg(label,opts,get,set){var w=h('div'),s=h('div','seg');add(w,h('div','lab',label),s);w.firstChild.style.marginBottom='4px';segm(s,opts,get,set);return w;}
 
 /* ---------------- tabs + pages */
-var TABS=[['perform','PERFORM'],['motion','MOTION'],['shape','SHAPE'],['color','COLOR'],['layers','LAYERS'],['fractal','FRACTAL'],['art','ART'],
+var TABS=[['build','BUILD'],['perform','PERFORM'],['motion','MOTION'],['shape','SHAPE'],['color','COLOR'],['layers','LAYERS'],['fractal','FRACTAL'],['art','ART'],
   ['scenes','SCENES'],['ai','AI DREAM'],['midi','CONTROLLERS'],['mapping','MAPPING'],['land','3D DECKS'],['bus','MOD BUS'],['assistant','ASSISTANT']];   /* ASSISTANT: ONLINE plugin, built by its own script block at the end */
 if(!META.params.some(function(p){return p.group==='land';}))TABS=TABS.filter(function(t){return t[0]!=='land';});
 var GROUP_TAB={motion:'motion',space:'shape',shape:'shape',color:'color',layers:'layers',fractal:'fractal',art:'art',land:'land'};
@@ -582,10 +582,12 @@ GROUP_NAME.text='Text';GROUP_TAB.beings='motion';GROUP_NAME.beings='Beings';    
 META.groups.forEach(function(g){if(g!=='master'&&!GROUP_TAB[g]){GROUP_TAB[g]=g;TABS.push([g,g.toUpperCase()]);}});
 var pages={};
 TABS.forEach(function(t,i){
-  var b=h('button',null,t[1]);b.dataset.tab=t[0];if(i<10)b.innerHTML=t[1]+'<small>F'+(i+1)+'</small>';
+  var b=h('button',null,t[1]);b.dataset.tab=t[0];if(i>0&&i<=10)b.innerHTML=t[1]+'<small>F'+i+'</small>';   /* BUILD is first and has no F key: F1..F10 keep their tabs */
   b.addEventListener('click',function(){setTab(t[0]);});$('tabs').appendChild(b);
   var pg=h('div','page');pg.id='pg-'+t[0];pages[t[0]]=pg;$('main').appendChild(pg);
 });
+/* bar order: BUILD, PERFORM, LAYERS, then the rest. Only the buttons move: every tab keeps its F key (shown on it). */
+(function(){var t=$('tabs'),l=t.querySelector('[data-tab="layers"]'),p=t.querySelector('[data-tab="perform"]');if(l&&p)t.insertBefore(l,p.nextSibling);})();
 add($('tabs'),h('div','sp'));
 var learnB=h('button',null,'MIDI LEARN');learnB.id='learn';learnB.title='L';$('tabs').appendChild(learnB);
 var helpB=h('button',null,'?');helpB.title='keyboard shortcuts';$('tabs').appendChild(helpB);
@@ -1046,7 +1048,7 @@ function drawSrc(cv,m,b){
     al.textContent='Amount '+(m.amt>=0?'+':'')+m.amt.toFixed(2);pl.textContent='Phase '+m.phase.toFixed(2);
     rl.style.opacity=rates.style.opacity=pl.style.opacity=ph.style.opacity=sync?1:0.3;amt.draw();ph.draw();});
 });
-function openMod(name){modName=name;$('modt').textContent='Modulation: '+P[name].label;$('modp').classList.add('on');draw();}
+function openMod(name,label){modName=name;$('modt').textContent='Modulation: '+(label||(P[name]?P[name].label:name));$('modp').classList.add('on');draw();}
 function closeMod(){modName=null;$('modp').classList.remove('on');draw();}
 $('modx').addEventListener('click',closeMod);
 $('modp').addEventListener('pointerdown',function(e){if(e.target===$('modp'))closeMod();});
@@ -1363,7 +1365,7 @@ function nudge(dx,dy){mNudge(dx*mStep,-dy*mStep);}        /* the shared keydown 
   function path(g,pts){g.beginPath();pts.forEach(function(p,i){if(i)g.lineTo(p[0],p[1]);else g.moveTo(p[0],p[1]);});g.closePath();}
   function spanBox(){
     var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9,n=0,W=MS.output[0],H=MS.output[1];
-    MS.surfaces.forEach(function(s){if(s.enabled&&s.source.mode==='span')mOutline(s).forEach(function(p){n++;x0=Math.min(x0,p[0]);y0=Math.min(y0,p[1]);x1=Math.max(x1,p[0]);y1=Math.max(y1,p[1]);});});
+    MS.surfaces.forEach(function(s){if(s.source.mode==='span')mOutline(s).forEach(function(p){n++;x0=Math.min(x0,p[0]);y0=Math.min(y0,p[1]);x1=Math.max(x1,p[0]);y1=Math.max(y1,p[1]);});});
     if(!n)return null;var w=Math.max(x1-x0,1),hh=Math.max(y1-y0,1),a=W/H,cw=w/hh>=a?w:hh*a,ch=w/hh>=a?w/a:hh;
     return [(x0+x1-cw)/2,(y0+y1-ch)/2,cw,ch];
   }
@@ -1567,7 +1569,8 @@ function nudge(dx,dy){mNudge(dx*mStep,-dy*mStep);}        /* the shared keydown 
     bmask.classList.toggle('on',s.shape==='poly');badd.disabled=bdel.disabled=s.shape!=='poly';
     rectRow.style.display=s.source.mode==='rect'?'':'none';
     bu.disabled=!MS.undo;br.disabled=!MS.redo;setTxt(bu,'UNDO'+(MS.undo?' ('+MS.undo+')':''));
-    setTxt(saved,MS.local?'waiting for the engine…':!MS.can_save?'surfaces.json is locked: NOT saving':MS.dirty?'unsaved edits (autosave in a moment)':'saved');
+    setTxt(saved,MS.local?'waiting for the engine…':MS.out==='fallback'?'SURFACE OUTPUT FAILED: showing the corner pin only, retrying':!MS.can_save?'surfaces.json is locked: NOT saving':MS.save_failed?'CAN’T SAVE surfaces.json: retrying':MS.dirty?'unsaved edits (autosave in a moment)':'saved');
+    saved.style.color=(MS.out==='fallback'||MS.save_failed||!MS.can_save)&&!MS.local?'var(--warn)':'';
     [].forEach.call(cols.children,function(b,k){b.classList.toggle('on',MCOL[k].join()===s.color.map(function(x){return +(+x).toFixed(2);}).join());});
   });
   window.addEventListener('resize',function(){if(tab==='mapping')paint();});
@@ -1641,7 +1644,8 @@ function mkLayers(tabId){
   mon.alt='';btn.style.marginTop='8px';
   var clr=h('button',null,'SOLO OFF'),all=h('button',null,'SHOW ALL HIDDEN');
   clr.addEventListener('click',function(){SOLO={};draw();});
-  all.addEventListener('click',function(){LAYERS.concat(['layers']).forEach(function(n){if(isByp(n))setByp(n,false);});draw();});
+  all.addEventListener('click',function(){LAYERS.concat(BYP.filter(function(k){return (BCOV[k]||[]).some(function(n){return LAYERS.indexOf(n)>=0;});}))
+    .forEach(function(n){if(isByp(n))setByp(n,false);});draw();});   /* tab switches (art, land, fractal ...) hide layer rows too */
   var pv=h('button','pvsw','PREVIEW OFF'),pvo=h('div','pvoff','Preview is OFF: nothing is captured or drawn for this panel. Switch it on to see the output, solo layers and (on the LAYERS tab) a thumbnail per layer. It costs some GPU while it is on.');
   pv.addEventListener('click',function(){if(!learnMode)setPreview(!PREVIEW);});
   add(btn,pv,clr,all);add(left,mon,pvo,cap,btn);
@@ -1888,8 +1892,9 @@ function merge(d){
   if(C&&held('bpm'))c.clock.bpm=C.clock.bpm;
   C=c;V=c.values;
   for(var n in c.base)if(!held('b:'+n))B[n]=c.base[n];
-  var names={};for(n in c.mods)names[n]=1;for(n in M)names[n]=1;
-  for(n in names)if(!held('m:'+n)){if(c.mods[n])M[n]=c.mods[n];else delete M[n];}
+  var cm=c.mods;if(c.stack&&c.stack.mods){cm=Object.assign({},c.mods);for(n in c.stack.mods)cm['stack:'+n]=c.stack.mods[n];}   /* math-stack fields: stack:<id>:<field> */
+  var names={};for(n in cm)names[n]=1;for(n in M)names[n]=1;
+  for(n in names)if(!held('m:'+n)){if(cm[n])M[n]=cm[n];else delete M[n];}
   if(!held('morph'))X.morph=c.morph;if(!held('quantize'))X.quantize=c.quantize;if(!held('glide'))X.glide=c.glide;
   if(!held('srate'))X.strobe_rate=c.strobe_rate;if(!held('src'))X.src=c.clock.src;if(!held('auto'))X.auto=c.autopilot;
   if(Array.isArray(c.bypass)&&!held('bypass'))X.bypass=c.bypass;if(c.seq&&!held('seq'))X.seq=c.seq;if(c.xfade&&!held('xfade'))X.xfade=c.xfade;
@@ -1954,7 +1959,7 @@ helpB.addEventListener('click',function(){help(true);});$('ovx').addEventListene
 $('ov').addEventListener('pointerdown',function(e){if(e.target===$('ov'))help(false);});
 window.addEventListener('keydown',function(e){
   var fk=/^F(\d\d?)$/.exec(e.key);
-  if(fk&&+fk[1]<=10&&!e.ctrlKey&&!e.altKey&&TABS[+fk[1]-1]){e.preventDefault();setTab(TABS[+fk[1]-1][0]);return;}
+  if(fk&&+fk[1]<=10&&!e.ctrlKey&&!e.altKey&&TABS[+fk[1]]){e.preventDefault();setTab(TABS[+fk[1]][0]);return;}   /* TABS[0] is BUILD */
   if(e.key==='Escape'){
     if(typing(e)){e.target.blur();return;}
     if($('ov').classList.contains('on')){help(false);return;}
@@ -1995,7 +2000,7 @@ document.addEventListener('contextmenu',function(e){if(!typing(e))e.preventDefau
     var t=b.dataset.tab;if(BYP.indexOf(t)<0||!pages[t])return;         /* perform / scenes / mapping ... have nothing to bypass */
     var pw=h('i','pw');pw.innerHTML=PW;pw.dataset.mt='bypass:'+t;pw.title='switch everything on this tab off / on again (settings are kept)';
     pw.addEventListener('click',function(e){if(learnMode)return;e.stopPropagation();setByp(t);});
-    b.appendChild(pw);
+    if(t!=='layers')b.appendChild(pw);       /* every layer off = black: not one small click away in the tab strip */
     var bar=h('div','pwbar'),sw=h('button'),tx=h('span');sw.dataset.mt='bypass:'+t;
     sw.addEventListener('click',function(){if(!learnMode)setByp(t);});
     add(bar,sw,tx);pages[t].insertBefore(bar,pages[t].firstChild);
@@ -2017,7 +2022,8 @@ document.addEventListener('contextmenu',function(e){if(!typing(e))e.preventDefau
 setPreview(PREVIEW);
 var t0='perform';try{t0=localStorage.getItem('tab')||t0;}catch(_){}
 setTab(pages[t0]?t0:'perform');draw();poll();tick();
-window.__panel={GP:GP,gpAxis:gpAxis,send:send,pend:function(){return pend;},W:W,state:function(){return {B:B,V:V,M:M,X:X,tab:tab,online:online};}};
+window.__panel={META:META,P:P,h:h,add:add,reg:reg,draw:draw,setTab:setTab,setByp:setByp,covered:covered,setParam:setParam,mkSlider:mkSlider,
+  openMod:openMod,banner:banner,palc:function(i){return PALC[clamp(i,0,PALC.length-1)];},GP:GP,gpAxis:gpAxis,send:send,pend:function(){return pend;},W:W,state:function(){return {B:B,V:V,M:M,X:X,tab:tab,online:online};}};
 })();
 </script>
 <script>
@@ -2211,7 +2217,7 @@ function draw(){
   buildCard();if(!card)return;
   ['Source','Audio','Frame rate','Size','Quality'].forEach(function(k){parts[k].paint();});parts.rs.paint();
   parts.big.textContent=live?'STOP RECORDING  '+fmtT(el2):'START RECORDING';parts.big.classList.toggle('on',!!live);
-  parts.note.textContent=!r?'Recorder not available (engine not running?)':live?('Recording '+r.file+' with '+(r.encoder||'?')+'. Changes apply to the next recording.'):
+  parts.note.textContent=!r?'Recorder not available (engine not running?)':live?('Recording '+r.file+' with '+(r.encoder||'?')+(r.cpu_encode?' (CPU encoder, NVENC unavailable: more heat)':'')+'. Changes apply to the next recording.'):
     ('Next: '+setting('source')+', '+setting('fps')+' fps, '+setting('res')+', audio '+setting('audio')+'.');
   var ron=!!setting('replay');parts.ron.textContent=ron?'REPLAY BUFFER ON':'REPLAY BUFFER OFF';parts.ron.classList.toggle('on',ron);
   parts.rsave.textContent='SAVE LAST '+setting('replay_s')+' s';parts.rsave.disabled=!(r&&r.replay&&r.replay.ready);
@@ -2223,8 +2229,8 @@ function draw(){
       tr.appendChild(el('td',null,fmtMB(f.mb)));parts.tb.appendChild(tr);});}
 }
 function notice(r){
-  var n=r&&r.notice;if(!n||n.t<=lastNote)return;
-  var fresh=Date.now()/1000-n.t<20;lastNote=n.t;if(!fresh)return;
+  var n=r&&r.notice;if(!n||n.t===lastNote)return;   /* a new notice = a new engine timestamp (no clock compare: phone / laptop skew) */
+  lastNote=n.t;
   t.className='on '+n.level;t.textContent=(n.level==='error'?'⚠ ':'')+'REC: '+n.msg;
   clearTimeout(t._h);t._h=setTimeout(function(){t.classList.remove('on');},n.level==='error'?15000:6000);
 }
@@ -2287,7 +2293,8 @@ if(pg){
   var c=el('div','card grow onlc');c.style.flexBasis='640px';c.appendChild(el('h2',null,'Online assistant: describe what you want, it proposes the changes'));
   var r=el('div','row');ui.sw=el('button','big onl-sw','ONLINE OFF');ui.sw.id='onlbig';ui.sw.addEventListener('click',toggle);
   ui.be=seg([['claude','CLAUDE CODE'],['agy','AGY (GEMINI)']],O.backend,function(v){
-    if(v==='agy'&&!O.cli_google){note('agy is opt-in: tick the Google CLI box first');return;}send({op:'backend',backend:v});});ui.be.id='onlbe';
+    if(v==='agy'){note('agy chat is not offered: it cannot run without tools');return;}send({op:'backend',backend:v});});
+  ui.be.children[1].disabled=true;ui.be.children[1].title='not offered: agy has no tool-less mode, so chat text could make it act on this laptop';ui.be.id='onlbe';
   ui.mo=seg([['suggest','SUGGEST'],['autopilot','AUTOPILOT']],O.mode,function(v){send({op:'mode',mode:v});});ui.mo.id='onlmode';
   var can=el('button',null,'CANCEL');can.addEventListener('click',function(){send({op:'cancel'});});
   var clr=el('button',null,'CLEAR CHAT');clr.addEventListener('click',function(){send({op:'clear'});});
@@ -2296,7 +2303,7 @@ if(pg){
   c.appendChild(el('div','priv',CHATPRIV));
   var ol=el('label','onl-opt');ui.cli=el('input');ui.cli.type='checkbox';ui.cli.id='onlcli';
   ui.cli.addEventListener('change',function(){if(!O.on){ui.cli.checked=false;note('Switch ONLINE on first');return;}send({op:'cli_google',on:ui.cli.checked});});
-  ol.appendChild(ui.cli);ui.cliT=el('span',null,'Allow Google CLI tools (agy chat backend, agy / gemini CLI images). Off by default: review Antigravity\'s terms first (antigravity.google/terms), they may not permit other software driving the CLI.');
+  ol.appendChild(ui.cli);ui.cliT=el('span',null,'Allow images through the agy CLI (no API key needed). Off by default, and it can only be switched from the laptop itself (open this panel on the laptop, address 127.0.0.1) or in online_local.json. Review Antigravity\'s terms first (antigravity.google/terms): they may not permit other software driving the CLI.');
   ol.appendChild(ui.cliT);c.appendChild(ol);
   ui.log=el('div','onl-log');ui.log.id='onllog';c.appendChild(ui.log);
   ui.stat=el('div','dim');ui.stat.id='onlstat';c.appendChild(ui.stat);
@@ -2338,7 +2345,7 @@ var eng={};
 /* ---- drawing */
 function propBox(p,compact){
   var d=el('div','onl-p '+p.status),ul=el('ul');
-  d.appendChild(el('div','tag',p.status==='pending'?'Proposed changes':p.status==='applied'?'Applied':p.status==='undone'?'Undone':p.status==='rejected'?'Nothing allowed in this reply':'Dismissed'));
+  d.appendChild(el('div','tag',p.status==='pending'?'Proposed changes':p.status==='applied'?'Applied':p.status==='locked'?'Applied (before PANIC)':p.status==='undone'?'Undone':p.status==='rejected'?'Not applied':'Dismissed'));
   (p.diff||[]).slice(0,compact?6:30).forEach(function(t){ul.appendChild(el('li',null,t));});
   if(!compact){(p.notes||[]).forEach(function(t){ul.appendChild(el('li','note',t));});
     (p.rejected||[]).forEach(function(x){ul.appendChild(el('li','rej','refused: '+x.cmd+' ('+x.why+')'));});}
@@ -2357,7 +2364,7 @@ function draw(){
   var on=!!O.on,lab=on?'ONLINE ON':'ONLINE OFF';
   if(tbB){tbB.textContent=lab;tbB.classList.toggle('on',on);}
   if(ui.sw){ui.sw.textContent=lab;ui.sw.classList.toggle('on',on);ui.be._set(O.backend);ui.mo._set(O.mode);
-    var bk=O.backends||{};[].forEach.call(ui.be.children,function(b){var i=bk[b.dataset.v];b.title=i&&i.optin?'opt-in: tick the Google CLI box below':i&&!i.ok?'not installed on this laptop':'';b.style.opacity=i&&(!i.ok||i.optin)?'.45':'';});
+    var bk=O.backends||{};[].forEach.call(ui.be.children,function(b){var i=bk[b.dataset.v];if(i){b.title=!i.ok?(i.why||'not available'):'';b.style.opacity=!i.ok?'.45':'';}});
     if(document.activeElement!==ui.cli)ui.cli.checked=!!O.cli_google;}
   var props={};(O.props||[]).forEach(function(p){props[p.id]=p;});
   if(ui.log){
@@ -2370,12 +2377,12 @@ function draw(){
         ui.log.appendChild(d);if(m.prop!=null&&props[m.prop])ui.log.appendChild(propBox(props[m.prop],false));});
       if(atEnd)ui.log.scrollTop=ui.log.scrollHeight;}
     var b=O.busy,bl=b&&O.backends&&O.backends[b.backend]?O.backends[b.backend].label:(b?b.backend:'');
-    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(b.backend==='agy'?'  (agy can take minutes to start)':'')+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):(O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
+    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(b.backend==='agy'?'  (agy can take minutes to start)':'')+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):(O.notice||O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
   }
   if(ui.hist){var hk=JSON.stringify(O.history||[]);if(hk!==keyHist){keyHist=hk;ui.hist.textContent='';
     var hs=(O.history||[]).slice().reverse();if(!hs.length)ui.hist.appendChild(el('div','dim','Nothing applied yet.'));
     hs.forEach(function(x){var r=el('div','onl-h'+(x.undone?' undone':''));r.appendChild(el('b',null,x.t));r.appendChild(el('span',null,x.summary+(x.by==='autopilot'?'  [autopilot]':'')));
-      if(!x.undone){var u=el('button',null,'UNDO');u.addEventListener('click',function(){send({op:'undo',id:x.id});});r.appendChild(u);}ui.hist.appendChild(r);});}}
+      if(!x.undone&&!x.stale){var u=el('button',null,'UNDO');u.addEventListener('click',function(){send({op:'undo',id:x.id});});r.appendChild(u);}ui.hist.appendChild(r);});}}
   if(mini.out){var ms=(O.msgs||[]).filter(function(m){return m.role!=='user';}),lm=ms[ms.length-1],lp=lm&&lm.prop!=null?props[lm.prop]:null;
     var mk=JSON.stringify([on,lm,lp,O.busy?1:0]);
     if(mk!==keyMini){keyMini=mk;mini.out.textContent='';
@@ -2388,9 +2395,9 @@ function draw(){
     eng.note.textContent=on?(O.engine==='nano'?'Nano Banana makes the images (max 2 per job, 6 a minute); if it fails or is offline the local engine takes over by itself.':'Local SD-Turbo makes the images. Nano Banana is better at recognisable subjects (a Buddha, a woman).')
       :'Local SD-Turbo. Nano Banana needs the ONLINE switch (top bar)'+(O.engine==='nano'?'; it is selected and comes back when ONLINE is on.':'.');
     eng.priv.style.display=on?'':'none';eng.key.style.display=on?'':'none';
-    eng.kst.textContent=O.has_key?'Key saved on this laptop (online_keys.json). Recommended route.':'No key saved. The key stays in online_keys.json on this laptop; it travels once over your local network to get there.';
+    eng.kst.textContent=O.has_key?'Key saved on this laptop (in your user profile, outside the show folder). Recommended route.':'No key saved. The key is kept in your user profile on this laptop; it travels once over your local network to get there.';
     var n=O.nano,t='';
-    if(on&&n){t=!n.available.length?'No online image route yet: save your own Gemini API key above (recommended), or opt in to the Google CLI tools on the ASSISTANT tab. Until then the local engine is used.'
+    if(on&&n){t=!n.available.length?'No online image route yet: save your own Gemini API key above (recommended), or allow agy images on the ASSISTANT tab (from the laptop itself). Until then the local engine is used.'
       :(n.current?'Nano Banana is generating ('+n.current.provider+', '+(+n.current.secs).toFixed(0)+' s)…':n.pending?'Nano Banana: queued':'')+(n.note?(n.current||n.pending?'  ·  ':'')+n.note:'');
       var ld=n.done&&n.done[n.done.length-1];if(!t&&ld)t='Last online image: '+ld.name+' ('+ld.provider+', '+(+ld.secs).toFixed(1)+' s)';}
     eng.stat.textContent=t;eng.stat.style.color=n&&n.note?'#ff8b98':'';}
@@ -2400,6 +2407,528 @@ window.addEventListener('panelstate',function(e){var d=e.detail,t=Date.now();if(
   try{var o=(d.ctl||d).online;if(o){O=o;have=true;}draw();}catch(_){}});   /* controller state: under "ctl" or flat */
 draw();
 window.__online={state:function(){return O;},draw:draw};
+})();
+</script>
+<script>
+/* ---------------- BUILD tab + SIMPLE / FULL (math stack: stack.py, control.py "stack" / "canvas" commands).
+   Self-contained: reads the shared "panelstate" event, sends {"cmd":"stack","op":...} and {"cmd":"canvas","op":...}.
+   Edits are applied here at once (so a drag never lags) and sent with a per-field key (latest value wins). */
+(function(){
+'use strict';
+var PN=window.__panel,META=PN&&PN.META,SM=META&&META.stack,pg=document.getElementById('pg-build');
+if(!PN||!pg)return;
+var st=document.createElement('style');
+st.textContent=
+'#pg-build{align-items:flex-start}'+
+'.bhead{flex:1 1 100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap}'+
+'.bhead .big{min-width:150px}'+
+'#bnew{border-color:var(--acc2);color:#fff;background:color-mix(in srgb,var(--acc2) 22%,#120b18)}'+
+'#bback{border-color:var(--acc3);color:#fff;background:color-mix(in srgb,var(--acc3) 22%,#120b18)}'+
+'.bhead .say{flex:1 1 220px;font-size:12px;color:var(--dim);line-height:1.4}'+
+'.bhead .amt{width:190px}'+
+'.bcol{flex:1 1 330px;max-width:470px;display:flex;flex-direction:column;gap:10px;position:sticky;top:0;max-height:calc(100vh - 300px);overflow:auto}'+
+'.bdet{flex:3 1 480px;min-width:0}'+
+'#badd{width:100%;min-height:62px;font-size:18px;letter-spacing:.1em;border:2px dashed var(--acc2);color:#fff;background:color-mix(in srgb,var(--acc2) 12%,#120b18)}'+
+'#badd.on{border-style:solid}'+
+'.bmenu{display:none;margin-top:8px}.bmenu.on{display:block}'+
+'.bmenu h3,.bsec h3,.bcol h3{margin:10px 0 6px;font-size:11px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase;font-weight:700}'+
+'.bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(98px,1fr));gap:6px}'+
+'.bgen{min-height:70px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;font-size:12px;padding:6px 4px;white-space:normal;line-height:1.1}'+
+'.bgen svg{width:34px;height:34px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}'+
+'.bgen.eng{min-height:48px;color:var(--txt)}.bgen.eng.in{border-color:var(--ok);color:#fff;background:color-mix(in srgb,var(--ok) 22%,#120b18)}'+
+'.brow{display:grid;grid-template-columns:30px 54px minmax(70px,1fr) 34px 34px 34px 34px;gap:5px;align-items:center;padding:5px;border-radius:10px;border:1px solid transparent;cursor:pointer}'+
+'.brow:hover{background:#150e1c}.brow.sel{border-color:var(--acc2);background:#0d171a}'+
+'.brow.off{opacity:.5}'+
+'.brow button{min-height:32px;padding:0;font-size:12px}'+
+'.brow .mv{display:flex;flex-direction:column;gap:2px}.brow .mv button{min-height:15px;height:15px;font-size:9px;line-height:1;border-radius:4px}'+
+'.brow .sw{height:34px;border-radius:6px;border:1px solid var(--line)}'+
+'.brow .nm{font-size:13px;font-weight:650;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+'.brow .sub{font-size:10px;color:var(--dim);letter-spacing:.06em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'+
+'.brow .ey.on{background:color-mix(in srgb,var(--ok) 45%,#120b18);border-color:var(--ok);color:#fff}'+
+'.brow .so.on{background:var(--acc3);border-color:var(--acc3);color:#000}'+
+'.brow .del.arm{background:#5a1220;border-color:var(--warn);color:#ffc9d0}'+
+'.brow .cap{color:var(--acc3);font-size:9px;margin-left:5px}'+
+'.bempty{color:var(--dim);font-size:13px;line-height:1.5;padding:14px 6px}'+
+'.beng{display:grid;grid-template-columns:minmax(90px,1fr) minmax(80px,1.2fr) 44px 74px;gap:6px;align-items:center;padding:4px 5px}'+
+'.beng .nm{font-size:12px;color:var(--txt)}.beng button{min-height:30px;padding:0 6px;font-size:10px}.beng .sl.hz{height:22px}'+
+'.bsec{border-top:1px solid var(--line);padding:2px 0 8px}.bsec:first-of-type{border-top:0}'+
+'.bf{display:grid;grid-template-columns:minmax(96px,150px) minmax(90px,1fr) 78px 30px 44px;gap:6px;align-items:center;padding:3px 2px;border-radius:8px;border:1px solid transparent}'+
+'.bf .lb{font-size:12px;color:var(--txt);line-height:1.15}.bf .lb small{display:block;color:var(--dim);font-size:10px}'+
+'.bf .sl.hz{height:26px}'+
+'.bf input{width:100%;background:#0b0810;border:1px solid var(--line);border-radius:6px;color:#fff;padding:5px 6px;font-variant-numeric:tabular-nums;font-size:13px;-webkit-user-select:text;user-select:text}'+
+'.bf input:focus{outline:none;border-color:var(--acc2)}'+
+'.bf button{min-height:28px;padding:0;font-size:11px}'+
+'.bf .md{border-radius:14px;color:var(--dim);font-size:10px;letter-spacing:.06em}'+
+'.bf .md.mod{color:#00110f;background:var(--acc2);border-color:var(--acc2)}'+
+'.bf.na{opacity:.3}.bf.capd .lb::after{content:" limited";color:var(--acc3);font-size:10px}'+
+'body.learn .bf[data-mt],body.learn .brow [data-mt]{outline:1px dashed var(--acc3)}'+
+'.bopts{display:flex;gap:5px;flex-wrap:wrap;margin:4px 0 6px}'+
+'.bopts button{min-height:34px;font-size:12px;padding:4px 10px}'+
+'.bopts .bgen{min-height:58px;min-width:76px}.bopts .bgen svg{width:26px;height:26px}'+
+'.bname{display:flex;gap:8px;align-items:center;margin-bottom:6px}'+
+'.bname input{flex:1 1 140px;background:#0b0810;border:1px solid var(--line);border-radius:8px;color:#fff;padding:8px 10px;font-size:15px;font-weight:650;-webkit-user-select:text;user-select:text}'+
+'.gbar{position:relative;height:44px;border-radius:8px;border:1px solid var(--line);cursor:copy;touch-action:none}'+
+'.gstops{position:relative;height:30px;margin:0 0 4px;touch-action:none}'+
+'.gstop{position:absolute;top:2px;width:22px;height:26px;margin-left:-11px;border-radius:4px 4px 11px 11px;border:2px solid #fff;box-shadow:0 1px 5px #000;cursor:grab;touch-action:none}'+
+'.gstop.sel{border-color:var(--acc2);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc2) 45%,transparent)}'+
+'.gsw{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}'+
+'.gsw i{width:26px;height:26px;border-radius:6px;border:1px solid var(--line);cursor:pointer;display:block}'+
+'.gsw .pre{width:74px}'+
+'#uimode button{min-height:34px;font-size:12px;letter-spacing:.08em}'+
+'body.simple #tabs button[data-tab]:not([data-simple]){display:none}'+
+'@media (max-width:900px){.bcol{position:static;max-height:none}.bf{grid-template-columns:minmax(80px,110px) minmax(70px,1fr) 64px 28px 40px}.bcol{max-width:none}}';
+document.head.appendChild(st);
+
+var h=PN.h,add=PN.add,P=PN.P;
+function clamp(x,a,b){return Math.min(b,Math.max(a,x));}
+function learning(){return document.body.classList.contains('learn');}
+function txt(e,t){if(e.textContent!==t)e.textContent=t;}
+
+/* ---------------- SIMPLE / FULL */
+var SIMPLE_TABS=['build','perform','scenes'];
+[].forEach.call(document.querySelectorAll('#tabs button[data-tab]'),function(b){if(SIMPLE_TABS.indexOf(b.dataset.tab)>=0)b.dataset.simple='1';});
+var mode='full';try{mode=localStorage.getItem('uimode')==='simple'?'simple':'full';}catch(_){}
+var modeBox=h('div','seg'),mS=h('button',null,'SIMPLE'),mF=h('button',null,'FULL');modeBox.id='uimode';
+mS.title='only BUILD, PERFORM, SCENES and the essentials';mF.title='every tab';
+var modeTb=h('div','tb');add(modeTb,h('span','lab','Panel'),modeBox);add(modeBox,mS,mF);
+var statTb=document.getElementById('stat');statTb.parentNode.insertBefore(modeTb,statTb.nextSibling);      /* top bar: always in reach */
+function setMode(m,keep){
+  mode=m==='simple'?'simple':'full';if(!keep){try{localStorage.setItem('uimode',mode);}catch(_){}}
+  document.body.classList.toggle('simple',mode==='simple');mS.classList.toggle('on',mode==='simple');mF.classList.toggle('on',mode==='full');
+  if(mode==='simple'&&SIMPLE_TABS.indexOf(PN.state().tab)<0)PN.setTab('build');
+}
+mS.addEventListener('click',function(){if(!learning())setMode('simple');});
+mF.addEventListener('click',function(){if(!learning())setMode('full');});
+setMode(mode,true);
+
+if(!SM){pg.appendChild(h('div','card','The math stack module (stack.py) is not available in this build.'));return;}
+
+/* ---------------- model (optimistic copy of controller.stack) */
+var S={layers:[],mods:{},live:{},capped:[]},CAN={active:false,fresh:0},sel=null,holdT=0,wantNew=null,have=false;
+var NUM={},INT={};SM.num.forEach(function(f){NUM[f.name]=f;});SM.int.forEach(function(f){INT[f.name]=f;});
+var LOGF={freq:1,warp_freq:1,pulse_div:1};
+var UNIT={angle:[360,'°'],spin:[1,' turn/s'],speed:[1,' /s'],hue_speed:[1,' /s'],warp_speed:[1,' /s'],zoom:[1,' oct']};
+function cur(){for(var i=0;i<S.layers.length;i++)if(S.layers[i].id===sel)return S.layers[i];return null;}
+function touch(){holdT=Date.now()+800;}
+function send(o,key){if(o.id<0)return;o.cmd='stack';PN.send(o,key);}      /* id < 0: a layer the engine has not confirmed yet */
+/* undo: snapshots of the whole stack; one step per gesture (same key within 1 s) */
+var hist=[],hKey='',hT=0;
+function snap(key){var t=Date.now();if(key&&key===hKey&&t-hT<1000){hT=t;return;}hKey=key||'';hT=t;
+  hist.push(JSON.stringify({layers:S.layers,mods:S.mods}));if(hist.length>40)hist.shift();}
+function undo(){if(!hist.length)return;var s=JSON.parse(hist.pop());S.layers=s.layers;S.mods=s.mods;hKey='';touch();
+  send({op:'replace',stack:{layers:s.layers,mods:s.mods}});if(!cur())sel=S.layers.length?S.layers[S.layers.length-1].id:null;PN.draw();}
+function setF(f,v,quiet){
+  var L=cur();if(!L)return;
+  var d=NUM[f]||INT[f];if(d){v=clamp(v,d.lo,d.hi);if(INT[f])v=Math.round(v);}
+  snap('f:'+L.id+':'+f);
+  if(f==='gen'&&L.name===SM.generators[L.gen])L.name=SM.generators[v];
+  L[f]=v;touch();
+  send({op:'set',id:L.id,f:f,v:(typeof v==='number'&&NUM[f])?+v.toFixed(4):v},'st:'+L.id+':'+f);
+  if(!quiet)PN.draw();
+}
+function structOp(o){snap('');touch();send(o);PN.draw();}
+function addLayer(gen){
+  if(S.layers.length>=SM.max){PN.banner('The stack is full ('+SM.max+' layers): delete or merge one first',2200);return;}
+  snap('');wantNew=S.layers.map(function(l){return l.id;});
+  var L=JSON.parse(JSON.stringify(SM.presets[String(gen)]));L.id=-Date.now();S.layers.push(L);sel=L.id;touch();   /* shown at once; the real id arrives with the next state */
+  send({op:'add',gen:gen});PN.draw();
+}
+window.addEventListener('panelstate',function(e){
+  var d=e.detail,c=d&&(d.ctl||d);if(!c||!c.stack)return;
+  have=true;CAN=c.canvas||CAN;S.live=c.stack.live||{};S.capped=c.stack.capped||[];
+  if(Date.now()>holdT||wantNew){
+    var ls=c.stack.layers||[];
+    if(wantNew){var nw=ls.filter(function(l){return wantNew.indexOf(l.id)<0;});
+      if(nw.length){sel=nw[nw.length-1].id;wantNew=null;S.layers=ls;S.mods=c.stack.mods||{};}
+      else if(Date.now()>holdT+1500)wantNew=null;}
+    else{S.layers=ls;S.mods=c.stack.mods||{};}
+  }
+  if(sel!==null&&!cur()&&!wantNew)sel=S.layers.length?S.layers[S.layers.length-1].id:null;
+  if(sel===null&&S.layers.length)sel=S.layers[S.layers.length-1].id;
+  /* a --fresh start opens SIMPLE on BUILD, once per launch; after that the browser's own choice stands */
+  if(CAN.fresh){var seen='';try{seen=localStorage.getItem('fresh_seen')||'';}catch(_){}
+    if(seen!==String(CAN.fresh)){try{localStorage.setItem('fresh_seen',String(CAN.fresh));}catch(_){}setMode('simple');PN.setTab('build');}}
+});
+
+/* ---------------- icons */
+var GI=['<path d="M3 27L27 3M3 17L17 3M13 27L27 13M3 7L7 3M23 27l4-4"/>',
+ '<circle cx="15" cy="15" r="12"/><circle cx="15" cy="15" r="7.5"/><circle cx="15" cy="15" r="3"/>',
+ '<path d="M15 15c0-3 5-3 5 1s-7 6-10 1 1-12 8-11 10 9 6 15"/>',
+ '<path d="M15 15L15 2M15 15l9-9M15 15h13M15 15l9 9M15 15v13M15 15l-9 9M15 15H2M15 15L6 6"/>',
+ '<path d="M3 3h24v24H3zM11 3v24M19 3v24M3 11h24M3 19h24"/><path d="M3 3h8v8H3zM19 3h8v8h-8zM11 11h8v8h-8zM3 19h8v8H3zM19 19h8v8h-8z" fill="currentColor" stroke="none"/>',
+ '<path d="M2 8c5-6 8 6 13 0s8 6 13 0M2 15c5-6 8 6 13 0s8 6 13 0M2 22c5-6 8 6 13 0s8 6 13 0"/>',
+ '<path d="M15 2l11.3 6.5v13L15 28 3.7 21.500v-13zM15 8l6 3.500v7L15 22l-6-3.500v-7z"/>',
+ '<path d="M4 3v24M7 3v24M12 3v24M14 3v24M19 3v24M24 3v24M26 3v24" /><path d="M16.500 3v24M21.500 3v24" stroke-width="3.2"/>'];
+function genBtn(i,cls){var b=h('button','bgen'+(cls?' '+cls:''));b.innerHTML='<svg viewBox="0 0 30 30">'+GI[i]+'</svg>';b.appendChild(h('span',null,SM.generators[i]));return b;}
+function rgb(s){return 'rgb('+Math.round(s[1]*255)+','+Math.round(s[2]*255)+','+Math.round(s[3]*255)+')';}
+function hex(s){return '#'+[1,2,3].map(function(k){var v=Math.round(clamp(s[k],0,1)*255).toString(16);return v.length<2?'0'+v:v;}).join('');}
+function unhex(x){return [parseInt(x.substr(1,2),16)/255,parseInt(x.substr(3,2),16)/255,parseInt(x.substr(5,2),16)/255];}
+function palStops(){return PN.palc?PN.palc(Math.round(PN.state().V.palette||0)):null;}
+function gradCss(L){
+  if(L.color===1){var pc=palStops();if(pc){return 'linear-gradient(90deg,'+pc.concat([pc[0]]).join(',')+')';}}
+  var s=L.stops,n=s.length,a=s[n-1],b=s[0],span=b[0]+1-a[0],t=span>1e-5?(1-a[0])/span:0;
+  var w='rgb('+[1,2,3].map(function(k){return Math.round((a[k]+(b[k]-a[k])*t)*255);}).join(',')+')';      /* the loop closes: last -> first */
+  return 'linear-gradient(90deg,'+w+' 0%,'+s.map(function(x){return rgb(x)+' '+(x[0]*100).toFixed(1)+'%';}).join(',')+','+w+' 100%)';
+}
+function stripeCss(L){
+  if(L.color===1||L.grad>0.5)return gradCss(L);
+  var n=L.stops.length;return 'linear-gradient(90deg,'+L.stops.map(function(x,i){return rgb(x)+' '+(i/n*100)+'% '+((i+0.6)/n*100)+'%,#000 '+((i+0.6)/n*100)+'% '+((i+1)/n*100)+'%';}).join(',')+')';
+}
+
+/* ---------------- head: NEW CANVAS / RESTORE PREVIOUS / UNDO / master amount */
+var head=h('div','card bhead'),bNew=h('button','big','NEW CANVAS'),bBack=h('button','big','RESTORE PREVIOUS'),bUndo=h('button','big','UNDO'),say=h('div','say');
+bNew.id='bnew';bBack.id='bback';bUndo.id='bundo';bUndo.style.minWidth='90px';
+bNew.title='crossfade to a clean black canvas with one moving stripe layer; your current look is kept for RESTORE PREVIOUS';
+bBack.title='bring back the look from before NEW CANVAS, exactly';
+bNew.addEventListener('click',function(){if(learning())return;hist=[];wantNew=[];holdT=0;CAN={active:true,fresh:CAN.fresh};PN.send({cmd:'canvas',op:'new'});PN.draw();});
+bBack.addEventListener('click',function(){if(learning())return;hist=[];holdT=0;CAN={active:false,fresh:CAN.fresh};PN.send({cmd:'canvas',op:'restore'});PN.draw();});
+bUndo.addEventListener('click',function(){if(!learning())undo();});
+var amt=h('div','amt'),amtL=h('div','lab'),amtS=P.l_stack?PN.mkSlider({lo:0,hi:1,def:P.l_stack.default,get:function(){return PN.state().B.l_stack;},set:function(v){PN.setParam('l_stack',v);},live:function(){return PN.state().V.l_stack;}}):h('div');
+amt.dataset.mt='param:l_stack';add(amt,amtL,amtS);
+add(head,bNew,bBack,bUndo,say,amt);pg.appendChild(head);
+
+/* ---------------- left: the pile */
+var col=h('div','bcol'),pile=h('div','card'),addB=h('button',null,'+ ADD LAYER'),menu=h('div','bmenu'),rowsBox=h('div'),engBox=h('div');
+addB.id='badd';pile.appendChild(h('h2',null,'Layers · top of the list is drawn last'));
+add(pile,addB,menu,rowsBox,engBox);col.appendChild(pile);pg.appendChild(col);
+addB.addEventListener('click',function(){if(learning())return;menu.classList.toggle('on');addB.classList.toggle('on',menu.classList.contains('on'));});
+menu.appendChild(h('h3',null,'Math generators'));
+var g1=h('div','bgrid');menu.appendChild(g1);
+SM.generators.forEach(function(_,i){var b=genBtn(i);b.dataset.gen=i;b.addEventListener('click',function(){if(learning())return;addLayer(i);menu.classList.remove('on');addB.classList.remove('on');});g1.appendChild(b);});
+menu.appendChild(h('h3',null,'Bring in from the engine (gently, at 40%)'));
+var g2=h('div','bgrid');menu.appendChild(g2);
+/* engine layers: [layer param, the tab that holds its controls] */
+var ENG=[['l_kene','layers'],['l_beads','layers'],['l_lines','layers'],['l_beings','motion'],['l_fractal','fractal'],['l_art','art'],['l_land','land'],['l_text','text'],['l_ai','ai'],['l_video','layers']]
+  .filter(function(e){return P[e[0]];});
+var BCOV=(META.bypass&&META.bypass.cover)||{};
+function engOn(n){var s=PN.state();return !PN.covered(n)&&s.B[n]>0.02;}
+function bringIn(n){
+  var s=PN.state();
+  s.X.bypass.slice().forEach(function(k){if(k!=='fx'&&BCOV[k]&&BCOV[k].indexOf(n)>=0)PN.setByp(k,false);});   /* its own switch and its tab's */
+  PN.setParam(n,0.4);
+  PN.banner(P[n].label+' is in at 40%. Its fader is below; every control is on its own tab.',2600);
+}
+var engBtns=ENG.map(function(e){var b=h('button','bgen eng',P[e[0]].label);b.dataset.eng=e[0];
+  b.addEventListener('click',function(){if(learning())return;if(engOn(e[0]))PN.setByp(e[0],true);else bringIn(e[0]);menu.classList.remove('on');addB.classList.remove('on');PN.draw();});
+  g2.appendChild(b);return b;});
+
+var rowSig='',rows=[];
+function buildRows(){
+  rowsBox.innerHTML='';rows=[];
+  S.layers.slice().reverse().forEach(function(L){
+    var r=h('div','brow'),mv=h('div','mv'),up=h('button',null,'▲'),dn=h('button',null,'▼'),sw=h('div','sw'),mid=h('div'),nm=h('div','nm'),sub=h('div','sub');
+    var ey=h('button','ey','EYE'),so=h('button','so','SOLO'),du=h('button',null,'DUP'),de=h('button','del','×');
+    ey.style.fontSize=so.style.fontSize=du.style.fontSize='9px';de.style.fontSize='18px';
+    up.title='move up (drawn later)';dn.title='move down';ey.title='mute / show this layer';so.title='only soloed layers show';du.title='duplicate';de.title='delete (click twice)';
+    ey.dataset.mt='stack:'+L.id+':mute';so.dataset.mt='stack:'+L.id+':solo';
+    add(mv,up,dn);add(mid,nm,sub);add(r,mv,sw,mid,ey,so,du,de);rowsBox.appendChild(r);
+    function pick(){sel=L.id;PN.draw();}
+    r.addEventListener('click',function(e){if(learning()||e.target.closest('button'))return;pick();});
+    function idx(){for(var i=0;i<S.layers.length;i++)if(S.layers[i].id===L.id)return i;return -1;}
+    function move(d){var i=idx(),j=i+d;if(i<0||j<0||j>=S.layers.length)return;snap('');S.layers.splice(i,1);S.layers.splice(j,0,L);touch();send({op:'move',id:L.id,to:j});PN.draw();}
+    up.addEventListener('click',function(){if(!learning())move(1);});
+    dn.addEventListener('click',function(){if(!learning())move(-1);});
+    ey.addEventListener('click',function(){if(learning())return;sel=L.id;setF('mute',L.mute?0:1);});
+    so.addEventListener('click',function(){if(learning())return;sel=L.id;setF('solo',L.solo?0:1);});
+    du.addEventListener('click',function(){if(learning())return;if(S.layers.length>=SM.max){PN.banner('The stack is full ('+SM.max+' layers)',1800);return;}
+      wantNew=S.layers.map(function(l){return l.id;});structOp({op:'dup',id:L.id});});
+    var armT=0;
+    de.addEventListener('click',function(){if(learning())return;
+      if(!de.classList.contains('arm')){de.classList.add('arm');clearTimeout(armT);armT=setTimeout(function(){de.classList.remove('arm');},1600);return;}
+      snap('');var i=idx();if(i>=0)S.layers.splice(i,1);if(sel===L.id)sel=S.layers.length?S.layers[Math.max(0,i-1)].id:null;touch();send({op:'del',id:L.id});PN.draw();});
+    rows.push({L:L,r:r,sw:sw,nm:nm,sub:sub,ey:ey,so:so});
+  });
+}
+var engRows={};
+function drawPile(){
+  var sig=S.layers.map(function(l){return l.id;}).join(',');
+  if(sig!==rowSig){rowSig=sig;buildRows();}
+  var anySolo=S.layers.some(function(l){return l.solo;});
+  rows.forEach(function(w){var L=null;for(var i=0;i<S.layers.length;i++)if(S.layers[i].id===w.L.id)L=S.layers[i];if(!L)return;w.L=L;
+    w.r.classList.toggle('sel',L.id===sel);w.r.classList.toggle('off',!!L.mute||(anySolo&&!L.solo)||L.opacity<=0.01);
+    var bg=stripeCss(L);if(w.sw._bg!==bg){w.sw._bg=bg;w.sw.style.background=bg;}
+    txt(w.nm,L.name||SM.generators[L.gen]);
+    txt(w.sub,SM.generators[L.gen]+' · '+SM.spaces[L.space]+' · '+SM.blends[L.blend]+(S.capped.indexOf(L.id)>=0?' · speed limited':''));
+    w.ey.classList.toggle('on',!L.mute);txt(w.ey,L.mute?'OFF':'EYE');w.so.classList.toggle('on',!!L.solo);});
+  var none=!S.layers.length;
+  if(none&&!rowsBox.firstChild){rowsBox.appendChild(h('div','bempty','Nothing in the stack yet. Press + ADD LAYER to put a first band of colour on the wall, or NEW CANVAS to start from black with one moving stripe layer.'));rowSig='-';}
+  /* engine layers that are showing: a compact row each, underneath the stack */
+  var s=PN.state(),on=ENG.filter(function(e){return engOn(e[0]);}),key=on.map(function(e){return e[0];}).join(',');
+  if(engBox._k!==key){engBox._k=key;engBox.innerHTML='';engRows={};
+    if(on.length)engBox.appendChild(h('h3',null,'Engine layers underneath'));
+    on.forEach(function(e){var n=e[0],r=h('div','beng'),nm=h('div','nm',P[n].label),v=h('div','fv mono'),off=h('button',null,'CONTROLS');
+      var sl=PN.mkSlider({lo:P[n].lo,hi:P[n].hi,def:0.4,get:function(){return PN.state().B[n];},set:function(x){PN.setParam(n,x);},live:function(){return PN.state().V[n];}});
+      r.dataset.mt='param:'+n;v.style.fontSize='12px';off.title='open the tab with every control of this layer';
+      off.addEventListener('click',function(){if(!learning())PN.setTab(e[1]);});
+      add(r,nm,sl,v,off);engBox.appendChild(r);engRows[n]=[sl,v];});
+    engBox.style.cssText=on.length?'margin-top:8px;border-top:1px solid var(--line)':'';}
+  for(var n in engRows){engRows[n][0].draw();txt(engRows[n][1],s.B[n].toFixed(2));}
+  engBtns.forEach(function(b){var o=engOn(b.dataset.eng);b.classList.toggle('in',o);});
+  addB.disabled=false;txt(addB,S.layers.length>=SM.max?'+ ADD (stack full: engine layers only)':'+ ADD LAYER');
+}
+
+/* ---------------- right: details of the selected layer */
+var det=h('div','card bdet'),detTitle=h('h2',null,'Layer details'),detBody=h('div'),detNone=h('div','bempty','Select a layer on the left (or add one) to shape it here: every number can be typed, dragged, reset, modulated and MIDI-learned.');
+add(det,detTitle,detNone,detBody);pg.appendChild(det);
+var FW=[];                                   /* field widgets: draw functions */
+function sect(title){var s=h('div','bsec');s.appendChild(h('h3',null,title));detBody.appendChild(s);return s;}
+function numRow(box,f,rel){
+  var d=NUM[f],lg=!!LOGF[f],u=UNIT[f]||[1,''];
+  var r=h('div','bf'),lb=h('div','lb'),inp=h('input'),rs=h('button',null,'↺'),md=h('button','md','MOD');
+  lb.textContent=d.label;if(d.hint){var sm=h('small',null,d.hint);lb.appendChild(sm);}
+  inp.type='number';inp.step=String((d.hi-d.lo)*u[0]>=20?0.1:0.01);inp.title='type a value'+(u[1]?' ('+u[1].trim()+')':'');
+  rs.title='reset to the generator default';md.title='modulate: bass / mid / high, beat-synced LFOs, random, sequencer';
+  function val(){var L=cur();return L?L[f]:d.default;}
+  var sl=PN.mkSlider({lo:lg?Math.log(d.lo):d.lo,hi:lg?Math.log(d.hi):d.hi,def:lg?Math.log(d.default):d.default,
+    get:function(){return lg?Math.log(val()):val();},set:function(v){setF(f,lg?Math.exp(v):v);},
+    live:function(){var L=cur(),k=L?L.id+':'+f:'',x=(k in S.live)?S.live[k]:val();return lg?Math.log(Math.max(x,1e-6)):x;}});
+  sl.addEventListener('dblclick',function(e){e.stopImmediatePropagation();if(!learning())reset();},true);
+  function reset(){var L=cur();if(!L)return;setF(f,SM.presets[String(L.gen)][f]);}
+  rs.addEventListener('click',function(){if(!learning())reset();});
+  md.addEventListener('click',function(){var L=cur();if(learning()||!L)return;if(L.id<0)return;PN.openMod('stack:'+L.id+':'+f,(L.name||'Layer')+' · '+d.label);});
+  function commit(){var x=parseFloat(inp.value);if(isFinite(x))setF(f,x/u[0]);inp.blur();}
+  inp.addEventListener('change',commit);
+  inp.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter'){e.preventDefault();commit();}else if(e.key==='Escape'){inp.value='';inp.blur();}});
+  add(r,lb,sl,inp,rs,md);box.appendChild(r);
+  FW.push(function(L){
+    r.dataset.mt='stack:'+L.id+':'+f;sl.draw();
+    if(document.activeElement!==inp){var t=(L[f]*u[0]).toFixed((d.hi-d.lo)*u[0]>=20?1:2);if(inp.value!==t)inp.value=t;}
+    var m=PN.state().M['stack:'+L.id+':'+f],on=!!(m&&(m[0]||m[1]));md.classList.toggle('mod',on);
+    r.classList.toggle('na',!!(rel&&!rel(L)));
+    r.classList.toggle('capd',(f==='speed'||f==='spin')&&S.capped.indexOf(L.id)>=0);
+  });
+  return r;
+}
+function optRow(box,f,labels,icons){
+  var d=INT[f],w=h('div','bopts'),bs=[];w.dataset.f=f;
+  (labels||d.options).forEach(function(lab,i){var b=icons?genBtn(i):h('button',null,lab);b.dataset.v=i;
+    b.addEventListener('click',function(){if(!learning())setF(f,i);});w.appendChild(b);bs.push(b);});
+  box.appendChild(w);
+  FW.push(function(L){w.dataset.mt='stack:'+L.id+':'+f;bs.forEach(function(b,i){b.classList.toggle('on',L[f]===i);});});
+  return w;
+}
+function intRow(box,f,rel){
+  var d=INT[f],r=h('div','bf'),lb=h('div','lb',d.label),inp=h('input'),rs=h('button',null,'↺'),sp=h('span');
+  inp.type='number';inp.step='1';
+  var sl=PN.mkSlider({lo:d.lo,hi:d.hi,def:d.default,get:function(){var L=cur();return L?L[f]:d.default;},set:function(v){var L=cur();if(L&&Math.round(v)!==L[f])setF(f,v);}});
+  rs.addEventListener('click',function(){var L=cur();if(!learning()&&L)setF(f,SM.presets[String(L.gen)][f]);});
+  function commit(){var x=parseFloat(inp.value);if(isFinite(x))setF(f,x);inp.blur();}
+  inp.addEventListener('change',commit);
+  inp.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter'){e.preventDefault();commit();}});
+  add(r,lb,sl,inp,rs,sp);box.appendChild(r);
+  FW.push(function(L){r.dataset.mt='stack:'+L.id+':'+f;sl.draw();if(document.activeElement!==inp&&inp.value!==String(L[f]))inp.value=String(L[f]);r.classList.toggle('na',!!(rel&&!rel(L)));});
+}
+/* which controls mean something for this generator / space (the rest are dimmed, never hidden) */
+var RADIAL=[1,2,3,6];
+function isRad(L){return RADIAL.indexOf(L.gen)>=0;}
+function relCount(L){return L.gen===2||L.gen===3||L.gen===6;}
+function relFolds(L){return L.space===3||((L.space===1||L.space===2)&&isRad(L));}
+function relFreq(L){return L.gen!==3;}
+function relWarp(L){return L.gen!==4;}
+function relWarpF(L){return L.gen!==4&&L.gen!==6;}
+function relWarpS(L){return L.gen!==4&&L.gen!==6;}
+
+/* name + generator */
+var nmBox=h('div','bname'),nmIn=h('input'),rsAll=h('button',null,'RESET LAYER');nmIn.maxLength=24;nmIn.placeholder='layer name';
+rsAll.title='every setting of this layer back to its generator default (name and position kept)';
+add(nmBox,nmIn,rsAll);detBody.appendChild(nmBox);
+nmIn.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter'||e.key==='Escape')nmIn.blur();});
+nmIn.addEventListener('change',function(){var L=cur();if(!L)return;snap('');L.name=nmIn.value.trim().slice(0,24)||SM.generators[L.gen];touch();send({op:'set',id:L.id,set:{name:L.name}});PN.draw();});
+rsAll.addEventListener('click',function(){var L=cur();if(learning()||!L)return;snap('');var p=SM.presets[String(L.gen)];
+  for(var k in p)if(k!=='name'&&k!=='gen'&&k!=='mute'&&k!=='solo'&&k!=='id')L[k]=JSON.parse(JSON.stringify(p[k]));touch();send({op:'reset',id:L.id});PN.draw();});
+FW.push(function(L){if(document.activeElement!==nmIn&&nmIn.value!==(L.name||''))nmIn.value=L.name||'';});
+var sG=sect('Generator');optRow(sG,'gen',SM.generators,true);
+var sS=sect('Shape');
+numRow(sS,'freq',relFreq);intRow(sS,'count',relCount);numRow(sS,'duty');numRow(sS,'soft');
+sS.appendChild(h('div','lab','Waveform'));optRow(sS,'wave');
+var sP=sect('Space');optRow(sP,'space');
+intRow(sP,'folds',relFolds);numRow(sP,'angle');numRow(sP,'zoom');numRow(sP,'cx');numRow(sP,'cy');
+var sM=sect('Motion');
+numRow(sM,'speed');sM.appendChild(h('div','lab','Scroll + pulse follow'));optRow(sM,'sync',['FREE (seconds)','BEAT (the clock)']);
+numRow(sM,'spin');numRow(sM,'phase');numRow(sM,'pulse');numRow(sM,'pulse_div');
+numRow(sM,'warp',relWarp);numRow(sM,'warp_freq',relWarpF);numRow(sM,'warp_speed',relWarpS);
+
+/* colour: gradient editor */
+var sC=sect('Colour');optRow(sC,'color',['GRADIENT (your stops)','FOLLOW THE SHOW PALETTE']);
+var gWrap=h('div'),gBar=h('div','gbar'),gSt=h('div','gstops'),gBtns=h('div','row'),gAdd=h('button',null,'+ STOP'),gDel=h('button',null,'− STOP'),gRs=h('button',null,'↺ RESET'),gCol=h('input'),gHint=h('span','dim'),gSw=h('div','gsw');
+gCol.type='color';gCol.style.cssText='width:54px;height:36px;padding:0;border:1px solid var(--line);border-radius:8px;background:none';gCol.title='colour of the selected stop';
+gHint.style.fontSize='11px';gHint.textContent='click a stop = pick its colour · drag = move · double-click the bar = new stop there';
+add(gBtns,gCol,gAdd,gDel,gRs,gHint);add(gWrap,gBar,gSt,gBtns,gSw);sC.appendChild(gWrap);
+var gSel=0,gDrag=null;
+function stopsChanged(key){var L=cur();if(!L)return;touch();send({op:'set',id:L.id,f:'stops',v:L.stops.map(function(s){return s.map(function(x){return +x.toFixed(4);});})},'st:'+L.id+':stops');PN.draw();}
+function sortStops(L,keep){L.stops.sort(function(a,b){return a[0]-b[0];});if(keep)gSel=L.stops.indexOf(keep);}
+function addStop(pos){
+  var L=cur();if(!L||L.color===1)return;if(L.stops.length>=SM.stops[1]){PN.banner('A gradient holds up to '+SM.stops[1]+' stops',1600);return;}
+  snap('');var s=L.stops,n=s.length;
+  if(pos==null){var best=0,bg=-1;for(var i=0;i<n;i++){var a=s[i][0],b=i+1<n?s[i+1][0]:s[0][0]+1;if(b-a>bg){bg=b-a;best=i;}}pos=(s[best][0]+bg/2)%1;}
+  var lo=s[n-1],hi=s[0];for(var j=0;j<n;j++){if(s[j][0]<=pos)lo=s[j];}for(j=n-1;j>=0;j--){if(s[j][0]>=pos)hi=s[j];}
+  var ns=[pos,(lo[1]+hi[1])/2,(lo[2]+hi[2])/2,(lo[3]+hi[3])/2];s.push(ns);sortStops(L,ns);stopsChanged();
+}
+gAdd.addEventListener('click',function(){if(!learning())addStop(null);});
+gDel.addEventListener('click',function(){var L=cur();if(learning()||!L||L.color===1)return;if(L.stops.length<=SM.stops[0]){PN.banner('A gradient needs at least '+SM.stops[0]+' stops',1600);return;}
+  snap('');L.stops.splice(clamp(gSel,0,L.stops.length-1),1);gSel=Math.max(0,gSel-1);stopsChanged();});
+gRs.addEventListener('click',function(){var L=cur();if(learning()||!L)return;snap('');L.stops=JSON.parse(JSON.stringify(SM.presets[String(L.gen)].stops));gSel=0;stopsChanged();});
+gCol.addEventListener('input',function(){var L=cur();if(!L||L.color===1||!L.stops[gSel])return;snap('gc'+L.id+':'+gSel);var c=unhex(gCol.value);L.stops[gSel][1]=c[0];L.stops[gSel][2]=c[1];L.stops[gSel][3]=c[2];stopsChanged();});
+gBar.addEventListener('dblclick',function(e){if(learning())return;var r=gBar.getBoundingClientRect();addStop(clamp((e.clientX-r.left)/r.width,0,1));});
+var SWC=['#ffffff','#000000','#ff1030','#ff6a00','#ffc400','#b6ff1f','#14f060','#00e0c8','#18b8ff','#1040ff','#7a1cff','#e010d0','#ff2e90'];
+SWC.forEach(function(c){var i=h('i');i.style.background=c;i.title='set the selected stop to this colour';
+  i.addEventListener('click',function(){var L=cur();if(learning()||!L||L.color===1||!L.stops[gSel])return;snap('');var v=unhex(c);L.stops[gSel][1]=v[0];L.stops[gSel][2]=v[1];L.stops[gSel][3]=v[2];stopsChanged();});gSw.appendChild(i);});
+var GPRE=[['Jewel',[[0,0,.85,.8],[.25,1,.05,.55],[.5,1,.7,.05],[.75,.28,.1,1]]],['Fire',[[0,1,.9,.3],[.3,1,.45,0],[.6,.85,.05,.05],[.85,.25,0,.1]]],
+ ['Ocean',[[0,0,.95,.8],[.35,.05,.45,1],[.7,.3,.1,.9]]],['Candy',[[0,1,.2,.6],[.5,.2,.9,1]]],['Mono',[[0,1,1,1],[.5,0,0,0]]],
+ ['Rainbow',[[0,1,.06,.1],[.17,1,.8,0],[.33,.05,.95,.25],[.5,0,.85,.9],[.67,.05,.3,1],[.83,.85,.05,1]]]];
+GPRE.forEach(function(g){var i=h('i','pre');i.title=g[0]+' (replaces every stop)';i.style.background=gradCss({color:0,stops:g[1]});
+  i.addEventListener('click',function(){var L=cur();if(learning()||!L)return;snap('');L.stops=JSON.parse(JSON.stringify(g[1]));if(L.color===1){L.color=0;send({op:'set',id:L.id,f:'color',v:0});}gSel=0;stopsChanged();});gSw.appendChild(i);});
+var gSig='';
+function drawGrad(L){
+  var pal=L.color===1;gWrap.style.opacity=pal?0.45:1;
+  var bg=gradCss(L);if(gBar._bg!==bg){gBar._bg=bg;gBar.style.background=bg;}
+  var sig=L.id+':'+L.stops.length+':'+pal;
+  if(sig!==gSig&&!gDrag){gSig=sig;gSt.innerHTML='';gSel=clamp(gSel,0,L.stops.length-1);
+    L.stops.forEach(function(_,i){var k=h('div','gstop');k.dataset.i=i;
+      k.addEventListener('pointerdown',function(e){var LL=cur();if(learning()||!LL||LL.color===1)return;e.preventDefault();var ii=+k.dataset.i;gSel=ii;
+        gDrag={p:e.pointerId,s:LL.stops[ii],x:e.clientX,moved:false,el:k};try{k.setPointerCapture(e.pointerId);}catch(_){}PN.draw();});
+      k.addEventListener('pointermove',function(e){if(!gDrag||gDrag.p!==e.pointerId)return;var LL=cur();if(!LL)return;
+        if(!gDrag.moved&&Math.abs(e.clientX-gDrag.x)<4)return;if(!gDrag.moved){gDrag.moved=true;snap('');}
+        var r=gSt.getBoundingClientRect();gDrag.s[0]=clamp((e.clientX-r.left)/r.width,0,1);stopsChanged();});
+      function end(e){if(!gDrag||gDrag.p!==e.pointerId)return;var d=gDrag,LL=cur();gDrag=null;
+        if(LL){sortStops(LL,d.s);if(d.moved)stopsChanged();else{gCol.value=hex(d.s);try{gCol.click();}catch(_){}}}gSig='';PN.draw();}
+      k.addEventListener('pointerup',end);k.addEventListener('pointercancel',end);
+      gSt.appendChild(k);});}
+  [].forEach.call(gSt.children,function(k,i){var s=L.stops[i];if(!s)return;k.style.left=(s[0]*100)+'%';k.style.background=rgb(s);k.classList.toggle('sel',i===gSel&&!pal);});
+  if(L.stops[gSel]&&document.activeElement!==gCol){var hx=hex(L.stops[gSel]);if(gCol.value!==hx)gCol.value=hx;}
+}
+FW.push(drawGrad);
+numRow(sC,'grad');numRow(sC,'hue');numRow(sC,'hue_speed');numRow(sC,'sat');numRow(sC,'bright');
+var sB=sect('Blend onto the layers below');optRow(sB,'blend');numRow(sB,'opacity');
+
+/* ---------------- draw */
+PN.reg('build',function(){
+  if(!have&&!S.layers.length){txt(say,'Waiting for the engine…');}
+  else txt(say,CAN.active?'CLEAN CANVAS: every engine layer and effect is switched off (not changed). RESTORE PREVIOUS brings your earlier look back exactly.'
+    :'Build a look layer by layer on top of what is playing, or press NEW CANVAS to start from black. Nothing you have set is lost.');
+  bBack.disabled=!CAN.active;bUndo.disabled=!hist.length;
+  if(P.l_stack){amtS.draw();txt(amtL,'Math stack amount '+PN.state().B.l_stack.toFixed(2)+(PN.covered('l_stack')?'  (switched OFF on LAYERS)':''));}
+  drawPile();
+  var L=cur();detBody.style.display=L?'':'none';detNone.style.display=L?'none':'';
+  txt(detTitle,L?'Layer details · '+(L.name||SM.generators[L.gen]):'Layer details');
+  if(L)FW.forEach(function(f){f(L);});
+});
+window.__build={state:function(){return {S:S,sel:sel,CAN:CAN,mode:mode,hist:hist.length};},setMode:setMode};
+PN.draw();
+})();
+</script>
+<script>
+/* ---------------- crowd camera (camera_layer.py / camera_worker.py): CAMERA ON indicator in the top bar + the CAMERA
+   tab's input card (switch, device, quality, alignment, debug preview, mod-source meters). Integration mode tiles and
+   the effect faders are the generated "camera" group page below it. Self-contained: reads state.camera from the shared
+   "panelstate" event, sends {"cmd":"camera","op":...}. The debug preview (mask + skeleton, never camera pixels) is OFF
+   by default (localStorage camprev) and only polled while it is on AND the CAMERA tab is showing. */
+(function(){
+var st=document.createElement('style');
+st.textContent=
+ '#camb button{min-height:40px;font-size:12px;white-space:nowrap;font-weight:800}'+
+ '#camb button.on{background:var(--warn);border-color:var(--warn);color:#fff}#camb button.on i{display:inline-block;width:9px;height:9px;border-radius:50%;background:#fff;margin-right:5px;animation:camblink 1.6s steps(2) infinite}'+
+ '#camb button.wait{border-color:var(--acc3);color:var(--acc3)}@keyframes camblink{50%{opacity:.25}}'+
+ '.camc{display:flex;flex-direction:column;gap:9px}.camc .dim{color:var(--dim);font-size:12px}.camc .priv{color:var(--acc3);font-size:12px}'+
+ '.camc .err{color:#ff8b98;font-size:12px}.camc select{background:#0a070d;border:1px solid var(--line);border-radius:8px;padding:6px;color:inherit;max-width:100%}'+
+ '.camsl{display:grid;grid-template-columns:110px 1fr 52px;gap:6px;align-items:center;font-size:12px}.camsl input{width:100%}'+
+ '.cammet{display:grid;grid-template-columns:110px 1fr 44px;gap:5px;align-items:center;font-size:12px}'+
+ '.cammet div.b{height:9px;background:#0a070d;border:1px solid var(--line);border-radius:5px;overflow:hidden}.cammet div.b i{display:block;height:100%;background:var(--acc2)}'+
+ '#camimg{width:320px;max-width:100%;aspect-ratio:16/9;background:#000;border:1px solid var(--line);border-radius:8px;display:none}';
+document.head.appendChild(st);
+function $(i){return document.getElementById(i);}
+function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+function send(c){c.cmd='camera';if(window.__panel&&window.__panel.send)window.__panel.send(c);}
+var C={on:false,status:'off',settings:{}},have=false,devAsked=false;
+var prevOn=false;try{prevOn=localStorage.getItem('camprev')==='1';}catch(_){}
+function goTab(){var b=document.querySelector('#tabs button[data-tab="camera"]');if(b)b.click();}
+
+/* ---- top bar: clear indicator while the camera is on; one click = CAMERA OFF. While off it opens the tab (switching
+   the webcam on is a deliberate act on the tab, not a stray tap on the bar). */
+var top=$('top'),tbB=null;
+if(top){var tb=el('div','tb');tb.id='camb';tbB=el('button',null,'CAMERA OFF');tbB.id='camsw';
+  tbB.addEventListener('click',function(){if(C.on)send({op:'off'});else goTab();});tb.appendChild(tbB);top.appendChild(tb);}
+
+/* ---- CAMERA tab card */
+var pg=$('pg-camera'),ui={};
+if(pg){
+  var c=el('div','card grow camc');c.style.flexBasis='560px';c.appendChild(el('h2',null,'Crowd camera'));
+  var r=el('div','row');ui.sw=el('button','big','CAMERA OFF');ui.sw.id='cambig';
+  ui.sw.addEventListener('click',function(){send({op:C.on?'off':'on'});});r.appendChild(ui.sw);
+  ui.stat=el('span','dim','');r.appendChild(ui.stat);c.appendChild(r);
+  ui.err=el('div','err','');c.appendChild(ui.err);
+  c.appendChild(el('div','priv','Frames stay on this laptop: processed in memory by camera_worker.py, never saved, never sent anywhere, never recorded (REC captures only the projected output). OFF stops the worker and releases the webcam. The camera always starts OFF.'));
+  /* device + quality */
+  var dr=el('div','row');dr.appendChild(el('span','lab','Device'));ui.dev=el('select');ui.dev.id='camdev';
+  ui.dev.addEventListener('change',function(){send({op:'set',device:+ui.dev.value});});dr.appendChild(ui.dev);
+  var rs=el('button',null,'RESCAN');rs.addEventListener('click',function(){send({op:'devices'});});dr.appendChild(rs);
+  ui.ir=el('label','dim');var irc=el('input');irc.type='checkbox';irc.addEventListener('change',function(){send({op:'set',show_ir:irc.checked});});
+  ui.ir.appendChild(irc);ui.ir.appendChild(document.createTextNode(' show IR cameras'));ui.irc=irc;dr.appendChild(ui.ir);c.appendChild(dr);
+  function seg(opts,fn){var s=el('div','seg');opts.forEach(function(o){var b=el('button',null,o[1]);b.dataset.v=String(o[0]);
+    b.addEventListener('click',function(){fn(o[0]);});s.appendChild(b);});s._set=function(v){[].forEach.call(s.children,function(b){b.classList.toggle('on',b.dataset.v===String(v));});};return s;}
+  var qr=el('div','row');
+  ui.res=seg([[0,'480'],[1,'320'],[2,'240']],function(v){send({op:'set',res:v});});
+  ui.fps=seg([[15,'15 FPS'],[30,'30 FPS']],function(v){send({op:'set',fps:v});});
+  ui.pose=seg([[0,'NO POSE'],[1,'1 DANCER'],[2,'2'],[3,'3']],function(v){send(v?{op:'set',pose:true,max_poses:v}:{op:'set',pose:false});});
+  ui.mir=seg([[1,'MIRROR'],[0,'AS SEEN']],function(v){send({op:'set',mirror:!!v});});
+  [el('span','lab','Res'),ui.res,ui.fps,ui.pose,ui.mir].forEach(function(x){qr.appendChild(x);});c.appendChild(qr);
+  c.appendChild(el('div','dim','Lower res / fps and fewer dancers cost less CPU. Under strain the governor steps the camera down by itself (15 fps, then 10 fps at 240 with one dancer) and back up after 20 s.'));
+  /* alignment */
+  c.appendChild(el('h2',null,'Align silhouettes to the wall'));
+  c.appendChild(el('div','dim','Set Integration to Bodies reveal or Glow outline, stand in front of the wall and move these until your outline sits on you.'));
+  ui.sl={};
+  [['pos_x','Position X',-1,1],['pos_y','Position Y',-1,1],['scale','Scale',0.25,4],['key_x','Keystone top',-1,1],['key_y','Keystone side',-1,1],
+   ['c0','Crop left',0,0.9],['c2','Crop right',0.1,1],['c1','Crop top',0,0.9],['c3','Crop bottom',0.1,1],['gain','Motion gain',0.25,4]].forEach(function(d){
+    var w=el('div','camsl'),i=el('input'),v=el('span','mono','');i.type='range';i.min=d[2];i.max=d[3];i.step=0.005;
+    var tmr=null;i.addEventListener('input',function(){v.textContent=(+i.value).toFixed(2);clearTimeout(tmr);tmr=setTimeout(function(){
+      if(d[0][0]==='c'&&d[0].length===2){var cr=(C.settings.crop||[0,0,1,1]).slice();cr[+d[0][1]]=+i.value;send({op:'set',crop:cr});}
+      else{var o={op:'set'};o[d[0]]=+i.value;send(o);}},60);});
+    i.dataset.busy='0';i.addEventListener('pointerdown',function(){i.dataset.busy='1';});i.addEventListener('pointerup',function(){i.dataset.busy='0';});
+    w.appendChild(el('span',null,d[1]));w.appendChild(i);w.appendChild(v);c.appendChild(w);ui.sl[d[0]]={i:i,v:v};});
+  var ar=el('div','row'),rst=el('button',null,'RESET ALIGNMENT');rst.addEventListener('click',function(){send({op:'align_reset'});});ar.appendChild(rst);c.appendChild(ar);
+  /* debug preview */
+  var pr=el('div','row');ui.pv=el('button',null,'');ui.pv.id='campv';
+  ui.pv.addEventListener('click',function(){prevOn=!prevOn;try{localStorage.setItem('camprev',prevOn?'1':'0');}catch(_){}draw();});
+  pr.appendChild(ui.pv);pr.appendChild(el('span','dim','mask + skeleton only, about 2 fps'));c.appendChild(pr);
+  ui.img=el('img');ui.img.id='camimg';ui.img.alt='camera mask preview';c.appendChild(ui.img);
+  /* meters */
+  c.appendChild(el('h2',null,'Mod sources (pick them in any fader\'s MOD editor)'));
+  ui.met={};['crowd_motion','crowd_left','crowd_centre','crowd_right','crowd_presence','hand_height','hands_spread','hip_sway','hand_speed'].forEach(function(n){
+    var w=el('div','cammet'),b=el('div','b'),i=el('i'),v=el('span','mono','0');b.appendChild(i);w.appendChild(el('span',null,n));w.appendChild(b);w.appendChild(v);c.appendChild(w);ui.met[n]={i:i,v:v};});
+  pg.insertBefore(c,pg.firstChild);
+}
+
+function draw(){
+  var on=!!C.on,s=C.status||'off';
+  if(tbB){tbB.className=on?(s==='running'?'on':'wait'):'';tbB.innerHTML=on?(s==='running'?'<i></i>CAMERA ON':'CAMERA '+s.toUpperCase()):'CAMERA OFF';
+    tbB.title=on?'The webcam is in use. Click = CAMERA OFF (releases the device).':'Crowd camera is off. Click to open the CAMERA tab.';}
+  if(!pg)return;
+  ui.sw.textContent=on?'CAMERA ON (click = OFF)':'CAMERA OFF (click = ON)';ui.sw.className='big'+(on?' arm':'');ui.sw.disabled=C.available===false;
+  var t=s;if(on&&C.fps!=null)t+=' · '+C.fps+' fps analysed ('+(C.grab_fps||0)+' captured)';if(on&&C.ms)t+=' · seg '+(C.ms.seg||0)+' / flow '+(C.ms.flow||0)+' / pose '+(C.ms.pose||0)+' ms';
+  if(on)t+=' · '+(C.bodies||0)+' dancer(s) · engine '+(C.cost_ms||0)+' ms'+(C.quality?' · governor step '+C.quality:'');if(C.backend)t+=' · '+C.backend;
+  ui.stat.textContent=t;ui.err.textContent=[C.reason,C.notes].filter(Boolean).join(' · ');
+  var S=C.settings||{};
+  if(C.devices){var keep=ui.dev.value;ui.dev.textContent='';C.devices.forEach(function(d){if(d.ir&&!S.show_ir)return;var o=el('option',null,d.index+': '+d.name+(d.ir?' (IR)':''));o.value=d.index;ui.dev.appendChild(o);});}
+  else if(!ui.dev.options.length){var o=el('option',null,'Camera '+(S.device||0));o.value=S.device||0;ui.dev.appendChild(o);}
+  ui.dev.value=String(S.device||0);ui.irc.checked=!!S.show_ir;
+  ui.res._set(S.res);ui.fps._set(S.fps);ui.pose._set(S.pose?S.max_poses:0);ui.mir._set(S.mirror?1:0);
+  var cr=S.crop||[0,0,1,1],vals={pos_x:S.pos_x,pos_y:S.pos_y,scale:S.scale,key_x:S.key_x,key_y:S.key_y,c0:cr[0],c1:cr[1],c2:cr[2],c3:cr[3],gain:S.gain};
+  for(var k in ui.sl){var q=ui.sl[k];if(q.i.dataset.busy!=='1'&&vals[k]!=null&&document.activeElement!==q.i){q.i.value=vals[k];q.v.textContent=(+vals[k]).toFixed(2);}}
+  ui.pv.textContent=prevOn?'PREVIEW: ON':'PREVIEW: OFF';ui.pv.className=prevOn?'on':'';ui.img.style.display=prevOn&&on?'block':'none';
+  var sg=C.signals||{};for(var n in ui.met){var v=+sg[n]||0;ui.met[n].i.style.width=Math.min(100,Math.abs(v)*100)+'%';ui.met[n].v.textContent=v.toFixed(2);}
+}
+/* preview poll: only while switched on, the camera runs and the CAMERA tab is showing */
+var pvBusy=false;
+setInterval(function(){if(!prevOn||!C.on||!pg||!pg.classList.contains('on')||pvBusy||document.hidden)return;pvBusy=true;
+  var ac=new AbortController(),to=setTimeout(function(){ac.abort();},3000),k=new URLSearchParams(location.search).get('k')||'';
+  fetch('/camera-preview?k='+encodeURIComponent(k),{signal:ac.signal,cache:'no-store'}).then(function(r){return r.status===200?r.blob():null;})
+   .then(function(b){if(b){var u=URL.createObjectURL(b),old=ui.img.src;ui.img.src=u;if(old&&old.indexOf('blob:')===0)URL.revokeObjectURL(old);}})
+   .catch(function(){}).finally(function(){clearTimeout(to);pvBusy=false;});},500);
+var lastT=0;
+window.addEventListener('panelstate',function(e){var d=e.detail,t=Date.now();if(!d||t-lastT<300)return;lastT=t;
+  try{if(d.camera){C=d.camera;have=true;if(!devAsked&&pg&&pg.classList.contains('on')&&!C.devices){devAsked=true;send({op:'devices'});}}draw();}catch(_){}});
+draw();
+window.__camera={state:function(){return C;},draw:draw};
 })();
 </script>
 </body></html>

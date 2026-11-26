@@ -97,9 +97,17 @@ try:
 except ImportError:
     LandPass = PreviewTap = None
 try:
+    import stack as stack_mod                        # math stack: hand-built procedural layers (l_stack), model + pass
+except ImportError:
+    stack_mod = None
+try:
     from beings import BeingsPass                    # living / supernatural creatures layer (l_beings)
 except ImportError:
     BeingsPass = None
+try:                                                 # post-FX filter chain (group "filters"): dream, oil, halftone, ...
+    from filters import FilterPass, active as filters_active
+except ImportError:
+    FilterPass, filters_active = None, (lambda vals: False)
 try:                                                 # text layer (l_text): SDF letters + the compositor GLSL for SCENE_FS
     from text_layer import CPU_ONLY_PARAMS as TEXT_CPU_ONLY, SCENE_GLSL as TEXT_GLSL, TextPass
 except ImportError:
@@ -115,6 +123,14 @@ try:
     import recorder as rec_mod                       # show recorder -> recordings/*.mp4 (REC in the panel, Ctrl+R)
 except ImportError:
     rec_mod = None
+try:                                                 # crowd camera (camera_layer.py; the webcam runs in camera_worker.py)
+    import camera_layer as cam_mod
+    CAMERA_GLSL = cam_mod.SCENE_GLSL
+except ImportError:
+    cam_mod = None
+    CAMERA_GLSL = ("uniform float p_l_camera, p_crowd_mode, p_crowd_glow, p_crowd_hue, p_crowd_push; "
+                   "vec2 camWarp(vec2 a, vec2 b){ return vec2(0.0*(p_crowd_mode+p_crowd_glow+p_crowd_hue+p_crowd_push)); } "
+                   "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b){}")
 
 HERE = Path(__file__).parent
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)   # it warns on every (intended) decode-time rescale
@@ -152,7 +168,11 @@ STRICT = False                    # True in headless runs: guarded() re-raises s
 CPU_ONLY = {"speed", "flow", "rotate", "palette", "travel", "serpent_speed", "chase_rate", "spin"} | {
     n for n, v in PARAMS.items() if v[3] in ("fractal", "art", "land", "beings")} | (   # consumed by FractalPass / ArtPass / LandPass
     {"l_swarm"} & set(PARAMS)) | (set(TEXT_CPU_ONLY) & set(PARAMS))            # (l_swarm is mixed inside fx_stack.LandPass)
+CPU_ONLY |= {"crowd_soft", "crowd_swarm", "crowd_beings", "crowd_ripples", "crowd_serpent"} & set(PARAMS)   # camera_layer.py
+CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "filters"}             # consumed by filters.FilterPass
 RESET_GROUPS = ("space", "shape", "motion")
+# engine-drawn layers (everything but the math stack, the echo and the text overlay): see the coreOn uniform
+CORE_LAYERS = [n for n in PARAMS if (n.startswith("l_") and n not in ("l_stack", "l_echo", "l_text")) or n == "serpent"]
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 VS = """
@@ -164,6 +184,9 @@ void main(){ v_uv = in_pos*0.5+0.5; gl_Position = vec4(in_pos,0,1); }
 SCENE_FS = """
 #version 330
 uniform sampler2D texA, texB, prevFrame, texV, texF, texR, texL, texG;
+uniform sampler2D texK;             // math stack (stack.StackPass): rgb = its light, a = how much it hides of the rest
+uniform float p_l_stack;            // 1 while that pass rendered this frame (the amount is applied inside it), else 0
+uniform float coreOn;               // 1 normally; fades to 0 only when EVERY engine layer is at 0 (clean canvas): no core jewel
 uniform float t, mixAB, bass, mid, high, aspect, pxh, hasVideo, limiter, nanGuard;
 uniform float rotPh, chasePh, chaseCol, travelAct, breath, calm;
 uniform float spinPh, spinV, p_spin_twist;   // barrel-roll phase (wrapped at TAU), signed spin speed, corkscrew amount
@@ -586,6 +609,7 @@ vec4 serpents(vec2 p){
 vec2 sway(float s){ return vec2(sin(s*0.20)+0.5*sin(s*0.46+1.3), cos(s*0.18)+0.5*sin(s*0.40)); }   // period 100 PI
 
 //@TEXT_GLSL
+//@CAMERA_GLSL
 void main(){
   vec2 asp = vec2(aspect, 1.0);
   vec2 p0 = (v_uv-0.5)*asp, p = p0;
@@ -613,6 +637,7 @@ void main(){
     emboss = mix(1.0, 0.70+0.80*dot(im, vec3(.299,.587,.114)), p_l_art);
   }
   if (p_l_text > 0.0) p += textWarp(pscr, asp);                      // text modes 1 / 4: the letters bend the pattern
+  if (p_l_camera > 0.0) p += camWarp(pscr, asp);                     // crowd camera: movement pushes the pattern
 
   // ---- serpentine warp: segmented bands sliding sideways like a snake's body
   if (p_serpent > 0.0 && smode > 0.5) {
@@ -703,7 +728,7 @@ void main(){
       }
       // core jewel hides the log-polar pole
       float cg = exp(-rs*rs/0.0016)*(0.65+0.6*bass+0.25*calm*breath) + 0.30*pow(1.0-v,6.0)*exp(-rs*16.0)*min(1.0, 8.0/folds);
-      cm += (palette(t*0.04+0.1)*cg + vec3(1.0,0.95,0.85)*exp(-rs*rs/0.00025)*0.35)*(1.0-0.6*fog*act);
+      cm += (palette(t*0.04+0.1)*cg + vec3(1.0,0.95,0.85)*exp(-rs*rs/0.00025)*0.35)*(1.0-0.6*fog*act)*coreOn;
     }
     col += cm*sym; cov += cvm*sym;
   }
@@ -861,6 +886,15 @@ void main(){
     cov = max(cov, s.a*p_serpent);
   }
 
+  // ---- math stack (stack.StackPass), on top of every engine layer: mask / multiply / replace / over layers hide
+  // what is underneath through the texture's alpha; the layer amount is already applied in the pass
+  if (p_l_stack > 0.0) {
+    vec4 sk = clamp(texture(texK, pscr/asp+0.5), 0.0, 1.0);
+    col = col*(1.0-sk.a) + sk.rgb;
+    cov = max(cov, max3(sk.rgb));
+  }
+
+  if (p_l_camera > 0.0) camScene(col, cov, pscr, asp);               // crowd camera: patterns inside bodies / trails
   col *= 1.0 + 1.6*min(rglow, 1.5);                                  // light rides the ripple wavefront (geometry only)
   col *= 0.82+0.38*bass+0.12*calm*breath;                            // kick bloom (bounded)
   float lum = dot(col, vec3(.299,.587,.114));
@@ -887,6 +921,7 @@ void main(){
   fbE = vec4(max(col, trail), 1.0);
   vec3 o = max(col, trail*mix(min((0.30+0.25*p_trails)*(min(p_l_echo/0.6, 1.0) + 3.0*max(p_l_echo-0.6, 0.0)), 0.95), 0.92, melt));   // echo above its default: x2.2 at 1
   if (p_l_text > 0.0) textMix(o, cov, pscr, pt, asp, edge);          // text layer (text_layer.SCENE_GLSL): display only
+  if (p_l_camera > 0.0) camShow(o, cov, pscr, asp);                  // crowd camera: reveal / outline / knockout
 
   // ---- performance stage (display only; the echo buffer never sees it)
   float mx = max3(o);
@@ -914,6 +949,7 @@ void main(){
 }
 """
 SCENE_FS = SCENE_FS.replace("//@TEXT_GLSL", TEXT_GLSL)   # the text compositor lives in text_layer.py
+SCENE_FS = SCENE_FS.replace("//@CAMERA_GLSL", CAMERA_GLSL)   # crowd camera compositor (camera_layer.py)
 
 OUT_FS = """
 #version 330
@@ -1927,6 +1963,11 @@ def main():
                     help="headless: every look / contortion / trigger / travel mode -> test_frames/gallery/contact_sheet.png")
     ap.add_argument("--batch", default=None, metavar="JOBS.json",
                     help="headless: render a list of jobs [{name, sets, frames, script}] in one process -> <out>/<name>.png + batch.json")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start on a clean black canvas with one moving stripe layer (NEW CANVAS; RESTORE PREVIOUS in the "
+                         "panel brings the saved look back) and open the panel in SIMPLE mode")
+    ap.add_argument("--stack", default=None, metavar="FILE.json",
+                    help="headless: load this math stack ({\"layers\": [...]}, see stack.py) at start")
     ap.add_argument("--surfaces", default=None, metavar="FILE.json",
                     help="headless: render through this surfaces file (read-only; the show always uses surfaces.json)")
     ap.add_argument("--remote", action="store_true", help="start the touch remote web page (Ctrl+W toggles it at runtime)")
@@ -2036,7 +2077,7 @@ def main():
           + ("" if surf_draw is not None else " (multi-surface output unavailable: corner pin only)"))
     corners = mapper.corners()
     hinv = inverse_homography(corners)
-    map_ref = dict(c=[list(p) for p in corners], id=mapper.target_id(), fails=0, drag_n=0)
+    map_ref = dict(c=[list(p) for p in corners], id=mapper.target_id(), drag_n=0)
 
     def map_pull():                                # the model -> the old corner view
         corners[:] = mapper.corners()
@@ -2086,13 +2127,33 @@ def main():
             extra.append(dict(param="l_text", uniform="texT", unit=10, obj=TextPass(ctx, (rw, rh)), fails=0))
         except Exception as ex:
             print(f"[l_text] disabled: {ex}")
+    # math stack: always registered, so p_l_stack is forced to 0 whenever the pass did not draw (empty stack, pass
+    # missing): an empty stack costs nothing and never samples an unbound texture. Unit 16 (0-15 are taken).
+    stack_obj = None
+    if stack_mod is not None and "l_stack" in PARAMS:
+        try:
+            stack_obj = stack_mod.StackPass(ctx, (rw, rh))
+        except Exception as ex:
+            print(f"[l_stack] disabled: {ex}")
+    extra.append(dict(param="l_stack", gate=1.0, uniform="texK", unit=16, obj=stack_obj, fails=0))
+    own_stack = stack_mod.StackState() if stack_mod is not None else None   # used when the controller has no stack
     preview = guarded("preview", PreviewTap, ctx) if PreviewTap is not None and not headless else None
+    filt = None                                  # post-FX filter chain (filters.py); never called while every filter is off
+    if FilterPass is not None:
+        try:
+            filt = FilterPass(ctx, (rw, rh))
+        except Exception as ex:
+            print(f"[filters] disabled: {ex}")
+    filt_fails = 0
 
     controller = make_controller(headless, args.live_controller)
     print(f"[control] {type(controller).__name__}")
     gov = None                                   # resource governor (show mode, or headless with --governor)
     if gov_mod is not None and not sheet and (args.governor or not headless):
         gov = guarded("governor", gov_mod.for_engine, ctx, controller, args.governor)
+    cam = None                                   # crowd camera: OFF until the panel switches it on (no process, no cost)
+    if cam_mod is not None and not sheet:
+        cam = guarded("camera", cam_mod.CameraLayer.for_engine, ctx, controller, extra, rw / rh)
     DEF = defaults()
 
     def apply_start(ctl):
@@ -2109,6 +2170,21 @@ def main():
         for k, v in start_sets.items():
             ctl.set(k, v)
 
+    def the_stack():                             # the controller's stack (the show), else the engine's own (static controller)
+        return getattr(controller, "stack", None) or own_stack
+
+    if args.fresh and stack_mod is not None:     # NEW CANVAS at launch: nothing stored is edited by control.Controller
+        if hasattr(controller, "new_canvas"):
+            controller.new_canvas(fresh=True)
+        else:                                    # static controller (headless): the same picture by hand
+            from params import NEUTRAL as _NEUTRAL
+            for k, v in _NEUTRAL.items():
+                if k != "l_stack":
+                    controller.set(k, v)
+            own_stack.add(stack_mod.CANVAS_START["gen"], stack_mod.CANVAS_START)
+            own_stack.restore(own_stack.to_json())
+    if args.stack and stack_mod is not None and headless:
+        the_stack().restore(json.loads(Path(args.stack).read_text(encoding="utf-8")))
     apply_start(controller)
 
     # corner-pin / UI state. The legacy keys (fold_i .. fbAmt) only carry old touch-remote commands across to params.
@@ -2367,6 +2443,8 @@ def main():
 
             # ---- controller: one Frame of final values, events and clock. Non-GL steps are guarded: a bug in
             # the control system, a MIDI device or the panel must never take the picture down.
+            if cam is not None:                      # crowd camera mod sources + hand ripples (returns at once while off)
+                guarded("camera", cam.pre_update, dt, getattr(gov, "level", 0) if gov else 0)
             fr = guarded("control", controller.update, dt, sm, default=None)
             if fr is None:
                 fr = Frame(values=dict(last_frame.values), events=[], clock=dict(last_frame.clock))
@@ -2401,6 +2479,8 @@ def main():
                     if gov: guarded("governor", gov.command, c)
                 elif kind == "rec":
                     if recorder is not None: guarded("rec", recorder.command, c)
+                elif kind == "camera":
+                    if cam is not None: guarded("camera", cam.command, c)
                 elif kind in ("text_show", "text"): guarded("text", text_show, c)
                 elif kind == "surf": guarded("map", mapper.command, c)
                 elif isinstance(c.get("cmd"), str): own.append(c)
@@ -2461,6 +2541,9 @@ def main():
                     ripples[slot] = (min(max(ex_, 0.0), 1.0), min(max(ey_, 0.0), 1.0), 0.0)
 
             pal = palette_stops(vals["palette"])    # fractional value = blend of neighbouring palettes
+            if own_stack is not None and getattr(controller, "stack", None) is None:   # no control system: step it here
+                guarded("stack", own_stack.step, dtf, clock, None, None, rw / rh, fz >= 0.5,
+                        args.phase_offset if headless else 0)
 
             # touch remote / panel: publish state ~6x/s
             if remote.running and now - pub_t > 0.15:
@@ -2471,7 +2554,7 @@ def main():
                         state.update(controller.state())
                     except Exception as ex:
                         state["control_error"] = str(ex)
-                    state.update(surfaces=mapper.set.state())
+                    state.update(surfaces=mapper.state())
                     state.update(grid=st["grid"], calib=st["calib"], corners=corners, res=list(glfw.get_framebuffer_size(win)),
                                  fps=(frame - pub_frame) / (now - pub_t), bands=[float(x) for x in sm],
                                  bass=float(sm[0]), mid=float(sm[1]), high=float(sm[2]),
@@ -2480,6 +2563,7 @@ def main():
                                  palette_colors=[[list(c) for c in stops] for _, stops in PALETTES])
                     if gov: state["gov"] = gov.status()
                     if recorder is not None: state["rec"] = recorder.state()
+                    if cam is not None: state["camera"] = cam.state()
                     remote.publish_state(state)
 
                 guarded("publish", publish)
@@ -2568,6 +2652,8 @@ def main():
                     continue
                 if ex["obj"] is None or amount <= 0.001 or ex["fails"] >= 5:
                     continue
+                if ex["param"] == "l_stack" and not (the_stack() is not None and the_stack().frame):
+                    continue                             # empty stack: the pass is never drawn
                 try:
                     if gov: gov.timer.start(ex["param"])
                     if ex["param"] == "l_fractal":           # it integrates its own roll from rotate: spin is added as a rate
@@ -2577,6 +2663,8 @@ def main():
                         tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0), clock, T, dts, smr, pal)
                     elif ex["param"] == "l_text":
                         tex = ex["obj"].render(vals, clock, T, dts, smr, pal)
+                    elif ex["param"] == "l_stack":
+                        tex = ex["obj"].render(the_stack().frame, amount, pal)
                     elif ex["param"] == "l_land":
                         tex = ex["obj"].render(vals, clock, T, ph.travel, None, pal, smr, spin_phase=ph.spin)
                     else:
@@ -2593,19 +2681,29 @@ def main():
             fbos[dst].use()
             ctx.viewport = (0, 0, rw, rh)
             texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
-            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, mixAB=mix,
+            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, texK=16, mixAB=mix,
                        bass=smr[0], mid=smr[1], high=smr[2], aspect=rw / rh, pxh=1.0 / rh,
                        hasVideo=1.0 if has_video else 0.0, limiter=limiter.value, nanGuard=0.0 if args.no_nan_guard else 1.0,
                        chasePh=chase % 1.0, chaseCol=(chase * 0.15) % 1.0, breath=breath, calm=calm,
                        beat=clk["beat"] % 4096.0, beat_phase=clk["beat_phase"],
                        bar_phase=clk["bar_phase"], phrase_phase=clk["phrase_phase"])
             uni.update(ph.uniforms(vals, args.phase_offset if headless else 0))
+            # the mandala's core jewel belongs to the engine's own layers: with all of them at 0 (NEW CANVAS) it goes too
+            uni["coreOn"] = min(1.0, 8.0 * max([vals[n] for n in CORE_LAYERS] or [1.0]))
             uni.update(texS=8, artUse=float(art_mode), srcAI=1.0 if src_ai else 0.0, srcAsp=src_asp,
                        srcPh=(ph.swim * 0.035) % 2.0, srcTr=(ph.travel * 0.45 + ph.T * 0.04) % 2.0)
             for name, v in vals.items():
                 uni[f"p_{name}"] = v
             uni["p_blackout"] = bo
             uni.update({f"p_{k2}": v2 for k2, v2 in layer_on.items()})
+            if cam is not None:                      # crowd camera: mask / flow on units 12 / 13 (p_l_camera 0 while off)
+                uni.update(guarded("camera", cam.uniforms, vals, uni, default=None) or {"p_l_camera": 0.0})
+            # [filters> post-FX chain: while a filter is on, the scene draws without limiter / master / blackout and
+            # FilterPass applies them after the filters (same maths); its post-filter level feeds the meter below.
+            filt_on = filt is not None and filt_fails < 5 and filters_active(vals)
+            if filt_on:
+                uni.update(limiter=0.0, p_master=1.0, p_blackout=0.0)
+            # <filters]
             for kname, v in uni.items():
                 if kname in scene_prog:
                     if isinstance(v, np.ndarray):
@@ -2619,6 +2717,19 @@ def main():
             if gov: gov.timer.start("scene")
             scene_vao.render(moderngl.TRIANGLE_STRIP)
             if gov: gov.timer.stop()
+            if filt_on:                                  # [filters> in place on disp, before Spout / preview / mapping
+                try:
+                    if gov: gov.timer.start("filters")
+                    filt.apply(disp, vals, clk, dt, limiter=limiter.value, master=vals["master"], blackout=bo, pal=pal)
+                    filt_fails = 0
+                except Exception as ex:
+                    filt_fails += 1
+                    print(f"[filters] failed ({filt_fails}/5): {ex}")
+                    filt_on = False
+                if gov: gov.timer.stop()
+                fbos[dst].use()
+                ctx.viewport = (0, 0, rw, rh)            # the scene's units back for preview.service's redraw
+                texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)   # <filters]
 
             if spout:
                 try:
@@ -2652,16 +2763,19 @@ def main():
             st["hinv"] = hinv
             target = test_fbo if headless else ctx.screen
             fw, fh = (rw, rh) if headless else glfw.get_framebuffer_size(win)
-            multi = surf_draw is not None and map_ref["fails"] < 5 and not mapper.set.trivial()
-            if multi:
+            # mapper.gate decides: "skip" = 0 x 0 framebuffer (window minimised / mid re-plug): draw nothing and
+            # count nothing; "multi" = the surfaces; "pin" = the old corner pin, which is also the fallback when
+            # the surface draw keeps failing (it lights only the inside of that one quad, and the surface path is
+            # tried again every couple of seconds for as long as it takes, never given up on).
+            plan = mapper.gate.plan((fw, fh), mapper.set.trivial(), surf_draw is not None, now)
+            if plan == "multi":
                 try:
                     surf_draw.render(mapper.set, disp, target, (fw, fh), T, float(smr[0]), grid=st["grid"])
-                    map_ref["fails"] = 0
+                    mapper.gate.ok()
                 except Exception as ex:
-                    map_ref["fails"] += 1
-                    multi = False
-                    print(f"[map] surface output failed ({map_ref['fails']}/5), corner pin only this frame: {ex}")
-            if not multi:
+                    plan = "pin"
+                    print(mapper.gate.failed(now, ex))
+            if plan == "pin":
                 target.use()
                 ctx.viewport = (0, 0, fw, fh)
                 disp.use(0)
@@ -2684,7 +2798,7 @@ def main():
             if frame % 4 == 0 and max(vals["flash"], vals["strobe"], vals["invert"]) < 0.02 and bo < 0.5 and vals["master"] > 0.05:
                 meter_fbo.use()
                 ctx.viewport = (0, 0, *METER_SIZE)
-                pp[dst].use(6)
+                (filt.level if filt_on else pp[dst]).use(6)   # [filters] post-filter level while the chain runs
                 meter_prog["src"].value = 6
                 meter_prog["texel"].value = (1.0 / rw, 1.0 / rh)
                 meter_vao.render(moderngl.TRIANGLE_STRIP)
@@ -2751,14 +2865,17 @@ def main():
             guarded("exit", fn)
         if gov:
             guarded("exit", gov.close)
+        if cam is not None:
+            guarded("exit", cam.close)               # CAMERA OFF: the worker quits and releases the webcam
         for ex in extra:
             if headless and hasattr(ex["obj"], "draws"):          # tests: a layer at 0 must not have drawn at all
                 print(f"[{ex['param']}] draws={ex['obj'].draws}")
             close = getattr(ex["obj"], "close", None) or getattr(ex["obj"], "release", None)
             if close:
                 guarded("exit", close)
-        if recorder is not None:                     # finalize the MP4 (Shift+Esc, crash unwinding, test end)
-            guarded("exit", recorder.close)
+        if recorder is not None:                     # bounded (~4 s): seal the parts; clean exit -> a detached process
+            # muxes the MP4, crash -> the next start's recover() does (never holds the window / watchdog for a mux)
+            guarded("exit", recorder.close, crash=__import__("sys").exc_info()[0] is not None)
         audio.running = False
         glfw.terminate()
 

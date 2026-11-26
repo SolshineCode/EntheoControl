@@ -2,8 +2,9 @@
 
 Threads: `ask()` (GL thread, via a panel command) builds the prompt from the live state and queues a job. ONE worker
 thread runs the backend CLI (seconds to minutes). `tick()` (GL thread, every frame, costs nothing when idle) collects
-finished replies, parses + validates them (safety.py) against the state AT THAT MOMENT, and either shows a proposal
-(SUGGEST) or applies it (AUTOPILOT). Only queues cross threads; the controller is only ever touched on the GL thread.
+finished replies, validates them (safety.py) against the state AT THAT MOMENT, and either shows a proposal (SUGGEST)
+or applies it (AUTOPILOT). Only queues cross threads; the controller is only ever touched on the GL thread. The reply
+is capped, scrubbed and parsed on the worker thread, and folder listings / CLI checks never run on the GL thread.
 
 Every applied batch records what it replaced, so it can be undone from the history list.
 """
@@ -11,6 +12,7 @@ import collections
 import copy
 import json
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -192,53 +194,107 @@ def describe(ctl, cmds):
 
 
 ART_PARAMS = ("art_source", "art_index", "art_use", "l_art", "l_ai")
+EMAIL_RX = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def redact(text):
+    """Scrub what a CLI may know about the person from text that goes to panels and the log: e-mail addresses (the
+    Claude CLI puts the account's address into the model's context by itself) and the home folder path."""
+    text = EMAIL_RX.sub("[email]", text)
+    home = str(Path.home())
+    for h in {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}:
+        if len(h) > 3:
+            text = text.replace(h, "~")
+    return text
+
+
+def quiet_set(ctl, name, v):
+    """A fader move that is NOT the performer's hand: no `edits` count, so the resource governor keeps whatever it
+    has reduced (Controller.set would make it stand down). Same clamp, same "a move overrides the morph" rule."""
+    ctl.base[name] = min(PARAMS[name][1], max(PARAMS[name][0], float(v)))
+    if ctl._morph:
+        ctl._morph["names"].discard(name)
 
 
 def capture(ctl, cmds):
-    """What this batch is about to replace (only what it touches)."""
-    b = dict(base={}, bypass={}, scenes={})
+    """What this batch is about to replace (only what it touches), and what it will leave behind (`after`), so an
+    undo can tell which of it the performer has changed since."""
+    b = dict(base={}, after={}, bypass={}, scenes={})
     for c in cmds:
         k = c["cmd"]
         if k == "set":
             b["base"].setdefault(c["name"], ctl.base[c["name"]])
+            b["after"][c["name"]] = c["v"]
         elif k == "morph":
             b.setdefault("morph", ctl.morph_bars)
         elif k == "scene_recall":
+            sc = ctl.scenes[c["i"]] or {}
             b.setdefault("full", dict(base={n: ctl.base[n] for n in control.CONT}, mods=copy.deepcopy(ctl.mods),
-                                      cur=ctl.cur))
+                                      cur=ctl.cur, slot=c["i"], to=dict(sc.get("base") or {}),
+                                      to_mods=copy.deepcopy(sc.get("mods") or {})))
             b.setdefault("morph", ctl.morph_bars)        # fade_guards may lengthen it
         elif k == "scene_save":
             b["scenes"].setdefault(c["i"], copy.deepcopy(ctl.scenes[c["i"]]))
             b.setdefault("cur", ctl.cur)
         elif k == "bypass":
-            b["bypass"].setdefault(c["key"], c["key"] in ctl.bypass)
-            b.setdefault("bypass_fade", ctl.bypass_fade)
-        elif k == "art_pick":
-            for n in ART_PARAMS:
-                if n in ctl.base:
-                    b["base"].setdefault(n, ctl.base[n])
+            b["bypass"].setdefault(c["key"], (c["key"] in ctl.bypass, c["on"]))
         elif k == "text" and ctl.text is not None:
             b.setdefault("text", copy.deepcopy(ctl.text.to_json()))
     return b
 
 
 def restore(ctl, b):
-    """Put back what capture() saw. Faders glide back through the controller's normal slew."""
+    """Undo one batch WITHOUT cuts and without touching what the performer changed afterwards.
+
+    Faders (and selectors, which flip at the half-way point like in any scene morph) travel back through a morph of
+    at least MIN_MORPH_S. A param is only restored if it still holds the value the batch gave it. A recall the
+    performer has queued stays queued; a morph the performer started since is never replaced. Layers come back
+    through the bypass fade (at least MIN_FADE_S). Returns (notes, fade the caller should put back later or None).
+    """
+    notes = []
+    mo = ctl._morph
     full = b.get("full")
-    if full:
-        ctl.pending = None
-        ctl._morph = None
-        ctl.base.update(full["base"])
-        ctl.mods = copy.deepcopy(full["mods"])
-        ctl.cur = full["cur"]
-    for n, v in b.get("base", {}).items():
-        ctl.set(n, v)
+    target = {}                                          # param -> value to travel back to
+    after = dict(full["to"]) if full else {}
+    after.update(b.get("after", {}))
+    before = dict(full["base"]) if full else {}
+    before.update(b.get("base", {}))
+    ours = bool(mo) and all(abs(mo["to"].get(n, 1e9) - after.get(n, -1e9)) < 1e-6 for n in mo["names"])
+    foreign = bool(mo) and not ours
+    for n, old in before.items():
+        if n not in after or n not in ctl.base:
+            continue
+        cur = ctl.base[n]
+        in_flight = ours and n in mo["names"]
+        if in_flight or abs(cur - after[n]) < 1e-6:
+            if abs(cur - old) > 1e-9 or in_flight:
+                target[n] = old
+    skipped = [n for n in before if n in after and n not in target and abs(ctl.base.get(n, 0.0) - before[n]) > 1e-6]
+    if foreign and target:
+        notes.append("a scene change is in progress: faders were left alone")
+        target = {}
+    elif skipped:
+        notes.append(f"{len(skipped)} fader(s) you moved since were left alone")
+    if target:
+        bars = max(safety.MIN_MORPH_S * max(1.0, float(ctl.bpm)) / 240.0, 1e-3)
+        ctl._morph = dict(src={n: ctl.base[n] for n in target}, to=dict(target), names=set(target),
+                          start=ctl.beat, dur=bars * 4.0, old=[], t=0.0)
+    if full and not foreign:
+        if ctl.cur == full["slot"]:
+            ctl.cur = full["cur"]
+        if ctl.mods == full["to_mods"]:                  # modulation untouched since the recall: put the old set back
+            ctl.mods = copy.deepcopy(full["mods"])
     if "morph" in b:
         ctl.morph_bars = b["morph"]
-    if "bypass_fade" in b:
-        ctl.bypass_fade = b["bypass_fade"]
-    for key, was in b.get("bypass", {}).items():
-        ctl.set_bypass(key, was)
+    fade_back = None
+    flips = [(k, was) for k, (was, now) in b.get("bypass", {}).items() if (k in ctl.bypass) == now and was != now]
+    if flips:
+        orig = ctl.bypass_fade
+        if orig < safety.MIN_FADE_S:                     # the layer comes back as a fade, never as a cut ...
+            ctl.bypass_fade = safety.MIN_FADE_S
+            fade_back = orig                             # ... and the performer's own fade time returns afterwards
+        for k, was in flips:
+            ctl.set_bypass(k, was)
     if b.get("scenes"):
         for i, old in b["scenes"].items():
             ctl.scenes[i] = copy.deepcopy(old)
@@ -247,6 +303,7 @@ def restore(ctl, b):
         ctl._save_scenes()
     if "text" in b and ctl.text is not None:
         ctl.text.restore(b["text"])
+    return notes, fade_back
 
 
 # ------------------------------------------------------------------------------------------------ the assistant
@@ -256,7 +313,8 @@ class Assistant:
                  backend="claude"):
         self.backends = dict(backends)                 # name -> object with .label, .available(), .ask(prompt, ...)
         self.log = log or OnlineLog(None)
-        self.lister = lister or (lambda: ([], []))     # -> (texture names newest first, art names)
+        self.lister = lister or (lambda: ([], []))     # -> CACHED (texture names newest first, art names): no disk
+        self.rescan = lambda: None                     # plugin hook, called on the WORKER thread before each job
         self.clock, self.sync = clock, bool(sync)
         self.mode, self.backend = mode, backend
         self.msgs = collections.deque(maxlen=MAX_MSGS)
@@ -268,13 +326,13 @@ class Assistant:
         self._done = queue.Queue()
         self._queued = 0
         self._busy = None                              # dict(id, backend, t0, chars) while a CLI runs
-        self._cancel = threading.Event()
+        self._events = set()                           # cancel events of every job queued or running (one per job)
         self._gen = 0                                  # bumped by cancel / panic: older replies are dropped
         self._last_apply = -1e9
+        self._fade_back = None                         # (deadline, performer's bypass_fade, the value we set meanwhile)
         self._ask_rate = RateLimiter(*ASK_LIMIT, clock=clock)
         self._gen_rate = RateLimiter(*GEN_LIMIT, clock=clock)
-        self._avail = {}
-        self.optin = {}                                # backend name -> why it is refused (opt-in not given)
+        self._avail = None                             # name -> bool, filled off the render thread (refresh)
         self._stop = False
         self._thread = None
 
@@ -288,13 +346,19 @@ class Assistant:
         self.msgs.append(m)
         return m
 
-    def available(self, name):
-        if name not in self._avail:                    # shutil.which once per session, not per frame
+    def refresh(self):
+        """Which backends can run. May start `claude --help` once, so it is called off the render thread."""
+        out = {}
+        for name, be in self.backends.items():
             try:
-                self._avail[name] = bool(self.backends[name].available())
+                out[name] = bool(be.available())
             except Exception:
-                self._avail[name] = False
-        return self._avail[name]
+                out[name] = False
+        self._avail = out
+        return out
+
+    def available(self, name):
+        return bool((self._avail or {}).get(name))
 
     # ---------------------------------------------------------------- GL thread: requests
     def ask(self, ctl, text, backend=None):
@@ -303,11 +367,12 @@ class Assistant:
         if name not in self.backends:
             self._msg("system", f"Unknown backend '{name}'.")
             return False
-        if name in self.optin:
-            self._msg("system", f"{self.backends[name].label} is opt-in and switched off. {self.optin[name]}")
+        if self._avail is None:
+            self._msg("system", "The assistant is still starting: try again in a moment.")
             return False
         if not self.available(name):
-            self._msg("system", f"{self.backends[name].label} is not installed on this laptop.")
+            why = getattr(self.backends[name], "problem", "") or "it is not installed on this laptop"
+            self._msg("system", f"{self.backends[name].label} cannot be used: {why}.")
             return False
         if self._queued >= MAX_QUEUE:
             self._msg("system", "Still working on earlier requests: wait or press CANCEL.")
@@ -316,9 +381,11 @@ class Assistant:
             self._msg("system", f"Slow down: at most {ASK_LIMIT[0]} requests a minute.")
             self.log.log("rate_limited", what="ask")
             return False
-        tex, art = self.lister()
+        tex, art = self.lister()                       # cached listing: no disk access on this thread
         prompt = build_prompt(ctl, text, tex, art, chat=list(self.msgs)[:-1])
-        job = dict(id=self._next(), text=text, backend=name, prompt=prompt, gen=self._gen)
+        ev = threading.Event()
+        job = dict(id=self._next(), text=text, backend=name, prompt=prompt, gen=self._gen, cancel=ev)
+        self._events.add(ev)
         self.log.log("request", id=job["id"], backend=name, text=text, prompt_chars=len(prompt))
         self._queued += 1
         if self.sync:
@@ -339,46 +406,58 @@ class Assistant:
             self._run_job(job)
 
     def _run_job(self, job):
-        if job["gen"] != self._gen:
+        ev = job["cancel"]                             # this job's own event: set once, never cleared, so a cancel
+        if ev.is_set() or job["gen"] != self._gen:     # that lands at any moment is seen
             self._done.put((job, None, "cancelled", 0.0))
             return
-        self._cancel.clear()
         busy = dict(id=job["id"], backend=job["backend"], t0=time.monotonic(), chars=0)
         self._busy = busy
-        text = err = None
+        parsed = err = None
         try:
-            text = self.backends[job["backend"]].ask(job["prompt"], cancel=self._cancel,
-                                                    progress=lambda n: busy.__setitem__("chars", n))
+            raw = self.backends[job["backend"]].ask(job["prompt"], cancel=ev,
+                                                   progress=lambda n: busy.__setitem__("chars", n))
+            raw = redact(str(raw)[:safety.MAX_REPLY])         # bounded, scrubbed, and parsed here: not on the render thread
+            parsed = (raw,) + tuple(safety.parse_reply(raw))
         except Exception as ex:
-            err = f"{type(ex).__name__}: {ex}"[:400]
+            err = redact(f"{type(ex).__name__}: {ex}")[:400]
+        try:
+            self.rescan()                              # folder listings for the next prompt / validation
+        except Exception:
+            pass
         secs = time.monotonic() - busy["t0"]
         self._busy = None
-        self._done.put((job, text, err, secs))
+        self._done.put((job, parsed, err, secs))
 
     # ---------------------------------------------------------------- GL thread: results
     def tick(self, ctl):
         while True:
             try:
-                job, text, err, secs = self._done.get_nowait()
+                job, parsed, err, secs = self._done.get_nowait()
             except queue.Empty:
                 break
             self._queued = max(0, self._queued - 1)
-            self._handle(ctl, job, text, err, secs)
+            self._events.discard(job["cancel"])
+            self._handle(ctl, job, parsed, err, secs)
+        fb = self._fade_back
+        if fb and self.clock() >= fb[0]:
+            self._fade_back = None
+            if abs(ctl.bypass_fade - fb[2]) < 1e-9:     # only if nobody changed it in the meantime
+                ctl.bypass_fade = fb[1]
         if self.mode == "autopilot":
             for p in list(self.props.values()):
                 if p["status"] == "pending" and p.get("auto"):
                     self.apply(ctl, p["id"], by="autopilot")
 
-    def _handle(self, ctl, job, text, err, secs):
+    def _handle(self, ctl, job, parsed, err, secs):
         label = getattr(self.backends.get(job["backend"]), "label", job["backend"])
-        if job["gen"] != self._gen:
+        if job["gen"] != self._gen or job["cancel"].is_set():
             self.log.log("dropped", id=job["id"], why="cancelled")
             return
         if err:
             self.log.log("error", id=job["id"], backend=job["backend"], secs=round(secs, 2), error=err)
             self._msg("system", f"{label} failed after {secs:.1f} s: {err}", backend=job["backend"], secs=round(secs, 1))
             return
-        say, raw, perr = safety.parse_reply(text)
+        text, say, raw, perr = parsed
         tex, art = self.lister()
         ok, rejected, notes = safety.validate_batch(raw, safety.context(ctl, tex, art))
         if notes:
@@ -402,6 +481,11 @@ class Assistant:
             self.apply(ctl, pid, by="autopilot")
 
     # ---------------------------------------------------------------- apply / undo
+    def _hold_fade(self, ctl, orig):
+        """bypass_fade was lengthened for a fade of ours: give the performer's value back once that fade is over."""
+        if self._fade_back is None:
+            self._fade_back = (self.clock() + safety.MIN_FADE_S * 1.5 + 0.1, orig, ctl.bypass_fade)
+
     def apply(self, ctl, pid, by="performer"):
         p = self.props.get(pid)
         if not p or p["status"] != "pending" or not p["cmds"]:
@@ -413,21 +497,38 @@ class Assistant:
         if now - self._last_apply < MIN_APPLY_S:
             p["why"] = "rate limit: one batch a second"
             return False
-        cmds = []
-        for c in p["cmds"]:
+        # the show may have moved since the reply arrived (tempo, faders, governor): run the whole-batch rules again
+        cmds, renotes, refusal = safety.finalize(p["cmds"], safety.context(ctl))
+        if renotes:
+            p["notes"] += [n for n in renotes if n not in p["notes"]]
+            self.log.log("clamp", prop=pid, notes=renotes)
+        if refusal or not cmds:
+            p["status"], p["auto"], p["why"] = "rejected", False, refusal or "nothing left to apply"
+            p["rejected"] = p["rejected"] + [{"cmd": "batch", "why": p["why"]}]
+            self.log.log("refused", prop=pid, why=p["why"])
+            return False
+        kept = []
+        for c in cmds:
             if c["cmd"] == "gen" and not self._gen_rate.allow():
                 p["notes"].append(f"image job skipped: at most {GEN_LIMIT[0]} a minute")
                 self.log.log("rate_limited", what="gen", prop=pid)
                 continue
-            cmds.append(c)
+            kept.append(c)
+        cmds = kept
+        p["diff"] = describe(ctl, cmds)                  # what is really applied, against the state right now
         before = capture(ctl, cmds)
+        fade0 = ctl.bypass_fade
         guards = safety.fade_guards(ctl, cmds)           # photosensitive: no hard cuts from the assistant
         if guards:
             p["notes"] += guards
             self.log.log("clamp", prop=pid, notes=guards)
+        if ctl.bypass_fade != fade0:
+            self._hold_fade(ctl, fade0)
         for c in cmds:
             try:
-                if c["cmd"] in control.CONTROL_CMDS:
+                if c["cmd"] == "set":
+                    quiet_set(ctl, c["name"], c["v"])    # not a performer edit: the governor keeps its reductions
+                elif c["cmd"] in control.CONTROL_CMDS:
                     ctl._do(dict(c))
                 else:
                     ctl._out.append(dict(c))             # engine command (art_pick): out through Controller.apply
@@ -436,8 +537,8 @@ class Assistant:
         self._last_apply = now
         p["status"], p["why"], p["auto"] = "applied", "", False
         summary = "; ".join(p["diff"])[:300] or "no change"
-        self.history.append(dict(id=pid, t=time.strftime("%H:%M:%S"), summary=summary, undone=False, before=before,
-                                 by=by, n=len(cmds)))
+        self.history.append(dict(id=pid, t=time.strftime("%H:%M:%S"), summary=summary, undone=False, stale=False,
+                                 before=before, by=by, n=len(cmds)))
         self.log.log("apply", prop=pid, by=by, commands=cmds, diff=p["diff"])
         return True
 
@@ -450,37 +551,55 @@ class Assistant:
     def undo(self, ctl, pid):
         for hrec in self.history:
             if hrec["id"] == pid and not hrec["undone"]:
+                if hrec.get("stale"):                    # applied before the last PANIC: an undo would reverse PANIC
+                    self.note = "that batch is from before the last PANIC and can no longer be undone"
+                    return False
                 try:
-                    restore(ctl, hrec["before"])
+                    notes, fade = restore(ctl, hrec["before"])
                 except Exception as ex:
                     self.note = f"undo failed: {type(ex).__name__}"
                     self.log.log("error", what="undo", prop=pid, error=str(ex)[:200])
                     return False
+                if fade is not None:
+                    self._hold_fade(ctl, fade)
                 hrec["undone"] = True
                 if pid in self.props:
                     self.props[pid]["status"] = "undone"
-                self.log.log("undo", prop=pid)
+                    self.props[pid]["notes"] = self.props[pid]["notes"] + notes
+                self.note = "; ".join(notes)
+                self.log.log("undo", prop=pid, notes=notes)
                 return True
         return False
 
     # ---------------------------------------------------------------- cancel / panic / close
     def cancel(self, why="cancelled"):
         self._gen += 1
-        self._cancel.set()
+        for ev in list(self._events):                   # the running job (its CLI tree is killed) and every queued one
+            ev.set()
         try:
             while True:
-                self._jobs.get_nowait()
+                job = self._jobs.get_nowait()
+                if job is None:
+                    self._jobs.put(None)
+                    break
+                self._events.discard(job["cancel"])
                 self._queued = max(0, self._queued - 1)
         except queue.Empty:
             pass
         self.log.log("cancel", why=why)
 
     def on_panic(self):
-        """PANIC wins: nothing the assistant has in flight may move the look away from the safe scene."""
+        """PANIC wins: nothing the assistant has in flight may move the look away from the safe scene, and nothing it
+        did before can be 'undone' on top of the safe scene afterwards."""
         self.cancel("panic")
         for p in self.props.values():
             if p["status"] == "pending":
                 p["status"], p["auto"], p["why"] = "dismissed", False, "PANIC"
+            elif p["status"] == "applied":
+                p["status"], p["why"] = "locked", "applied before PANIC: cannot be undone"
+        for hrec in self.history:
+            hrec["stale"] = True
+        self._fade_back = None
         self.mode = "suggest"
         self._msg("system", "PANIC: assistant requests dropped, mode back to SUGGEST.")
 
@@ -502,12 +621,13 @@ class Assistant:
         b = self._busy
         return dict(
             mode=self.mode, backend=self.backend,
-            backends={n: dict(label=getattr(be, "label", n), ok=self.available(n), optin=n in self.optin)
+            backends={n: dict(label=getattr(be, "label", n), ok=self.available(n),
+                              why=(getattr(be, "problem", "") or "") if self._avail is not None else "checking")
                       for n, be in self.backends.items()},
             busy=dict(id=b["id"], backend=b["backend"], secs=round(time.monotonic() - b["t0"], 1), chars=b["chars"]) if b else None,
             queue=self._queued,
             msgs=[dict(m, text=m["text"][:600]) for m in msgs],
             props=props,
-            history=[dict(id=x["id"], t=x["t"], summary=x["summary"][:160], undone=x["undone"], by=x["by"])
-                     for x in list(self.history)[-SHOWN_MSGS:]],
+            history=[dict(id=x["id"], t=x["t"], summary=x["summary"][:160], undone=x["undone"], by=x["by"],
+                          stale=bool(x.get("stale"))) for x in list(self.history)[-SHOWN_MSGS:]],
             note=self.note)

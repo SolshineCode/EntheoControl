@@ -77,12 +77,14 @@ reads **ONLINE ON** (amber). Press it again and nothing leaves the laptop.
   - It can move faders, pick palettes, scenes and images, switch layers, put words on the text layer and start AI images.
     It can never flash, strobe, black out, PANIC or touch the mapping; PANIC also cancels whatever it was doing.
 - **AI DREAM > Image engine > NANO BANANA**: recognisable subjects (a Buddha, a woman, a jaguar) instead of textures.
-  Paste your own Gemini API key (https://aistudio.google.com) into the box under the selector and press SAVE KEY.
+  Paste your own Gemini API key (https://aistudio.google.com) into the box under the selector and press SAVE KEY
+  (it is kept in your Windows user profile, not in the show folder).
   Prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply. If it fails or you are
   offline, the local engine makes the image instead. Add "on a pure black background" to prompts.
-- **Allow Google CLI tools** (checkbox on ASSISTANT, off by default): lets the plugin use your `agy` login for chat
-  (about 14 s) and for images without an API key (about 40 s each). Read https://antigravity.google/terms first: they may
-  not permit other programs driving the CLI. Your call.
+- **Allow images through the agy CLI** (checkbox on ASSISTANT, off by default): images without an API key (about 30 s
+  each) through your `agy` login. It can only be ticked on the laptop itself (open the panel at address 127.0.0.1),
+  never from a phone. Read https://antigravity.google/terms first: they may not permit other programs driving the
+  CLI. Your call. Chat is Claude Code only.
 - Everything it does is written to `logs\online_<date>.log`.
 
 ## 4. TouchDesigner (the deep, pro tool)
@@ -98,3 +100,50 @@ Demo mode (watermark). See `research/resolume_spout_mapping.md`. Its built-in we
 - **Day 2:** generate your own textures with your own prompts; tape 3-5 foam-core shapes or stack boxes and give each its own surface in MAPPING.
 - **Week 1:** TouchDesigner basics (Noise > Feedback > Kaleidoscope > Out), audioAnalysis, Kantan Mapper.
 - **Later:** train your own LoRA (`research/lora_dataset.md`), MIDI controller (`research/hardware_next.md`), Resolume sets.
+
+
+## Start simple and build it up (BUILD tab)
+Start on a clean black canvas with one moving stripe layer:
+```
+powershell -ExecutionPolicy Bypass -File run_show.ps1 --monitor 1 --panel --fresh
+```
+or press **NEW CANVAS** on the **BUILD** tab at any time (it crossfades; **RESTORE PREVIOUS** brings your earlier look
+back exactly, nothing is lost).
+
+- **+ ADD LAYER**: pick a generator (stripes, rings, spiral, rays, checker, waves, polygons, noise bands). Up to 8.
+  Further down the same menu you can bring the engine's own layers back in gently (Folding Blocks, Beadwork, Beings,
+  fractals, art, 3D landscapes, text...).
+- Click a layer to shape it on the right. Every number can be dragged, typed, reset (the round arrow, or double-click
+  the fader), modulated (**MOD**: bass, LFOs, sequencer) and MIDI-learned.
+  - **Shape**: how many bands, band width, edge softness, waveform.
+  - **Space**: straight, polar, tunnel, kaleidoscope, mirrors, perspective floor; direction, zoom, centre.
+  - **Motion**: scroll speed (FREE = per second, BEAT = per beat), rotation, pulse, wave.
+  - **Colour**: click a stop on the gradient to change its colour, drag it to move it, **+ STOP** to add one (2 to 6);
+    or FOLLOW THE SHOW PALETTE. "Colour blend" 0 = each stripe takes the next colour, 1 = one smooth gradient.
+  - **Blend**: add, screen, multiply, difference, mask (the layers below show only where this one is lit), replace, over.
+- In the list: arrows reorder, EYE mutes, SOLO shows only that layer, DUP copies, the cross deletes (click twice).
+  **UNDO** steps back.
+- **SIMPLE / FULL** (top bar): SIMPLE keeps only BUILD, PERFORM and SCENES in view; FULL shows every tab.
+- Save what you built into a scene slot as usual (SCENES): the stack is stored with it and morphs on recall.
+- Safety: very wide bands cannot scroll faster than 2.5 per second and pulses never beat faster than that; the panel
+  says "speed limited" when that holds a layer back.
+
+
+## Crowd camera (CAMERA tab)
+Dancers become part of the picture: their silhouettes, movement and arms drive the visuals. **Off by default**; it never
+switches itself on, not even after a restart.
+1. Open the **CAMERA** tab, press **CAMERA OFF (click = ON)**. The top bar shows a red blinking **CAMERA ON** while the
+   webcam is in use; one click there is CAMERA OFF and frees the webcam.
+2. Raise **Crowd camera** (`l_camera`, on the LAYERS tab and at the top of the CAMERA faders) and pick an **Integration**:
+   Bodies reveal (visuals only on the people), Glow outline, Patterns inside (bodies carry a hue-turned pattern),
+   Knockout (people black), Motion trails (silhouettes smear into the echo), Flow push (movement pushes the pattern).
+   **Flow push** also works on top of any mode.
+3. Align: Glow outline, stand in front of the wall, move Position / Scale / Keystone / Crop until the outline sits on you.
+   MIRROR / AS SEEN depends on where the camera points. **PREVIEW: ON** shows a small mask + skeleton view (no camera image).
+4. Dancer effects: **Hand ripples**, **Beings follow hands** (negative = they flee), **Hands pull swarm** (needs the
+   particle swarm up), **Serpent on arm** (needs serpents up; serpent 1 rides the most raised arm).
+5. Any fader can follow the crowd: open its **MOD** editor and pick `crowd_motion`, `crowd_left` / `centre` / `right`,
+   `crowd_presence`, `hand_height`, `hands_spread`, `hip_sway` or `hand_speed`. The meters on the CAMERA tab show them live.
+
+Frames are analysed in memory by a separate low-priority process and are never saved, sent or recorded. A dark room lowers
+the webcam's own frame rate (about 10 fps measured at night): more light on the dancers = smoother tracking.

@@ -11,7 +11,14 @@ Hard rules (photosensitive + show safety), none of them configurable from the pa
     MAX_FLASH_HZ.
   * `master` is clamped to MASTER_MIN or more and the whole-`layers` switch cannot be turned off: no blackout
     by the back door. PANIC, blackout, mapping / surfaces, MIDI, clock, recorder, governor: not in the allowlist.
-  * `chase_rate` is clamped so the light chase sweeps at most MAX_FLASH_HZ times a second at the current BPM.
+  * the light chase: sweeps a second x how often each point lights up per sweep (chase_mode 0 = 1, 1 = 2,
+    2 = up to 4) stays at or under MAX_FLASH_HZ. Checked against the chase_mode the batch leaves behind and against
+    the BPM at the moment of APPLY (`finalize`), not only when the reply arrived.
+  * no blackout by the back door: a batch whose net effect leaves no layer visible (every l_* under LAYER_MIN or
+    switched off) is refused as a whole.
+  * GPU load: the assistant may lower but never raise render scales / detail / counts (COST), and may not switch on
+    more heavy offscreen layers than HEAVY_MAX (none at all while the resource governor reports strain). Its fader
+    moves do not count as "the performer's hand" (assistant.quiet_set), so the governor keeps its reductions.
   * no hard cuts: a layer the assistant switches fades over at least MIN_FADE_S, a scene it recalls morphs over at
     least MIN_MORPH_S (`fade_guards`, applied at the moment of apply and reported as clamps).
   * saturated red: the assistant has no flashing control at all and its changes land at most once a second, which is
@@ -34,6 +41,13 @@ MIN_MORPH_S = 0.5           # shortest scene morph the assistant may cause
 MAX_CMDS = 24               # per reply
 MAX_GEN = 2                 # image jobs per reply
 MAX_SAY = 600
+MAX_REPLY = 16384           # characters of a reply that are looked at (the JSON we ask for is a few hundred)
+MAX_PARSE_TRIES = 48        # "{" positions tried as the start of the reply object
+CHASE_MULT = {0: 1.0, 1: 2.0, 2: 4.0}      # times each point lights up per sweep, by chase_mode (live_visuals chaseKey)
+LAYER_MIN = 0.15            # a layer below this does not count as visible
+HEAVY = ("l_fractal", "l_land", "l_swarm", "l_beings", "l_art")      # offscreen passes: the expensive layers
+HEAVY_MAX = 2               # heavy layers the assistant may have on at once (never forces the performer's own off)
+COST_EXTRA = ("being_count", "serpent_count")
 TEX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(png|jpg|jpeg|webp)$", re.I)
 
 
@@ -45,7 +59,9 @@ def parse_reply(text):
     text = text.strip()
     obj = None
     dec = json.JSONDecoder(strict=False)
-    for m in re.finditer(r"\{", text):
+    for k, m in enumerate(re.finditer(r"\{", text)):
+        if k >= MAX_PARSE_TRIES:                      # bounded work, whatever the model printed
+            break
         try:
             cand, _ = dec.raw_decode(text, m.start())
         except (ValueError, RecursionError):
@@ -65,9 +81,17 @@ def parse_reply(text):
 
 def context(ctl, tex=(), art=()):
     """Everything validation needs to know about the show right now (plain data, so tests can build one by hand)."""
+    gov = None
+    try:
+        fn = getattr(ctl, "gov_status", None)        # optional hook: the engine may publish governor.status here
+        gov = fn() if callable(fn) else None
+    except Exception:
+        gov = None
+    strained = bool(isinstance(gov, dict) and (gov.get("active") or gov.get("level") in ("strained", "critical", 1, 2)))
     return dict(bpm=float(ctl.bpm), base=dict(ctl.base), scenes=[s is not None for s in ctl.scenes],
                 scene_names=[(s or {}).get("name", "") for s in ctl.scenes], tex=list(tex), art=list(art),
-                bypass=set(ctl.bypass), has_text=ctl.text is not None)
+                scene_bases=[dict(s.get("base") or {}) if s else None for s in ctl.scenes],
+                bypass=set(ctl.bypass), has_text=ctl.text is not None, strained=strained)
 
 
 def _finite(v):
@@ -83,9 +107,95 @@ def _param(c):
     return name
 
 
-def max_chase_rate(bpm):
-    """Largest |chase_rate| (sweeps per bar) that stays at or under MAX_FLASH_HZ at this tempo."""
-    return MAX_FLASH_HZ * 240.0 / max(1.0, float(bpm))
+def max_chase_rate(bpm, mode=0):
+    """Largest |chase_rate| (sweeps per bar) at which no point of the picture lights up more than MAX_FLASH_HZ
+    times a second at this tempo: chase_mode 1 lights each point twice per sweep, mode 2 up to four times."""
+    mult = CHASE_MULT.get(int(round(float(mode))), 4.0)
+    return MAX_FLASH_HZ * 240.0 / max(1.0, float(bpm)) / mult
+
+
+def is_cost(name):
+    return name.endswith("_res") or name.endswith("_detail") or name in COST_EXTRA
+
+
+def _covered(name, bypass):
+    return any(name in control.BYPASS_COVER.get(k, ()) for k in bypass)
+
+
+def _visible(base, bypass):
+    """Is any picture-making layer up? (l_echo is feedback of the others, not a source.)"""
+    return any(n.startswith("l_") and n != "l_echo" and base.get(n, 0.0) >= LAYER_MIN and not _covered(n, bypass)
+               for n in PARAMS)
+
+
+def _heavy_on(base, bypass):
+    return [n for n in HEAVY if n in PARAMS and base.get(n, 0.0) > 0.01 and not _covered(n, bypass)]
+
+
+def _after(cmds, ctx):
+    """(base, bypass) the batch leaves behind: a recalled scene first, the batch's own sets on top."""
+    base, byp = dict(ctx["base"]), set(ctx["bypass"])
+    for c in cmds:
+        if c["cmd"] == "scene_recall":
+            base.update((ctx.get("scene_bases") or [None] * (c["i"] + 1))[c["i"]] or {})
+    for c in cmds:
+        if c["cmd"] == "set":
+            base[c["name"]] = c["v"]
+        elif c["cmd"] == "bypass":
+            (byp.add if c["on"] else byp.discard)(c["key"])
+    return base, byp
+
+
+def finalize(cmds, ctx):
+    """Whole-batch rules, run when the reply arrives AND again at the moment of apply (the tempo, the faders and the
+    governor may have moved in between). -> (commands, notes, refusal): refusal != "" means apply nothing."""
+    cmds, notes = [dict(c) for c in cmds], []
+    # ---- GPU cost: never raise render scale / detail / counts
+    keep = []
+    for c in cmds:
+        if c["cmd"] == "set" and is_cost(c["name"]) and c["v"] > ctx["base"].get(c["name"], PARAMS[c["name"]][2]) + 1e-9:
+            notes.append(f"{c['name']} not raised (GPU load is the performer's and the governor's call)")
+            continue
+        keep.append(c)
+    cmds = keep
+    # ---- heavy layers: no more than HEAVY_MAX on (or than are on already); none new while the governor is strained
+    before = _heavy_on(ctx["base"], ctx["bypass"])
+    allowed = len(before) if ctx.get("strained") else max(len(before), HEAVY_MAX)
+    while True:
+        base, byp = _after(cmds, ctx)
+        new = [n for n in _heavy_on(base, byp) if n not in before]
+        if len(before) + len(new) <= allowed or not new:
+            break
+        victim = new[-1]
+        drop = next((c for c in reversed(cmds) if c["cmd"] == "set" and c["name"] == victim), None) \
+            or next((c for c in reversed(cmds) if c["cmd"] == "bypass" and not c["on"]
+                     and victim in control.BYPASS_COVER.get(c["key"], ())), None) \
+            or next((c for c in cmds if c["cmd"] == "scene_recall"), None)
+        if drop is None:
+            break
+        cmds.remove(drop)
+        notes.append(f"{victim} left off: too many heavy layers at once"
+                     + (" (the governor is already reducing load)" if ctx.get("strained") else ""))
+    # ---- light chase: flashes per second = sweeps per second x multiplicity of the mode the batch leaves behind
+    touches = any((c["cmd"] == "set" and c["name"] in ("chase_rate", "chase_mode")) or c["cmd"] == "scene_recall"
+                  for c in cmds)
+    base, byp = _after(cmds, ctx)
+    if touches and "chase_rate" in PARAMS:
+        lim = max_chase_rate(ctx["bpm"], base.get("chase_mode", 0.0))
+        rate = base.get("chase_rate", 0.0)
+        if abs(rate) > lim + 1e-9:
+            v = lim if rate > 0 else -lim
+            cmds = [c for c in cmds if not (c["cmd"] == "set" and c["name"] == "chase_rate")]
+            cmds.append({"cmd": "set", "name": "chase_rate", "v": v})
+            notes.append(f"chase_rate clamped {rate:g} -> {v:.3g} (at most {MAX_FLASH_HZ:g} flashes a second in chase "
+                         f"mode {int(round(base.get('chase_mode', 0.0)))} at {ctx['bpm']:.0f} BPM)")
+            base, byp = _after(cmds, ctx)
+    # ---- net effect: never leave the room dark
+    if _visible(ctx["base"], ctx["bypass"]) and not _visible(base, byp):
+        return [], notes, "this would switch every layer off (a blackout is the performer's call)"
+    if base.get("master", 1.0) < MASTER_MIN - 1e-9 and ctx["base"].get("master", 1.0) >= MASTER_MIN:
+        return [], notes, "this would take the master below its floor"
+    return cmds, notes, ""
 
 
 def _set(name, v, ctx, notes):
@@ -230,6 +340,14 @@ def validate_batch(raw, ctx):
         if kind == "bypass":
             ok = [o for o in ok if not (o["cmd"] == "bypass" and o["key"] == out["key"])]
         ok.append(out)
+    if ok:
+        ok, more, refusal = finalize(ok, ctx)
+        notes += more
+        if refusal:
+            rejected.append({"cmd": "batch", "why": refusal})
+            ok = []
+        elif not ok:
+            rejected.append({"cmd": "batch", "why": "nothing left after the safety rules: " + "; ".join(more)[:120]})
     return ok, rejected, notes
 
 

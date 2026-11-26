@@ -6,7 +6,7 @@
 
 ## 1. `ai_gen.py` — SD-Turbo vs. SD 1.5 LoRA Compatibility (High Impact)
 - `ai_gen.py` loads `stabilityai/sd-turbo`, which is distilled from **SD 2.1** (1024-dim OpenCLIP ViT-H/14 text encoder), **not** SD 1.5 (768-dim CLIP ViT-L/14).
-- Line 9 & 44 (`--lora path/to/dmt_lora.safetensors` → `pipe.load_lora_weights(lora)`) will fail with a weight-shape mismatch if you later trains an **SD 1.5** LoRA.
+- Line 9 & 44 (`--lora path/to/dmt_lora.safetensors` → `pipe.load_lora_weights(lora)`) will fail with a weight-shape mismatch if the user later trains an **SD 1.5** LoRA.
 - **Suggestion:** Either document `--lora` as requiring an **SD 2.1 / SD-Turbo LoRA**, or add a `--base sd15-lcm` option loading `stable-diffusion-v1-5/stable-diffusion-v1-5` + `latent-consistency/lcm-lora-sdv1-5` (2–4 steps, TAESD, circular padding) so standard SD 1.5 LoRAs plug straight in.
 - **GTX 1650 Ti `--fp32` VRAM note:** Full FP32 `sd-turbo` UNet weights (~3.4 GB) + TAESD + activations may OOM on 4 GB VRAM without `pipe.enable_model_cpu_offload()`. If `--fp16` produces NaN/black frames on TU117, testing **FP16 UNet + FP32 TAESD** first (before full `--fp32`) keeps VRAM around ~2.3 GB while fixing VAE-induced NaNs.
 

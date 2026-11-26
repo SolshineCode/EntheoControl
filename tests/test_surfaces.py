@@ -300,7 +300,9 @@ def test_span_is_one_continuous_undistorted_picture_across_surfaces():
     assert abs((b[0] - a[0]) * cw - 100) < 1e-9 and abs((c[1] - a[1]) * ch - 100) < 1e-9, "uniform scale: no stretch"
     assert all(0 <= v <= 1 for i in (1, 2, 3) for p in st.get(i)["corners"] for v in S.apply_h(st.source_matrix(st.get(i)), p))
     st.apply(cmd("set", id=3, enabled=False))
-    assert st.span_box()[1] > y0 - 1e-9, "the canvas follows the surfaces that are on"
+    assert st.span_box() == (x0, y0, cw, ch), "review L5: switching a face off must not move the picture on the others"
+    st.apply(cmd("set", id=2, src="full")); st.apply(cmd("set", id=3, src="full"))
+    assert st.span_box() != (x0, y0, cw, ch), "faces that leave span mode do leave the canvas"
 
 
 def test_full_and_rect_sources_map_corners_to_the_frame_or_the_sub_rect():
@@ -433,7 +435,8 @@ def test_unreadable_file_is_left_alone_and_saving_is_off(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", locked)
     st = S.SurfaceSet.load(f, legacy=tmp_path / "mapping.json")
-    assert st.status == "unreadable" and not st.can_save and st.surfaces[0]["corners"][0] == [0, 0]
+    assert st.status == "unreadable" and not st.can_save
+    assert st.surfaces[0]["corners"][0] == pytest.approx([128, 80]), "review L1: the old corner pin still applies"
     assert not st.save(f)
     monkeypatch.undo()
     assert f.read_text() == text and not list(tmp_path.glob("*.bad"))
@@ -493,3 +496,213 @@ def test_mapper_headless_is_read_only_and_click_helpers(tmp_path):
     assert m.target_id() == 2 and m.corners()[2] == pytest.approx([1100 / 1280, 1 - 100 / 800])
     none = S.Mapper(None, legacy=tmp_path / "nope.json")
     assert none.set.trivial() and not none.command(cmd("save"))
+
+
+# ------------------------------------------------------------------ Opus review regressions
+
+def test_zero_size_framebuffer_is_not_an_error():
+    """Review H1: a minimised projector window reports a 0 x 0 framebuffer."""
+    st = S.SurfaceSet()
+    st.apply(cmd("add"))
+    assert st.render_items(0, 0) == [] and st.render_items(1280, 0) == [] and st.render_items(0, 800) == []
+    assert len(st.render_items(1280, 800)) == 2
+
+
+def test_output_gate_skips_zero_size_and_never_gives_up_on_the_surface_path():
+    """Review H1: five bad frames used to switch multi-surface output off until a restart."""
+    g = S.OutputGate()
+    for _ in range(50):                                   # minimised for a while: nothing drawn, nothing counted
+        assert g.plan((0, 0), False, True, 1.0) == "skip"
+    assert g.fails == 0 and g.plan((1280, 800), False, True, 1.0) == "multi"
+    assert g.plan((1280, 800), True, True, 1.0) == "pin" and g.mode == "pin"            # one plain surface: old path
+    assert g.plan((1280, 800), False, False, 1.0) == "pin"                             # no renderer at all
+    t = 10.0
+    for k in range(S.OutputGate.MAX_FAILS):
+        assert g.plan((1280, 800), False, True, t) == "multi"
+        line = g.failed(t, "boom")
+        assert "boom" in line
+        t += 1 / 60
+    assert g.mode == "fallback" and "trying again" in line
+    assert g.plan((1280, 800), False, True, t) == "pin", "fallback = the old pin (black outside it)"
+    assert g.plan((1280, 800), False, True, t + 1.9) == "pin"
+    assert g.plan((0, 0), False, True, t + 1.95) == "skip" and g.mode == "fallback"
+    assert g.plan((1280, 800), False, True, t + 2.1) == "multi", "it tries the surfaces again every RETRY_S"
+    g.failed(t + 2.1, "still broken")
+    assert g.plan((1280, 800), False, True, t + 2.2) == "pin" and g.plan((1280, 800), False, True, t + 4.2) == "multi"
+    g.ok()
+    assert g.mode == "multi" and g.fails == 0 and g.error == ""
+    assert all(g.plan((1280, 800), False, True, t + 4.2 + k / 60) == "multi" for k in range(200))
+    for hours in (1, 5):                                  # hours later it is still retrying, not dead
+        for _ in range(S.OutputGate.MAX_FAILS):
+            g.failed(hours * 3600.0)
+        assert g.plan((1280, 800), False, True, hours * 3600.0 + 2.01) == "multi"
+
+
+def test_engine_output_pass_uses_the_gate_and_the_pin_shader_is_black_outside_the_pin():
+    """Review H1, engine side (source level: no GL while a show is live)."""
+    import re
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    a = src.index("# ---- output pass")
+    out = src[a:src.index("if recorder is not None", a)] if "if recorder is not None" in src[a:] else src[a:a + 3000]
+    assert "mapper.gate.plan(" in out and "mapper.gate.ok()" in out and "mapper.gate.failed(" in out
+    assert 'map_ref["fails"]' not in src, "the old give-up-forever counter is gone"
+    assert re.search(r'if plan == "pin":\s+target\.use\(\)', out), "nothing is drawn on a skipped (0 x 0) frame"
+    fs = src[src.index('OUT_FS = """'):src.index('METER_FS = """')]
+    assert "vec3 col = vec3(0);" in fs and "if (all(greaterThanEqual(c,vec2(0))) && all(lessThanEqual(c,vec2(1))))" in fs
+    assert "surfaces=mapper.state()" in src, "the panel is told when the engine is on the fallback"
+
+
+def failing_writes(monkeypatch, fail):
+    real = S._atomic_write
+    calls = []
+
+    def write(path, obj):
+        calls.append(str(path))
+        return False if fail[0] else real(path, obj)
+
+    monkeypatch.setattr(S, "_atomic_write", write)
+    return calls
+
+
+def test_failed_autosave_is_retried_with_backoff_and_flushed_at_exit(tmp_path, monkeypatch):
+    """Review M6: one failed write (AV / indexer holding the file) used to drop the edits for good."""
+    clock, fail = [100.0], [True]
+    monkeypatch.setattr(S.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(S.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    calls = failing_writes(monkeypatch, fail)
+    f = tmp_path / "surfaces.json"
+    m = S.Mapper(f)
+    m.command(cmd("corner", id=1, i=0, x=64, y=40))
+    clock[0] += 1.6
+    m.tick()
+    assert len(calls) == 1 and m.save_failed and m.state()["save_failed"] and m.set.dirty and not f.exists()
+    m.tick()
+    assert len(calls) == 1, "not hammered every frame"
+    waits = []
+    for _ in range(7):                                    # 1.5, 3, 6, 12, 24, 30, 30
+        t0 = clock[0]
+        while len(calls) == len(waits) + 1:
+            clock[0] += 0.1
+            m.tick()
+        waits.append(round(clock[0] - t0, 1))
+    assert waits[0] == pytest.approx(1.5, abs=0.11) and waits[1] == pytest.approx(3.0, abs=0.11)
+    assert waits == sorted(waits) and waits[-1] == pytest.approx(S.Mapper.RETRY_MAX_S, abs=0.11) == waits[-2]
+    n = len(calls)
+    assert m.flush(tries=3) is False and len(calls) == n + 3, "exit tries a few times, then says so"
+    fail[0] = False
+    assert m.flush() is True and not m.save_failed and not m.set.dirty
+    assert json.loads(f.read_text())["surfaces"][0]["corners"][0] == [64, 40]
+    n = len(calls)
+    clock[0] += 100
+    m.tick()
+    assert m.flush() is True and len(calls) == n, "nothing pending, nothing written"
+
+
+def test_flush_writes_dirty_edits_even_when_no_save_is_pending(tmp_path, monkeypatch):
+    """Review M6: flush() looked only at the pending timer, which a failed save had cleared."""
+    f = tmp_path / "surfaces.json"
+    m = S.Mapper(f)
+    m.set.apply(cmd("corner", id=1, i=0, x=10, y=10))     # an edit that never went through command()
+    assert m._edit_t is None and m.set.dirty
+    assert m.flush() and json.loads(f.read_text())["surfaces"][0]["corners"][0] == [10, 10]
+    ro = S.Mapper(f, writable=False)
+    ro.command(cmd("corner", id=1, i=0, x=20, y=20))
+    assert ro.flush() is True and json.loads(f.read_text())["surfaces"][0]["corners"][0] == [10, 10]
+
+
+def test_unreadable_surfaces_file_still_uses_the_old_corner_pin(tmp_path, monkeypatch):
+    """Review L1."""
+    (tmp_path / "surfaces.json").write_text("{}")
+    (tmp_path / "mapping.json").write_text("[[0.25,0.25],[0.75,0.25],[0.75,0.75],[0.25,0.75]]")
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("locked"))
+                        if self.name == "surfaces.json" else real(self, *a, **k))
+    m = S.Mapper(tmp_path / "surfaces.json", legacy=tmp_path / "mapping.json")
+    assert m.set.status == "unreadable" and not m.set.can_save
+    assert m.corners() == [pytest.approx(p) for p in ([0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75])]
+    m.command(cmd("corner", id=1, i=0, x=5, y=5))
+    assert m.flush() is True and not m.save_failed, "saving is off by design here: no retry storm"
+    monkeypatch.undo()
+    assert (tmp_path / "surfaces.json").read_text() == "{}" and json.loads((tmp_path / "mapping.json").read_text())[0] == [0.25, 0.25]
+
+
+def test_lossy_load_keeps_a_copy_of_the_original_before_the_first_save(tmp_path):
+    """Review L2: dropped surfaces used to vanish from disk at the next edit."""
+    st = three_faces()
+    raw = st.to_dict()
+    raw["surfaces"][1]["corners"] = [[0, 0], [1, 1]]
+    f = tmp_path / "surfaces.json"
+    f.write_text(json.dumps(raw))
+    original = f.read_text()
+    m = S.Mapper(f)
+    assert len(m.set.surfaces) == 2 and m.set.backup_first and not list(tmp_path.glob("*.bak")), "loading never writes"
+    assert m.command(cmd("save"))
+    baks = list(tmp_path.glob("surfaces.json.*.bak"))
+    assert len(baks) == 1 and baks[0].read_text() == original and len(json.loads(f.read_text())["surfaces"]) == 2
+    m.command(cmd("corner", id=1, i=0, x=210, y=310))
+    assert m.command(cmd("save")) and len(list(tmp_path.glob("*.bak"))) == 1, "one copy, not one per save"
+    clean = S.Mapper(f)
+    assert not clean.set.backup_first and clean.command(cmd("save")) is True and len(list(tmp_path.glob("*.bak"))) == 1
+
+
+def test_corrupt_file_that_cannot_be_moved_aside_is_copied_not_overwritten(tmp_path, monkeypatch):
+    """Review L2: if the quarantine rename fails, the first save must not destroy the only copy."""
+    f = tmp_path / "surfaces.json"
+    f.write_text("{corrupt")
+    monkeypatch.setattr(S, "_quarantine", lambda p: None)
+    m = S.Mapper(f)
+    assert m.set.status == "quarantined" and m.set.backup_first and f.read_text() == "{corrupt"
+    monkeypatch.setattr(S, "_backup", lambda p: False)
+    m.command(cmd("corner", id=1, i=0, x=8, y=8))
+    assert m.save() is False and f.read_text() == "{corrupt" and m.save_failed, "no copy, no overwrite (and it retries)"
+    monkeypatch.undo()
+    monkeypatch.setattr(S, "_quarantine", lambda p: None)
+    assert m.save() is True and not m.save_failed
+    baks = list(tmp_path.glob("surfaces.json.*.bak"))
+    assert len(baks) == 1 and baks[0].read_text() == "{corrupt" and json.loads(f.read_text())["version"] == 1
+
+
+def test_glow_shader_has_no_pow_of_a_negative_base():
+    """Review L3 (source level): pow(x, 2.0) with x < 0 is undefined in GLSL."""
+    src = (ROOT / "surface_render.py").read_text(encoding="utf-8")
+    fs = src[src.index('FS = """'):src.index('def _font')]
+    assert "pow(" not in fs and "exp(-kc * kc)" in fs and "exp(-k2 * k2)" in fs
+
+
+def test_name_tags_of_deleted_surfaces_are_released_and_the_font_is_cached():
+    """Review L6 (no GL: the renderer's bookkeeping with stand-in textures)."""
+    pytest.importorskip("moderngl")
+    import surface_render as SR
+
+    class Tex:
+        def __init__(self):
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    r = SR.SurfaceRenderer.__new__(SR.SurfaceRenderer)
+    a, b, c = Tex(), Tex(), Tex()
+    r._labels = {1: ("k", a, (10, 10)), 2: ("k", b, (10, 10)), 7: ("k", c, (10, 10))}
+    r._prune({1, 7})
+    assert sorted(r._labels) == [1, 7] and b.released and not a.released and not c.released
+    assert SR._font(34) is SR._font(34), "the TrueType file is opened once, not for every name tag"
+
+
+def test_a_full_layout_import_fits_in_one_request():
+    """Review L10: 24 surfaces with 8-point masks as one surf `replace`."""
+    import remote_control
+    st = S.SurfaceSet()
+    for _ in range(S.MAX_SURFACES - 1):
+        st.apply(cmd("add"))
+    for s in st.surfaces:
+        s["name"] = "W" * S.MAX_NAME
+        st.apply(cmd("mask", id=s["id"], pts=[[400.123456, 300.123456], [700.123456, 310.123456],
+                 [820.123456, 400.123456], [800.123456, 520.123456], [700.123456, 610.123456], [520.123456, 640.123456],
+                 [410.123456, 560.123456], [380.123456, 420.123456]]))
+    assert all(s["shape"] == "poly" and len(s["mask"]) == 8 for s in st.surfaces)
+    body = json.dumps([{"cmd": "surf", "op": "replace", "surfaces": st.to_dict()["surfaces"]}])
+    assert len(body.encode()) < remote_control.MAX_BODY
+    c = remote_control.validate_command(json.loads(body)[0])
+    fresh = S.SurfaceSet()
+    assert fresh.apply(c) and len(fresh.surfaces) == S.MAX_SURFACES

@@ -47,10 +47,16 @@ import control
 import governor
 import recorder
 import surfaces
+try:                                                 # crowd camera (pure python at import; the webcam is in camera_worker.py)
+    import camera_layer
+except Exception:
+    camera_layer = None
 
 HERE = Path(__file__).resolve().parent
-MAX_BODY = 16384       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB
+MAX_BODY = 32768       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB, and a full
+                       # 24-surface mapping layout with 8-point masks (surf "replace") about 17 kB
 MAX_BATCH = 64         # commands per POST
+LOCAL_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")   # clients on the laptop itself (see control.mark_local)
 MAX_UPLOAD = 25 << 20  # bytes per uploaded art image
 MAX_ART_SIDE = 4096
 MAX_ART_PIXELS = 40_000_000   # decoded size guard (decompression bombs, and RAM next to a running show)
@@ -115,6 +121,8 @@ def validate_command(c):
         return governor.validate_command(c)
     if cmd == "rec":                                 # show recorder (recorder.py): validated there
         return recorder.validate_cmd(c)
+    if cmd == "camera" and camera_layer is not None:   # crowd camera on / off / settings (camera_layer.py)
+        return camera_layer.validate_command(c)
     if cmd == "next_video":                          # passed through to the render engine
         return control.passthrough(cmd)
     if cmd == "surf":                                # multi-surface mapping: {"cmd": "surf", "op": ...} (surfaces.py)
@@ -601,6 +609,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, data, "image/jpeg")
             else:
                 self._send(204, b"", "image/jpeg")
+        elif path == "/camera-preview":              # CAMERA tab debug view: mask + skeleton only, never camera pixels
+            data = camera_layer.debug_jpeg() if camera_layer is not None else None
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
         elif path == "/preview":                     # panel monitor: latest small JPEG of the output, if any
             q = parse_qs(urlsplit(self.path).query)
             data = self.server.rc.preview_bytes(q["solo"][0].split(",") if "solo" in q else ())
@@ -717,6 +731,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not 1 <= len(cmds) <= MAX_BATCH:
                 raise ValueError(f"send 1..{MAX_BATCH} commands")
             cmds = [validate_command(c) for c in cmds]  # all-or-nothing
+            if self.client_address[0] in LOCAL_ADDRS:
+                cmds = [control.mark_local(c) for c in cmds]   # some switches are honoured from this laptop only
         except (ValueError, RecursionError) as ex:  # JSONDecodeError / UnicodeDecodeError are ValueErrors
             return self._send(400, {"ok": False, "error": str(ex)[:200]})
         try:
@@ -849,11 +865,13 @@ class RemoteControl:
         # `state` must be a dict the caller does not mutate afterwards (both callers build a fresh one each time).
         with self._lock:
             self._state_obj = state
+            self._state_seq = getattr(self, "_state_seq", 0) + 1
         self.state_published += 1
 
     def _state_bytes(self):
         with self._lock:
             obj, self._state_obj = self._state_obj, None
+            seq = getattr(self, "_state_seq", 0)
         if obj is not None:
             try:
                 data = json.dumps(obj, default=_jsonable, allow_nan=False).encode()
@@ -862,7 +880,8 @@ class RemoteControl:
             if data is not None:
                 self.state_encoded += 1
                 with self._lock:
-                    self._state = data
+                    if seq >= getattr(self, "_state_done", 0):       # two GETs at once: the older snapshot never wins
+                        self._state, self._state_done = data, seq
         with self._lock:
             return self._state
 
@@ -932,7 +951,9 @@ class RemoteControl:
             with self._lock:
                 if key in self._views:
                     self._views[key][1] = bytes(data)
-                elif not key:                            # the plain output is always kept (first GET gets a picture)
+                elif not key and time.monotonic() - self._preview_asked <= self.preview_linger:
+                    # the plain output is kept for the first GET, but a capture that lands after every watcher has
+                    # gone must not bring the view (and with it more captures) back to life
                     self._views[key] = [time.monotonic() - self.preview_linger * 0.5, bytes(data)]
 
 
@@ -983,6 +1004,7 @@ def _demo():
     ap.add_argument("--state-dir", default=None, help="where scenes / midi map go (default: a temp folder)")
     ap.add_argument("--art-dir", default=None, help="art library folder (default: a temp folder)")
     ap.add_argument("--midi", action="store_true", help="open MIDI ports too")
+    ap.add_argument("--fresh", action="store_true", help="start on a clean canvas (NEW CANVAS), panel in SIMPLE mode")
     args = ap.parse_args()
     state_dir = Path(args.state_dir or tempfile.mkdtemp(prefix="panel_demo_"))
     art_dir = Path(args.art_dir) if args.art_dir else state_dir / "art"
@@ -991,6 +1013,8 @@ def _demo():
     if not rc.toggle():
         raise SystemExit(1)
     ctl = control.Controller(state_dir, restore=True, midi=args.midi, ai=False, art_dir=art_dir)
+    if args.fresh:
+        ctl.new_canvas(fresh=True)
     st = dict(fold_i=3, mode=2, fb=True, fbAmt=0.88, grid=False, calib=False, next=False, palette=0)
     mapper = surfaces.Mapper(state_dir / "surfaces.json")      # multi-surface mapping, saved in the demo folder
     corners = mapper.corners()
@@ -1022,7 +1046,7 @@ def _demo():
             if now - pub > 0.12:
                 pub = now
                 rc.publish_state(dict(grid=st["grid"], calib=st["calib"], corners=mapper.corners(), res=[1280, 800], fps=60.0,
-                                      surfaces=mapper.set.state(), bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
+                                      surfaces=mapper.state(), bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
                                       ctl=ctl.state()))
             time.sleep(1 / 60)
     except KeyboardInterrupt:

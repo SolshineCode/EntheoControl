@@ -70,7 +70,7 @@ PARAMS = {
     "trails":     (0.0, 0.98, 0.85, "color", "Trails"),
 
     # ---- layers (opacity)
-    "l_kene":     (0.0, 1.0, 1.0, "layers", "Kene patterns"),  # crawling labyrinth / Shipibo-Huni Kuin-inspired line fields
+    "l_kene":     (0.0, 1.0, 1.0, "layers", "Folding Blocks"),  # crawling stepped labyrinth (renamed 2026-11-25: it is NOT real kene; internal name kept for MIDI/state compat)
     "l_beads":    (0.0, 1.0, 0.7, "layers", "Beadwork"),
     "l_lines":    (0.0, 1.0, 0.5, "layers", "Sacred lines"),
     "l_ai":       (0.0, 1.0, 0.5, "layers", "AI textures"),
@@ -196,6 +196,74 @@ PARAMS = {
     "serpent_hue2":  (0.0, 1.0, 0.85, "motion", "Serpent hue 2 (tail)"),
     "serpent_sat":   (0.0, 1.0, 1.0, "motion", "Serpent colour depth"),
     "serpent_bright": (0.0, 2.0, 1.0, "motion", "Serpent brightness"),
+
+    # ---- math stack (stack.StackPass), APPENDED 2026-11-25: master amount of the hand-built procedural layers.
+    #      The layers themselves are structured state (control command "stack", see HANDOFF.md), not params.
+    #      Default 1 with an EMPTY stack: nothing is drawn (the pass is not even run), so the default look is unchanged.
+    "l_stack":       (0.0, 1.0, 1.0, "layers", "Math stack"),
+
+    # ---- post-FX filter chain (filters.FilterPass), APPENDED 2026-11-25. Display only, between the scene composite
+    #      and the brightness limiter, before mapping. Six ordered slots (flt_slotN = 0 empty, else 1 + index into
+    #      FILTER_TYPES); each filter type has its own amount + 2-3 params, so a MIDI knob / mod keeps its meaning
+    #      whatever slot the filter sits in. A type in two slots runs once (first slot). Every amount defaults to 0:
+    #      with nothing on, the pass is skipped entirely (zero cost, pixel-identical show). Names: OPTIONS below.
+    "flt_slot1":       (0.0, 10.0, 0.0, "filters", "Slot 1"),
+    "flt_slot2":       (0.0, 10.0, 0.0, "filters", "Slot 2"),
+    "flt_slot3":       (0.0, 10.0, 0.0, "filters", "Slot 3"),
+    "flt_slot4":       (0.0, 10.0, 0.0, "filters", "Slot 4"),
+    "flt_slot5":       (0.0, 10.0, 0.0, "filters", "Slot 5"),
+    "flt_slot6":       (0.0, 10.0, 0.0, "filters", "Slot 6"),
+    "flt_dream":       (0.0, 1.0, 0.0, "filters", "Deep dream"),
+    "flt_dream_scale": (0.0, 1.0, 0.5, "filters", "Dream motif size"),
+    "flt_dream_swirl": (0.0, 1.0, 0.5, "filters", "Dream swirl"),       # feedback flow + persistence (recursion)
+    "flt_dream_motif": (0.0, 1.0, 0.3, "filters", "Dream motifs"),      # 0 eyes .. 0.5 fur / dog-slugs .. 1 scales / arches
+    "flt_oil":         (0.0, 1.0, 0.0, "filters", "Oil paint"),
+    "flt_oil_size":    (0.0, 1.0, 0.5, "filters", "Brush size"),
+    "flt_oil_relief":  (0.0, 1.0, 0.4, "filters", "Impasto"),
+    "flt_halftone":    (0.0, 1.0, 0.0, "filters", "Halftone"),
+    "flt_ht_size":     (0.0, 1.0, 0.35, "filters", "Dot size"),
+    "flt_ht_angle":    (0.0, 1.0, 0.125, "filters", "Screen angle"),
+    "flt_ht_style":    (0.0, 2.0, 0.0, "filters", "Screen"),              # rounded: OPTIONS["flt_ht_style"]
+    "flt_neon":        (0.0, 1.0, 0.0, "filters", "Neon edges"),
+    "flt_neon_glow":   (0.0, 1.0, 0.5, "filters", "Neon glow"),
+    "flt_neon_keep":   (0.0, 1.0, 0.25, "filters", "Neon keeps picture"),
+    "flt_neon_color":  (0.0, 1.0, 0.0, "filters", "Neon colour"),        # 0 the picture's own hue .. 1 show palette
+    "flt_chroma":      (0.0, 1.0, 0.0, "filters", "Prism split"),
+    "flt_chroma_mode": (0.0, 2.0, 0.0, "filters", "Prism mode"),         # rounded: OPTIONS["flt_chroma_mode"]
+    "flt_chroma_angle": (0.0, 1.0, 0.0, "filters", "Prism angle"),
+    "flt_posterize":   (0.0, 1.0, 0.0, "filters", "Posterize"),
+    "flt_post_levels": (2.0, 12.0, 4.0, "filters", "Levels"),
+    "flt_post_palette": (0.0, 1.0, 0.0, "filters", "To show palette"),
+    "flt_sort":        (0.0, 1.0, 0.0, "filters", "Pixel sort"),
+    "flt_sort_thresh": (0.0, 1.0, 0.35, "filters", "Sort threshold"),
+    "flt_sort_len":    (0.0, 1.0, 0.5, "filters", "Sort length"),
+    "flt_sort_angle":  (0.0, 1.0, 0.25, "filters", "Sort angle"),        # 0..1 -> 0..180 degrees (0.25 = down)
+    "flt_glitch":      (0.0, 1.0, 0.0, "filters", "Glitch"),
+    "flt_glitch_rate": (0.0, 1.0, 0.3, "filters", "Glitch rate"),        # 0.2 .. 2.5 events / s (photosensitive cap)
+    "flt_glitch_block": (0.0, 1.0, 0.4, "filters", "Glitch blocks"),
+    "flt_bloom":       (0.0, 1.0, 0.0, "filters", "Bloom"),
+    "flt_bloom_thresh": (0.0, 1.0, 0.55, "filters", "Bloom threshold"),
+    "flt_bloom_radius": (0.0, 1.0, 0.5, "filters", "Bloom radius"),
+    "flt_kaleido":     (0.0, 1.0, 0.0, "filters", "Mirror / kaleido"),
+    "flt_kal_mode":    (0.0, 2.0, 2.0, "filters", "Mirror mode"),        # rounded: OPTIONS["flt_kal_mode"]
+    "flt_kal_folds":   (2.0, 16.0, 6.0, "filters", "Kaleido folds"),     # rounded in the shader
+    "flt_kal_spin":    (-1.0, 1.0, 0.1, "filters", "Kaleido spin"),
+
+    # ---- crowd camera (camera_layer.CameraLayer + camera_worker.py), APPENDED 2026-11-25: webcam silhouettes, motion
+    #      and dancer pose woven into the visuals. The CAMERA itself is switched on in the panel (command "camera");
+    #      while it is off these do nothing and cost nothing. Mode names: OPTIONS["crowd_mode"] below.
+    "l_camera":      (0.0, 1.0, 0.0, "layers", "Crowd camera"),
+    "crowd_mode":    (0.0, 5.0, 1.0, "camera", "Integration"),     # rounded: 0 bodies reveal the visuals, 1 glowing outline,
+                                                                   #  2 patterns flow inside bodies, 3 knockout (bodies black),
+                                                                   #  4 motion trails (into the echo), 5 crowd pushes the pattern
+    "crowd_glow":    (0.0, 1.0, 0.6, "camera", "Silhouette glow"),
+    "crowd_hue":     (0.0, 1.0, 0.0, "camera", "Silhouette hue"),  # hue shift of the light inside / around bodies
+    "crowd_soft":    (0.0, 1.0, 0.4, "camera", "Smoothing"),       # temporal smoothing of the silhouettes (slower = calmer)
+    "crowd_push":    (0.0, 1.0, 0.0, "camera", "Flow push"),       # crowd movement pushes the pattern (works in every mode)
+    "crowd_swarm":   (0.0, 1.0, 0.0, "camera", "Hands pull swarm"),
+    "crowd_beings":  (-1.0, 1.0, 0.0, "camera", "Beings follow hands"),   # + follow, - flee
+    "crowd_ripples": (0.0, 1.0, 0.0, "camera", "Hand ripples"),    # fast hand moves spawn ripples (max 2 per second)
+    "crowd_serpent": (0.0, 1.0, 0.0, "camera", "Serpent on arm"),  # serpent 1 rides the dancer's arm, head at the hand
 }
 
 # Option names for selectable (rounded) params that live here; index = rounded value - min. The panel shows them as a
@@ -210,12 +278,16 @@ OPTIONS = {
     "text_move": ["Static", "Drift", "Orbit ring", "Marquee", "Letter wave", "Tunnel spiral", "Beat bounce"],
     "text_mode": ["Overlay", "Woven", "Stencil mask", "Knockout", "Displace", "Rides the scene", "Kaleidoscope",
                   "Echo trails"],
+    "crowd_mode": ["Bodies reveal", "Glow outline", "Patterns inside", "Knockout", "Motion trails", "Flow push"],
 }
 
 TRIGGERS = ["flash", "strobe", "invert", "freeze", "blackout", "punch"]   # momentary buttons in the panel / MIDI
 EVENTS = ["ripple"]                                                        # ("ripple", x, y)
 MOD_SOURCES = ["none", "bass", "mid", "high", "lfo_sine", "lfo_tri", "lfo_saw", "lfo_square", "random",
-               "seq", "seq_gate"]     # 16-step sequencer (control.Controller.seq): step value 0..1 / gate envelope
+               "seq", "seq_gate",     # 16-step sequencer (control.Controller.seq): step value 0..1 / gate envelope
+               # crowd camera (camera_layer.Signals, APPENDED): 0..1 except hip_sway -1..1; all 0 while the camera is off
+               "crowd_motion", "crowd_left", "crowd_centre", "crowd_right", "crowd_presence",
+               "hand_height", "hands_spread", "hip_sway", "hand_speed"]
 
 
 def defaults():
@@ -302,7 +374,7 @@ NEUTRAL = {     # the value at which the param does nothing
     "saturation": 1.0, "chase": 0.0,
     # layers: opacity 0
     "l_kene": 0.0, "l_beads": 0.0, "l_lines": 0.0, "l_ai": 0.0, "l_echo": 0.0, "l_video": 0.0, "l_fractal": 0.0,
-    "l_art": 0.0, "l_land": 0.0, "l_swarm": 0.0, "l_beings": 0.0, "l_text": 0.0,
+    "l_art": 0.0, "l_land": 0.0, "l_swarm": 0.0, "l_beings": 0.0, "l_text": 0.0, "l_stack": 0.0,
     # art fly-through + distortion
     "cam_yaw": 0.0, "cam_pitch": 0.0, "cam_roll": 0.0, "cam_dolly": 0.0, "cam_drift": 0.0, "art_melt": 0.0,
     "art_liquify": 0.0, "art_slices": 0.0, "art_breathe": 0.0, "art_fold": 0.0, "art_droste": 0.0, "art_smear": 0.0,
@@ -331,10 +403,27 @@ BYPASS_KEEP = {  # bypass leaves these alone: "off" has no meaning (selectors, c
     "text_weave", "text_dissolve",
 }
 BYPASS_KEEP = {k for k in BYPASS_KEEP if k in PARAMS}
+# post-FX filter chain (filters.py): slot value i (1..10) = FILTER_TYPES[i-1]; the type's amount param is flt_<type>.
+# Bypass: the amounts go to 0 (the FILTERS tab's power button, and ALL FX), everything else is kept.
+FILTER_TYPES = ["dream", "oil", "halftone", "neon", "chroma", "posterize", "sort", "glitch", "bloom", "kaleido"]
+FILTER_NAMES = ["Deep dream", "Oil paint", "Halftone", "Neon edges", "Prism split", "Posterize", "Pixel sort", "Glitch",
+                "Bloom", "Mirror / kaleido"]
+OPTIONS.update({f"flt_slot{i}": ["Empty"] + FILTER_NAMES for i in range(1, 7)})
+OPTIONS.update({"flt_ht_style": ["Colour dots", "RGB screen", "Line engraving"],
+                "flt_chroma_mode": ["Radial", "Linear", "Prism ghosts"],
+                "flt_kal_mode": ["Mirror", "Quad mirror", "Kaleidoscope"]})
+NEUTRAL.update({f"flt_{t}": 0.0 for t in FILTER_TYPES if f"flt_{t}" in PARAMS})
+BYPASS_KEEP |= {n for n, v in PARAMS.items() if v[3] == "filters" and n not in NEUTRAL}
 BYPASS_GROUP_KEY = {"space": "shape"}            # the SHAPE tab holds two groups: one switch for both
 BYPASS_LINKS = {                                 # switching a tab off also switches its layer(s) off
     "fractal": ["l_fractal"], "art": ["l_art"], "land": ["l_land", "l_swarm"], "beings": ["l_beings"], "text": ["l_text"],
 }
+# crowd camera (camera_layer.py): amounts go to 0, the look settings are kept; the CAMERA tab's switch also drops
+# l_camera. (Bypass never switches the webcam itself off: that is the CAMERA ON / OFF switch.)
+NEUTRAL.update({n: 0.0 for n in ("l_camera", "crowd_push", "crowd_swarm", "crowd_beings", "crowd_ripples",
+                                 "crowd_serpent") if n in PARAMS})
+BYPASS_KEEP |= {n for n in ("crowd_mode", "crowd_glow", "crowd_hue", "crowd_soft") if n in PARAMS}
+BYPASS_LINKS["camera"] = ["l_camera"]
 
 
 def bypass_cover():

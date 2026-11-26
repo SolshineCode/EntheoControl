@@ -69,6 +69,10 @@ try:                                                 # text layer: the words / p
     import text_layer as _textlayer                  # (the pure-python part of text_layer.py; no GL is imported)
 except ImportError:
     _textlayer = None
+try:                                                 # math stack: the layer model + its commands (pure python part)
+    import stack as _stack
+except ImportError:
+    _stack = None
 try:                                                 # ONLINE plugin hooks (pure python; the plugin itself is only
     from plugins.online import protocol as _online   # imported when the performer switches ONLINE on)
 except Exception:
@@ -152,6 +156,8 @@ def valid_target(t):
             return p[1] in QUANT
         if p[0] == "bypass" and len(p) == 2:
             return p[1] in BYPASS_COVER
+        if p[0] == "stack" and len(p) == 3:          # stack:<layer id>:<field> (a knob on a field, a pad on mute / solo)
+            return _stack is not None and _stack.parse_target(t) is not None
         if p[0] == "ripple" and len(p) == 3:
             return 0 <= float(p[1]) <= 1 and 0 <= float(p[2]) <= 1
     except ValueError:
@@ -171,6 +177,12 @@ def _v_inc(c):
 
 
 def _v_mod(c):
+    name = c.get("name")
+    if isinstance(name, str) and name.startswith("stack:"):      # a math-stack field: stack:<layer id>:<field>
+        t = _stack.parse_target(name) if _stack is not None else None
+        if t is None or t[1] not in _stack.NUM:
+            raise ValueError("unknown stack field")
+        return _stack.validate(dict(c, op="mod", id=t[0], f=t[1]))
     return {"cmd": "mod", "name": _name(c, CONT), "slot": _int(c, "slot", 0, 1),
             "src": _name(c, MOD_SOURCES, "src"), "amt": _num(c, "amt", -1.0, 1.0, 0.0),
             "rate": _num(c, "rate", 1 / 64, 64.0, 1.0), "phase": _num(c, "phase", 0.0, 1.0, 0.0)}
@@ -304,6 +316,13 @@ BYPASS_COVER = _params.bypass_cover()
 BYPASS_FADE, BYPASS_FADE_MAX = 0.3, 5.0          # s; 0 = instant
 
 
+# NEW CANVAS: everything the engine draws by itself is bypassed (every layer but the math stack, every effect);
+# nothing stored is edited, so RESTORE PREVIOUS brings the look back exactly.
+CANVAS_KEYS = tuple(k for k in ["fx"] + [n for n in _params.NEUTRAL if n.startswith("l_") and n != "l_stack"]
+                    if k in BYPASS_COVER)
+CANVAS_FADE = 1.0                                # s: the crossfade into / out of a clean canvas
+
+
 def _v_bypass(c):
     """{"cmd": "bypass", "key": layer / tab / "fx", "on": bool}; without "on" it toggles."""
     out = {"cmd": "bypass", "key": _name(c, BYPASS_COVER, "key")}
@@ -356,11 +375,19 @@ _VALIDATORS = {
     "bypass": lambda c: _v_bypass(c),
     "bypass_fade": lambda c: {"cmd": "bypass_fade", "v": _num(c, "v", 0.0, BYPASS_FADE_MAX)},
 }
+if _stack is not None:                               # {"cmd": "stack", "op": ...}: stack.py; NEW CANVAS / RESTORE PREVIOUS
+    _VALIDATORS["stack"] = _stack.validate
+    _VALIDATORS["canvas"] = lambda c: {"cmd": "canvas", "op": _name(c, ("new", "restore"), "op")}
 if _textlayer is not None:                           # text, text_phrases, text_add, text_del, text_go, text_cycle
     _VALIDATORS.update(_textlayer.VALIDATORS)
 if _online is not None:                              # {"cmd": "online", "op": ...}: plugins/online/protocol.py
     _VALIDATORS["online"] = _online.validate
 CONTROL_CMDS = frozenset(_VALIDATORS)
+
+
+def mark_local(c):
+    """remote_control: this validated command came from the laptop itself (127.0.0.1). Only the ONLINE plugin cares."""
+    return _online.mark_local(c) if _online is not None else c
 
 
 def validate(c):
@@ -407,8 +434,11 @@ def _clean_scene(raw):
     if not isinstance(raw, dict) or not isinstance(raw.get("base"), dict):
         return None
     name = raw.get("name")
-    return dict(name=name[:24] if isinstance(name, str) else "", base=_clean_base(raw["base"]),
-                mods=_clean_mods(raw.get("mods")))
+    out = dict(name=name[:24] if isinstance(name, str) else "", base=_clean_base(raw["base"]),
+               mods=_clean_mods(raw.get("mods")))
+    if _stack is not None and isinstance(raw.get("stack"), dict):      # scenes saved before the math stack have none:
+        out["stack"] = _stack.clean_stack(raw["stack"])               # recalling one leaves the stack alone
+    return out
 
 
 def _copy_mods(mods):
@@ -447,7 +477,8 @@ def meta():
         triggers=list(TRIGGERS), sources=list(MOD_SOURCES), n_scenes=N_SCENES, quantize=list(QUANT),
         clock_sources=list(CLOCK_SOURCES), cue_cc={str(k): v for k, v in CUE_CC.items()},
         bypass=dict(keys=list(BYPASS_COVER), cover={k: list(v) for k, v in BYPASS_COVER.items()},
-                    group_key=dict(_params.BYPASS_GROUP_KEY)))
+                    group_key=dict(_params.BYPASS_GROUP_KEY)),
+        stack=_stack.meta() if _stack is not None else None, canvas_keys=list(CANVAS_KEYS))
 
 
 # ------------------------------------------------------------------ factory scenes
@@ -665,6 +696,11 @@ class Controller:
         self.bypass = set()                            # bypassed keys (BYPASS_COVER): outputs pulled to params.NEUTRAL
         self.bypass_fade = BYPASS_FADE                 # s to cross-fade a bypass in / out
         self._byp = {}                                 # key -> level 0..1 (the fade)
+        self._byp_once = None                          # s: fade time for the transition in progress (NEW CANVAS)
+        self.stack = _stack.StackState() if _stack is not None else None      # math stack: hand-built layers
+        self._stack_morph = False
+        self.canvas_prev = None                        # the look before NEW CANVAS (base, mods, bypass, stack)
+        self.fresh = 0                                 # start time of a --fresh launch (the panel opens in SIMPLE)
 
         # clock
         self.bpm = min(BPM_MAX, max(BPM_MIN, float(bpm)))
@@ -708,6 +744,7 @@ class Controller:
         self.learn = None
         self.midi_last = ""
         self._shift = False
+        self._cc_hi = {}                               # CC binding -> was it >= 64 last time (rising-edge presses)
         self._out = []                                 # passthrough commands raised by MIDI (e.g. next_video)
         self._led_t = 0.0
         self.events = []
@@ -724,6 +761,7 @@ class Controller:
         self.ai = AIClient([self.dir / ".remote_token", here / ".remote_token"], url=ai_url, start=bool(ai))
 
         self.ext = {}                                  # settings owned by other modules (governor.py: ext.governor.mode)
+        self.signals = {}                              # external mod sources set each frame (camera_layer: crowd_*, hand_*)
         self.edits, self.panics = {}, 0                # per-param count of direct set() moves; PANIC count
         self.restored = self._restore() if restore else False
         self._save_t = self.now()
@@ -820,6 +858,8 @@ class Controller:
         self.learn = None
         self.auto["on"] = False                        # nothing may move the look away from the safe scene
         self._auto_next = None
+        self.bypass.discard("layers")                  # the one bypass that is a blackout: PANIC must recover from it
+        self._byp.pop("layers", None)                  # (single layers / tabs the performer killed stay killed)
         if _online is not None:
             _online.on_panic(self)                     # drops the assistant's queue, its autopilot -> suggest
         safe = self.scenes[self.safe] if 0 <= self.safe < N_SCENES else None
@@ -872,6 +912,9 @@ class Controller:
                 return math.exp(-6.0 * f) if self.seq["gates"][i] else 0.0
             a, b = self.seq["vals"][i - 1], self.seq["vals"][i]
             return b if f >= 0.15 else a + (b - a) * (f / 0.15)        # short glide into each step: no clicks
+        sig = self.signals.get(src)                    # crowd camera (camera_layer.Signals): already 0..1 / -1..1 + slewed
+        if sig is not None:
+            return sig
         ph = beat / m["rate"] + m["phase"]
         cyc = math.floor(ph)
         f = ph - cyc
@@ -910,11 +953,17 @@ class Controller:
             return
         if on is None:
             on = key not in self.bypass
+        if on != (key in self.bypass):                 # persist soon (0.5 s), not at the next 5 s autosave: a crash
+            self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)   # must not bring a killed layer back
         (self.bypass.add if on else self.bypass.discard)(key)
 
     def _step_bypass(self, dt):
         """Advance the fades; returns {param: weight 0..1 towards neutral}."""
-        step = 1.0 if self.bypass_fade <= 0 else dt / self.bypass_fade
+        fade = self.bypass_fade if self._byp_once is None else self._byp_once
+        step = 1.0 if fade <= 0 else dt / fade
+        if self._byp_once is not None and all(self._byp.get(k, 0.0) >= 1.0 for k in self.bypass) and not (
+                set(self._byp) - self.bypass):
+            self._byp_once = None                      # the canvas crossfade has landed: back to the normal fade time
         for key in set(self._byp) | self.bypass:
             lvl = self._byp.get(key, 0.0)
             lvl = min(1.0, lvl + step) if key in self.bypass else max(0.0, lvl - step)
@@ -928,6 +977,55 @@ class Controller:
                 if lvl > w.get(n, 0.0):
                     w[n] = lvl
         return w
+
+    # ---------------------------------------------------------------- new canvas / restore previous
+
+    def new_canvas(self, fresh=False):
+        """Crossfade to a clean black canvas with ONE moving stripe layer in the math stack. Every engine layer and
+        effect is bypassed (CANVAS_KEYS), nothing stored is edited, and the look before is kept for
+        restore_canvas(). Pressed again while already on a canvas it starts the stack over and keeps the ORIGINAL
+        way back. fresh=True (launch option): already there on the first frame, and the panel opens in SIMPLE."""
+        if self.stack is None:
+            return
+        if self.canvas_prev is None:
+            self.canvas_prev = dict(base={n: self.base[n] for n in CONT}, mods=_copy_mods(self.mods),
+                                    bypass=sorted(self.bypass), stack=self.stack.to_json(), auto=bool(self.auto["on"]))
+        self.pending = self._morph = None
+        self._stack_morph = False
+        self.auto["on"] = False                        # a scene step must not paint over the canvas
+        self._auto_next = None
+        self.bypass |= set(CANVAS_KEYS)
+        self.bypass -= {k for k, cover in BYPASS_COVER.items() if "l_stack" in cover}
+        if self.base["l_stack"] <= 0.0:
+            self.base["l_stack"] = PARAMS["l_stack"][2]
+        self.mods.pop("l_stack", None)
+        self.stack.morph_cancel()
+        self.stack.load(dict(layers=[]), fade=not fresh)
+        lay = self.stack.add(_stack.CANVAS_START["gen"], _stack.CANVAS_START)
+        if fresh:
+            self.fresh = int(time.time())
+            self._byp = {k: 1.0 for k in self.bypass}
+            self._sm["l_stack"] = self.base["l_stack"]
+            self.stack._phase(lay["id"])["op"] = None
+        else:
+            self._byp_once = CANVAS_FADE
+
+    def restore_canvas(self):
+        """RESTORE PREVIOUS: faders, mods, bypass switches and the stack exactly as they were before NEW CANVAS."""
+        prev, self.canvas_prev = self.canvas_prev, None
+        if prev is None or self.stack is None:
+            return
+        self.pending = self._morph = None
+        self._stack_morph = False
+        self.base.update(prev["base"])
+        self.mods = _copy_mods(prev["mods"])
+        self.bypass = {k for k in prev["bypass"] if k in BYPASS_COVER}
+        self.stack.morph_cancel()
+        self.stack.load(prev["stack"])
+        if prev.get("auto"):
+            self.auto["on"], self._auto_next = True, None
+        self.cur = -1
+        self._byp_once = CANVAS_FADE
 
     # ---------------------------------------------------------------- scenes
 
@@ -952,6 +1050,10 @@ class Controller:
         for n in CONT:
             va, vb = sa["base"][n], sb["base"][n]
             self.base[n] = (vb if x >= 0.5 else va) if n in DISCRETE else va + (vb - va) * x
+        if self.stack is not None and "stack" in sa and "stack" in sb:
+            self._stack_morph = False
+            self.stack.morph_cancel()
+            self.stack.load(_stack.blend(sa["stack"], sb["stack"], x))
         side = "b" if x >= 0.5 else "a"
         if side != self._xside:
             self._xside = side
@@ -962,6 +1064,8 @@ class Controller:
         if not 0 <= i < N_SCENES:
             return
         snap = dict(name="", base={n: self.base[n] for n in CONT}, mods=_copy_mods(self.mods))
+        if self.stack is not None:
+            snap["stack"] = self.stack.to_json()
         if not self._scenes_ok:
             self._load_scenes()                        # the file was unreadable earlier: try again before writing
         if self.scenes[i]:
@@ -1017,6 +1121,15 @@ class Controller:
             old = [(self.mods, 1.0)]
         old = [(m, w) for m, w in old if w > 0.01 and m][:4]
         self.mods = _copy_mods(sc["mods"])
+        if self.stack is not None:
+            self._stack_morph = False
+            self.stack.morph_cancel()
+            if "stack" in sc:                          # numeric fields glide with the morph, stepped ones snap midway
+                if bars <= 0:
+                    self.stack.load(sc["stack"])
+                else:
+                    self.stack.morph_start(sc["stack"])
+                    self._stack_morph = True
         if bars <= 0:
             self.base.update(to)
             self._morph = None
@@ -1033,6 +1146,9 @@ class Controller:
             mo["start"], t = self.beat, 0.0
         t = min(1.0, t)
         mo["t"] = t
+        if self._stack_morph:
+            self.stack.morph_to(t)
+            self._stack_morph = t < 1.0
         for n in mo["names"]:
             a, b = mo["src"][n], mo["to"][n]
             if n in DISCRETE:
@@ -1089,7 +1205,8 @@ class Controller:
                     safe=self.safe, cue_ch=self.cue_ch, autopilot=dict(self.auto),
                     seq=dict(vals=list(self.seq["vals"]), gates=list(self.seq["gates"])),
                     text=self.text.to_json() if self.text is not None else None,
-                    bypass=sorted(self.bypass), bypass_fade=self.bypass_fade, ext=dict(self.ext))
+                    bypass=sorted(self.bypass), bypass_fade=self.bypass_fade, ext=dict(self.ext),
+                    stack=self.stack.to_json() if self.stack is not None else None, canvas=self.canvas_prev)
 
     def _autosave(self):
         if not self.autosave:
@@ -1131,6 +1248,14 @@ class Controller:
             if isinstance(s.get("bypass"), list):      # come back already bypassed: no fade-out on the projector
                 self.bypass = {k for k in s["bypass"] if isinstance(k, str) and k in BYPASS_COVER}
                 self._byp = {k: 1.0 for k in self.bypass}
+            if self.stack is not None and isinstance(s.get("stack"), dict):
+                self.stack.restore(s["stack"])         # comes back as it was: no fade-in on the projector
+            cv = s.get("canvas")
+            if self.stack is not None and isinstance(cv, dict) and isinstance(cv.get("base"), dict):
+                self.canvas_prev = dict(base=_clean_base(cv["base"]), mods=_clean_mods(cv.get("mods")),
+                                        bypass=sorted(k for k in (cv.get("bypass") if isinstance(cv.get("bypass"), list) else [])
+                                                      if isinstance(k, str) and k in BYPASS_COVER),
+                                        stack=_stack.clean_stack(cv.get("stack")), auto=bool(cv.get("auto")))
             f = s.get("bypass_fade")
             if isinstance(f, (int, float)) and not isinstance(f, bool) and math.isfinite(f):
                 self.bypass_fade = min(BYPASS_FADE_MAX, max(0.0, float(f)))
@@ -1175,6 +1300,11 @@ class Controller:
             self.nudge(c["name"], c["d"])
         elif cmd == "mod":
             self.set_mod(c["name"], c["slot"], c["src"], c["amt"], c["rate"], c["phase"])
+        elif cmd == "stack":                           # math stack edit (also what a "mod" on stack:<id>:<field> becomes)
+            self._stack_morph = False
+            self.stack.do(c)
+        elif cmd == "canvas":
+            (self.new_canvas if c["op"] == "new" else self.restore_canvas)()
         elif cmd == "trigger":
             self.trigger(c["name"], c["on"])
         elif cmd == "latch":
@@ -1228,6 +1358,9 @@ class Controller:
         elif cmd == "init":
             self.base.update({n: PARAMS[n][2] for n in CONT})
             self.mods, self._morph, self.cur = {}, None, -1
+            if self.stack is not None:
+                self._stack_morph = False
+                self.stack.load(dict(layers=[]))
         elif cmd == "cue_ch":
             self.cue_ch = c["ch"]
         elif cmd == "midi_learn":
@@ -1336,10 +1469,19 @@ class Controller:
                 if b <= num < b + N_SCENES:
                     self.scene_recall(num - b)
 
+    def _cc_rise(self, b, val):
+        """Shared CC press helper: True only when this binding's CC goes from < 64 to >= 64. A fader or knob swept
+        through the top half (or a pad re-sending 127) fires a toggle once, not on every message."""
+        key = (b.get("type"), b.get("ch"), b.get("num"), b.get("port"), b.get("target"))
+        hi, was = val >= 64, self._cc_hi.get(key, False)
+        self._cc_hi[key] = hi
+        return hi and not was
+
     def _act(self, b, kind, val):
         target = b["target"]
         p = target.split(":")
         press = kind == "note_on" or (kind == "cc" and val >= 64)
+        edge = self._cc_rise(b, val) if kind == "cc" else press   # one-shot actions: a CC fires once per crossing of 64
         if p[0] == "param":
             name = p[1]
             lo, hi = PARAMS[name][0], PARAMS[name][1]
@@ -1359,8 +1501,17 @@ class Controller:
             if kind == "cc":
                 self.set_bpm(60.0 + 120.0 * val / 127.0)
         elif p[0] == "bypass":
-            if press:                                  # a pad kills / restores a layer or a tab
+            if edge:                                   # a pad kills / restores a layer or a tab
                 self.set_bypass(p[1])
+        elif p[0] == "stack":                          # a knob on a math-stack field, a pad on mute / solo
+            t = _stack.parse_target(target) if self.stack is not None else None
+            if t and (kind == "cc" or kind == "note_on"):
+                self._stack_morph = False
+                if kind == "cc" and t[1] not in ("mute", "solo"):
+                    rel = (val if val < 64 else val - 128) if b.get("mode") == "rel" else None
+                    self.stack.midi(t[0], t[1], val / 127.0, rel=rel)
+                else:
+                    self.stack.midi(t[0], t[1], 1.0 if press else 0.0, press=edge)
         elif target == "xfade":
             if kind == "cc":                           # soft takeover: a physical fader that is somewhere else does
                 v, last, cur = val / 127.0, self._xf_cc, self.xfade["x"]     # nothing until it reaches the position
@@ -1368,8 +1519,8 @@ class Controller:
                 if self._xf_live or abs(v - cur) <= 0.05 or (last is not None and (last - cur) * (v - cur) <= 0):
                     self._xf_live = True
                     self.set_xfade(x=v)
-        elif not press:
-            return                                     # everything below fires on press only
+        elif not edge:
+            return                                     # everything below fires on press only (CC: rising edge)
         elif p[0] == "scene":
             (self.scene_save if self._shift else self.scene_recall)(int(p[1]))
         elif p[0] == "palette":
@@ -1547,6 +1698,13 @@ class Controller:
                 v = 1.0 if self.held[n] else self.base[n]
             vals[n] = min(1.0, max(0.0, v))
         self.values = {n: vals[n] for n in PARAMS}     # PARAMS order
+        if self.stack is not None:                     # math stack: phases (float64) + modulated fields -> stack.frame
+            try:
+                fz = self.values["freeze"]
+                self.stack.step(dt * (1.0 - fz), dict(bpm=self.bpm, beat=beat), hold=fz >= 0.5,
+                                source=lambda m, name, slot: self._source(m, name, slot, beat))
+            except Exception:
+                pass
 
         if now - self._save_t >= AUTOSAVE_S:
             self._save_t = now
@@ -1616,5 +1774,7 @@ class Controller:
             xfade=dict(self.xfade),
             text=self.text.state() if self.text is not None else None,
             bypass=sorted(self.bypass), bypass_fade=self.bypass_fade,
+            stack=self.stack.state() if self.stack is not None else None,
+            canvas=dict(active=self.canvas_prev is not None, fresh=self.fresh),
             online=_online.state(self) if _online is not None else dict(on=False, missing=True),
         )
