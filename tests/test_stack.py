@@ -44,7 +44,8 @@ def run(c, seconds, dt=1 / 60, bands=(0.6, 0.4, 0.2)):
 
 
 def do(c, **cmd):
-    assert c.apply([cmd]) == []
+    rest = [r for r in c.apply([cmd]) if r.get("cmd") != "snapshot"]     # scene saves ask the engine for a thumbnail
+    assert rest == []
 
 
 def sdo(st, **cmd):
@@ -438,9 +439,10 @@ def test_scenes_store_the_stack_and_morph_it(tmp_path):
     run(c, 0.5)                                                                       # 1 beat in: t = 0.25
     L = {x["id"]: x for x in c.stack.layers}
     assert L[1]["freq"] == pytest.approx(10.0, abs=0.3) and L[1]["wave"] == 3         # numeric glides, stepped waits
-    assert L[2]["opacity"] == pytest.approx(0.25, abs=0.05) and L[3]["opacity"] == pytest.approx(0.75, abs=0.05)
+    assert set(L) == {1, 3} and L[3]["opacity"] == pytest.approx(0.5, abs=0.06)       # 3 and 2 share a slot: 3 dips out
     run(c, 1.0)                                                                       # t = 0.75: stepped has snapped
     assert c.stack.find(1)["wave"] == 1
+    assert c.stack.find(3) is None and c.stack.find(2)["opacity"] == pytest.approx(0.5, abs=0.06)   # ... 2 comes up
     run(c, 1.0)
     assert c.stack.to_json()["layers"] == saved[9]["stack"]["layers"]
     do(c, cmd="scene_recall", i=10, now=True)
@@ -487,6 +489,177 @@ def test_panic_and_init(tmp_path):
     do(c, cmd="stack", op="add", gen=0)
     do(c, cmd="init")
     assert c.stack.layers == []
+
+
+@pytest.mark.parametrize("safe_scene", [True, False])
+def test_panic_switches_the_stack_off_and_leaves_the_canvas(tmp_path, safe_scene):
+    c = make(tmp_path)
+    if not safe_scene:
+        c.scenes = [None] * control.N_SCENES
+    do(c, cmd="bypass", key="l_lines", on=True)                        # killed by the performer before the canvas
+    do(c, cmd="canvas", op="new")
+    do(c, cmd="stack", op="add", gen=1)
+    run(c, 2.0)
+    assert len(c.stack.frame) == 2
+    do(c, cmd="panic")
+    v = run(c, 1 / 60)
+    assert c.stack.layers == [] and c.stack.frame == []                # gone on the very next frame, no fade
+    assert not c.state()["canvas"]["active"] and c.bypass == {"l_lines"}
+    assert v["l_kene"] == 1.0 and v["l_lines"] == 0.0 and v["master"] == 1.0      # the safe look is on the wall, not black
+
+
+def test_panic_cancels_a_running_stack_morph(tmp_path):
+    c = make(tmp_path)
+    do(c, cmd="stack", op="add", gen=0)
+    do(c, cmd="scene_save", i=9)
+    do(c, cmd="stack", op="set", id=1, f="freq", v=20)
+    c.morph_bars, c.bpm = 4.0, 120.0
+    do(c, cmd="scene_recall", i=9, now=True)
+    run(c, 0.5)
+    c.scenes[c.safe] = None                                            # no safe scene: the old code froze the morph here
+    do(c, cmd="panic")
+    run(c, 1.0)
+    assert c.stack.layers == [] and c._stack_morph is False and c.stack._morph is None
+
+
+LOOK_FIELDS = [f for f in stack.NUM if f not in stack.RATE_FIELDS]
+
+
+@pytest.mark.parametrize("field", LOOK_FIELDS)
+def test_no_modulation_can_swing_a_field_faster_than_the_limit(tmp_path, field):
+    """A 15 Hz square LFO at full depth on every look-changing field: what reaches the shader may move at most one
+    full range per 1 / SLEW s (band count and zoom: OCT_SLEW octaves / s), i.e. a full swing there and back never
+    faster than SAFE_HZ."""
+    c = make(tmp_path)
+    c.bpm = 120.0
+    do(c, cmd="stack", op="add", gen=0, layer=dict(freq=1.0))
+    do(c, cmd="stack", op="mod", id=1, f=field, slot=0, src="lfo_square", amt=1.0, rate=2 / 15, phase=0.01)     # 15 Hz: 2 frames up, 2 down
+    lo, hi = stack.NUM[field][0], stack.NUM[field][1]
+    ph, seen, asked = c.stack._phase(1), [], []
+    for _ in range(240):
+        run(c, 1 / 60)
+        seen.append(ph["op"] if field == "opacity" else ph["v"][field])
+        asked.append(c.stack.live[f"1:{field}"])
+    assert max(asked) - min(asked) > 0.45 * (hi - lo)                  # the LFO really is slamming the field
+    octs = field in stack.OCT_FIELDS
+    step = [abs(math.log2(b / a)) if octs else abs(b - a) for a, b in zip(seen, seen[1:])]
+    rate = stack.OCT_SLEW if octs or field == "zoom" else stack.SLEW if field == "bright" else (hi - lo) * stack.SLEW
+    assert max(step) <= rate / 60 + 1e-9
+    span = (math.log2(max(seen[60:]) / min(seen[60:])) if octs else max(seen[60:]) - min(seen[60:]))
+    assert span <= 3 * rate / 60 + 1e-6                                # at 15 Hz it can only ripple
+    if field == "bright":
+        assert span < 0.35                                             # was a full 0..1 blink before the fix
+
+
+def test_user_moves_still_land_exactly_and_quickly():
+    st = StackState()
+    sdo(st, op="add", gen=0)
+    for _ in range(30):
+        st.step(1 / 60)
+    sdo(st, op="set", id=1, set=dict(duty=0.9, freq=24, hue=0.5, bright=2.0, cx=-1))
+    for _ in range(30):                                                # half a second
+        st.step(1 / 60)
+    v = st._phase(1)["v"]
+    assert (v["duty"], v["freq"], v["hue"], v["bright"], v["cx"]) == (0.9, 24.0, 0.5, 2.0, -1.0)
+
+
+def test_morph_between_two_full_unrelated_stacks_never_drops_or_pops():
+    a = stack.clean_stack(dict(layers=[dict(id=i, gen=0) for i in range(1, 9)]))
+    b = stack.clean_stack(dict(layers=[dict(id=i, gen=1) for i in range(11, 19)]))
+    prev = None
+    for n in range(0, 101):
+        t = n / 100
+        m = stack.blend(a, b, t)
+        ids = [x["id"] for x in m["layers"]]
+        assert len(ids) == 8 and len(set(ids)) == 8
+        assert ids == (list(range(1, 9)) if t < 0.5 else list(range(11, 19)))
+        ops = [x["opacity"] for x in m["layers"]]
+        if prev is not None:
+            assert max(abs(p - q) for p, q in zip(prev, ops)) < 0.03   # no jump anywhere, the swap happens at zero
+        prev = ops
+    assert max(x["opacity"] for x in stack.blend(a, b, 0.5)["layers"]) == 0.0
+    five = stack.clean_stack(dict(layers=[dict(id=i) for i in range(1, 6)]))
+    four = stack.clean_stack(dict(layers=[dict(id=i) for i in range(11, 15)]))
+    for t in (0.2, 0.5, 0.8):
+        assert len(stack.blend(five, four, t)["layers"]) == 5 and len(stack.blend(four, five, t)["layers"]) == 5
+
+
+def test_a_fading_ghost_never_pushes_a_live_layer_out():
+    st = StackState()
+    for _ in range(8):
+        sdo(st, op="add", gen=0)
+    for _ in range(30):
+        st.step(1 / 60)
+    sdo(st, op="del", id=5)
+    sdo(st, op="add", gen=1)                                           # 8 live + 1 ghost
+    for _ in range(40):
+        ids = [r["id"] for r in st.step(1 / 60)]
+        assert len(ids) <= 8 and {1, 2, 3, 4, 6, 7, 8} <= set(ids)     # the ghost fades first, then the new one comes in
+    assert ids == [1, 2, 3, 4, 6, 7, 8, 9]
+    st.do(stack.validate(dict(cmd="stack", op="replace", stack=dict(layers=[dict(id=100 + i) for i in range(8)]))))
+    fr = st.step(1 / 60)
+    assert [r["id"] for r in fr if r["id"] >= 100] == []               # new ones are still at opacity 0 ...
+    assert len(fr) == 8                                                # ... while the old eight fade as ghosts
+    for _ in range(30):
+        fr = st.step(1 / 60)
+    assert [r["id"] for r in fr] == [100 + i for i in range(8)]
+
+
+def test_morphing_does_not_bump_edits_every_frame(tmp_path):
+    c = make(tmp_path)
+    do(c, cmd="stack", op="add", gen=0)
+    do(c, cmd="scene_save", i=9)
+    do(c, cmd="stack", op="set", id=1, f="freq", v=20)
+    c.morph_bars, c.bpm = 2.0, 120.0
+    do(c, cmd="scene_recall", i=9, now=True)
+    e0 = c.stack.edits
+    run(c, 2.0)
+    assert c.stack.edits == e0                                         # only numbers moved: the panel keeps its list
+    assert 4.9 < c.stack.find(1)["freq"] < 20
+
+
+def test_scene_saved_on_a_canvas_looks_the_same_recalled_off_it(tmp_path):
+    c = make(tmp_path)
+    do(c, cmd="mod", name="l_beads", slot=0, src="bass", amt=0.4, rate=1, phase=0)
+    do(c, cmd="canvas", op="new")
+    do(c, cmd="bypass", key="l_kene", on=False)                        # one engine layer brought in
+    do(c, cmd="set", name="l_kene", v=0.4)
+    do(c, cmd="scene_save", i=9)
+    sc = c.scenes[9]
+    assert sc["base"]["l_kene"] == 0.4 and sc["base"]["l_beads"] == 0.0 and sc["base"]["twirl"] == 0.0
+    assert "l_beads" not in sc["mods"] and len(sc["stack"]["layers"]) == 1
+    assert c.base["l_beads"] == 0.7                                    # the live faders are not touched by saving
+    do(c, cmd="canvas", op="restore")
+    run(c, 2.0)
+    do(c, cmd="scene_recall", i=9, now=True)
+    v = run(c, 1.0)
+    assert lit(v) == {"l_kene": pytest.approx(0.4, abs=1e-3)} and len(c.stack.frame) == 1
+
+
+@pytest.mark.parametrize("bad", [
+    dict(op="set", id=1, f=[1], v=1), dict(op="set", id=1, f={"a": 1}, v=1), dict(op="set", id=1, set={1: 2}),
+    dict(op="mod", id=1, f=[1], slot=0, src="bass"), dict(op="mod", id=1, f="speed", slot=0, src=[1]),
+    dict(op="reset", id=1, f=[1]), dict(op=[1]), dict(op="add", gen=[1]), dict(op="add", layer=dict(gen={})),
+])
+def test_unhashable_and_odd_values_are_value_errors(bad):
+    with pytest.raises(ValueError):
+        stack.validate(dict(bad, cmd="stack"))
+    import remote_control
+    with pytest.raises(ValueError):
+        remote_control.validate_command(dict(bad, cmd="stack"))
+
+
+def test_band_index_survives_a_change_of_wrap_period():
+    st = StackState()
+    sdo(st, op="add", gen=0, layer=dict(space=1, freq=7, angle=0.25, speed=0.0))      # 7 rays: W = 7
+    st.restore(st.to_json())
+    st._phase(1)["scroll"] = -4.0
+    a = st.step(1 / 60)[0]
+    assert a["W"] == 7 and a["C"][0] == pytest.approx(4.0)
+    sdo(st, op="set", id=1, f="freq", v=8)
+    for _ in range(30):
+        b = st.step(1 / 60)[0]
+    assert b["W"] == 8 and b["C"][0] == pytest.approx(4.0)             # was 4 -> 6: every band changed colour
 
 
 # ---------------------------------------------------------------- NEW CANVAS / RESTORE PREVIOUS

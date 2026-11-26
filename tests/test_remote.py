@@ -307,7 +307,8 @@ def test_page_is_generated_from_params_and_has_post_timeout():
     import params
     assert "/*META*/null" not in rcmod.PAGE and "cmd:'set'" in rcmod.PAGE
     for name, spec in params.PARAMS.items():
-        assert f'"name":"{name}"' in rcmod.PAGE and spec[4] in rcmod.PAGE
+        label = json.dumps(spec[4])[1:-1]                     # meta is ASCII-escaped JSON ("Kené" -> "Kené")
+        assert f'"name":"{name}"' in rcmod.PAGE and label in rcmod.PAGE
     post = rcmod.PAGE[rcmod.PAGE.index("fetch('cmd'") - 200:rcmod.PAGE.index("fetch('cmd'") + 400]
     assert "AbortController" in post and "signal:ac.signal" in post
 

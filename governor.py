@@ -525,6 +525,9 @@ class Governor:
         self.stats = FrameStats()
         self.pass_ms = {}
         self.ai_status = None
+        self.skins_source = None        # materials.SkinEngine.status (set by the engine): resident skins + their VRAM
+        self.camera_source = None       # camera_layer.CameraLayer.cost (set by the engine): shown in status(); the camera
+                                        # steps its own fps / res down from self.level (camera_layer._watch)
         self.snap = {}
         self._reds, self._n = {}, 0
         self._raw = {}
@@ -992,9 +995,23 @@ class Governor:
                     throttle=None if s.get("throttle") is None else f"0x{s['throttle']:x}", thermal=bool(s.get("thermal")),
                     ai_busy=bool((self.ai_status or {}).get("busy")),
                     passes={k: v for k, v in self.pass_ms.items() if isinstance(v, (int, float)) and math.isfinite(v)}, active=act, suggestion=sug, warnings=list(self.warnings),
-                    advice=self.advice, low_power=self.low_power,
+                    advice=self.advice, low_power=self.low_power, camera=self._camera(), skins=self._skins(),
                     thresholds=dict(strained_p95=STRAINED_P95, critical_p95=CRITICAL_P95, vram_crit_mb=VRAM_CRIT_MB,
                                     temp_strained=TEMP_STRAINED, ram_strained=RAM_STRAINED))
+
+    def _skins(self):
+        try:
+            s = self.skins_source() if self.skins_source is not None else None
+            return s if isinstance(s, dict) else None
+        except Exception:
+            return None
+
+    def _camera(self):
+        try:
+            c = self.camera_source() if self.camera_source is not None else None
+            return c if isinstance(c, dict) and c.get("active") else None
+        except Exception:
+            return None
 
     def close(self):
         if self.sensors is not None:

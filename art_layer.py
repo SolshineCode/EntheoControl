@@ -1090,8 +1090,9 @@ class ArtPass:
                 self._busy = None
 
     def source(self, values, dt):
-        """Keep the library / uploads going without drawing the relief -> (colour texture, aspect) of the piece
-        on show, or None while there is none. For the compositor's other ways of using the image (art_use)."""
+        """Keep the library / uploads going without drawing the relief -> (colour texture, aspect, fade) of the
+        piece on show, or None while there is none. `fade` dips 1 -> 0 -> 1 through a piece switch (the texture
+        changes at the bottom of the dip), so the compositor's other ways of using the image never cut hard."""
         try:
             dt = _clamp(float(dt) if math.isfinite(float(dt)) else 0.0, 0.0, 0.25)
             self._update_library(values, dt)
@@ -1100,7 +1101,8 @@ class ArtPass:
             if piece is None and self._a:
                 piece = self._cache.get(self._a)
             self._hist_valid = 0                                   # the relief's slit-scan history is stale when it comes back
-            return (piece.color, float(piece.aspect)) if piece is not None else None
+            fade = abs(2.0 * _clamp(self._mixv, 0.0, 1.0) - 1.0) if (self._fading and self._b) else 1.0
+            return (piece.color, float(piece.aspect), fade * fade * (3.0 - 2.0 * fade)) if piece is not None else None
         except Exception as ex:
             self.stats["error"] = repr(ex)
             return None

@@ -570,7 +570,7 @@ def test_state_is_compact_json_and_meta_covers_params(tmp_path):
     run(c, 0.1)
     s = c.state()
     blob = json.dumps(s, allow_nan=False)
-    assert len(blob) < 12000
+    assert len(blob) < 13000  # grows with PARAMS (about 11.8 kB at 213 params) + timeline / show (~0.3 kB)
     for key in ("values", "base", "mods", "clock", "trig", "scenes", "autopilot", "midi", "ai", "morph", "quantize"):
         assert key in s
     assert s["mods"] == {"zoom": [dict(src="lfo_sine", amt=0.5, rate=4.0, phase=0.0), None]}

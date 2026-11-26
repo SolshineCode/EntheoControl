@@ -262,6 +262,72 @@ void main(){
 
 LAND_FS = [CORRIDOR_FS, TORUS_FS, VORTEX_FS, HEX_FS]
 
+# ---- environment skins (materials.py). The ORIGINAL programs above are what runs while every slot is procedural
+# (pixel-identical, zero extra cost). A world with a skinned slot draws with a second program: the same source with
+# the materials chunk in the header and ONE block pasted next to the line that sets the surface colour.
+try:
+    import materials as _mat
+except Exception:                                  # the module is optional: without it the decks are as they were
+    _mat = None
+
+_SK_PX = "float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y, zr = p.z - uCam.z;"
+_SK_SCREEN = "skTap(%d, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y))"
+SKIN_HOOKS = [
+    # corridor: slot 0 = the vault, slot 1 = floor + ceiling
+    ("      col = mix(pc*facets*0.55, mix(pc*1.5, vec3(1.0, 0.86, 0.5), 0.4), lines);\n", """
+      { bool fl = (1.65 - abs(p.y)) < (rad - length(p.xy)); int s = fl ? 1 : 0;
+        if (skA[s].w > 0.0005) {
+          """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
+          if (mp > 1.5) S = skTap(s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
+          else if (mp > 0.5) S = skTri(s, vec3(p.xy, zr), fl ? vec3(0.0, 1.0, 0.0) : vec3(normalize(p.xy), 0.0), f);
+          else if (fl) S = skTap(s, vec2(p.x + step(0.0, p.y)*1.7, zr), vec2(f, 0.0), vec2(0.0, f*clamp(t/1.65, 1.0, 64.0)));
+          else S = skTap(s, vec2(ang/TAU, zr), vec2(f/(TAU*rad), 0.0), vec2(0.0, f*clamp(t/rad, 1.0, 64.0)));
+          col = skMix(s, col, S, lines, 0.62 + 0.38*facets);
+        } }
+""", "after"),
+    # torus: slot 0 = the tube, slot 1 = the torus side chambers
+    ("      col *= (0.85 + uLow*0.55)*exp(-t*0.07);\n", """
+      { int s = dTor > dTube ? 1 : 0;
+        if (skA[s].w > 0.0005) {
+          """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
+          if (mp > 1.5) S = skTap(s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
+          else if (mp > 0.5) S = skTri(s, vec3(q.xy, zr), vec3(normalize(q.xy), 0.0), f);
+          else S = skTap(s, vec2(atan(q.y, q.x)/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
+          col = skMix(s, col, S, edge, 0.55 + 0.45*lead);
+        } }
+""", "before"),
+    # vortex: the stained-glass panes are the "lines" (the lead between them stays dark)
+    ("      col *= exp(-t*0.06);\n", """
+      if (skA[0].w > 0.0005) {
+        """ + _SK_PX + """ vec3 S; float mp = skB[0].x;
+        if (mp > 1.5) S = """ + _SK_SCREEN % 0 + """;
+        else if (mp > 0.5) S = skTri(0, vec3(p.xy, zr), vec3(normalize(p.xy), 0.0), f);
+        else S = skTap(0, vec2(ang/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
+        col = skMix(0, col, S, lead*(0.35 + 0.65*step(0.3, vG.z)), 0.30 + 0.70*lead);
+      }
+""", "before"),
+    # hex domes: latitude / longitude of the shell (the domes are fixed in the world: no travel follow)
+    ("      col *= (0.85 + uMid*0.5)*exp(-t*0.07);\n", """
+      if (skA[0].w > 0.0005) {
+        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y; vec3 S; float mp = skB[0].x;
+        if (mp > 1.5) S = """ + _SK_SCREEN % 0 + """;
+        else if (mp > 0.5) S = skTri(0, q, n, f);
+        else S = skTap(0, vec2(atan(n.y, n.x)/TAU, acos(clamp(n.z, -1.0, 1.0))/PI), vec2(f/(TAU*1.6), 0.0), vec2(0.0, f/(PI*1.3)));
+        col = skMix(0, col, S, rim, 0.45 + 0.55*cell);
+      }
+""", "before"),
+]
+
+
+def skinned_source(mode):
+    """LAND_FS[mode] with the skin chunk + hook. Raises if an anchor moved (a test pins this)."""
+    anchor, add, where = SKIN_HOOKS[mode]
+    fs = LAND_FS[mode]
+    if fs.count(anchor) != 1 or fs.count(HEADER) != 1:
+        raise ValueError(f"skin hook anchor not found in landscape {mode}")
+    fs = fs.replace(HEADER, HEADER + _mat.GLSL)
+    return fs.replace(anchor, add + anchor if where == "before" else anchor + add)
+
 TRAIL_FS = """
 #version 330
 in vec2 v_uv; out vec4 fragColor;
@@ -437,6 +503,18 @@ class LandPass:
         self._quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
         self._progs = [ctx.program(vertex_shader=VS, fragment_shader=fs) for fs in LAND_FS]
         self._vaos = [ctx.vertex_array(p, [(self._quad, "2f", "in_pos")]) for p in self._progs]
+        # environment skins: set `skins` to a materials.SkinEngine (the engine does). The skinned programs are
+        # compiled here, once, so assigning the first skin mid-show never stalls a frame on a shader compile.
+        self.skins = None
+        self.skinned_decks = 0               # decks drawn with a skinned program by the last render()
+        self._sprogs, self._svaos = [None] * len(LAND_FS), [None] * len(LAND_FS)
+        if _mat is not None:
+            try:
+                self._sprogs = [ctx.program(vertex_shader=VS, fragment_shader=skinned_source(i)) for i in range(len(LAND_FS))]
+                self._svaos = [ctx.vertex_array(p, [(self._quad, "2f", "in_pos")]) for p in self._sprogs]
+            except Exception as ex:
+                print(f"[skins] landscape skins disabled: {ex}")
+                self._sprogs, self._svaos = [None] * len(LAND_FS), [None] * len(LAND_FS)
         self._trail = ctx.program(vertex_shader=VS, fragment_shader=TRAIL_FS)
         self._trail_vao = ctx.vertex_array(self._trail, [(self._quad, "2f", "in_pos")])
         self._comp = ctx.program(vertex_shader=VS, fragment_shader=COMP_FS)
@@ -499,7 +577,7 @@ class LandPass:
 
     def release(self):
         self._free_targets()
-        for o in (self._vaos + self._progs + [self._trail_vao, self._trail, self._comp_vao, self._comp, self._svao,
+        for o in ([x for x in self._svaos + self._sprogs if x is not None] + self._vaos + self._progs + [self._trail_vao, self._trail, self._comp_vao, self._comp, self._svao,
                                               self._sprog, self._sbuf, self._quad]):
             o.release()
         self._vaos, self._progs, self._size = [], [], None
@@ -535,6 +613,14 @@ class LandPass:
         if cam == 2:
             self._roll = (self._roll + dt * (0.18 + bands[1] * 0.6)) % TAU
         self._spin = (self._spin + dt * _f(v, "spin") * self.spin_rate) % TAU       # used unless spin_phase is given
+        sk = self.skins
+        if sk is not None and dzc:                                    # skins stay on their wall while the camera flies
+            ea = _mat.LAND_ENVS[_idx(v, "land_a", 3)]
+            eb = _mat.LAND_ENVS[_idx(v, "land_b", 3)]
+            if sk.active(ea):
+                sk.advance(ea, dzc)
+            if eb != ea and sk.active(eb):
+                sk.advance(eb, dzc)
         return dt, cam
 
     def _camera(self, v, cam, spin_phase=None):
@@ -559,7 +645,12 @@ class LandPass:
         return (x, y, self._z + 4.5 * punch), camera_matrix(yaw, pitch, roll), min(fov, 150.0)
 
     def _deck(self, which, mode, v, cam_pos, cam_mat, fov, bands, warp_tex, warp):
-        prog = self._progs[mode]
+        prog, vao = self._progs[mode], self._vaos[mode]
+        sk = self.skins
+        if sk is not None and self._sprogs[mode] is not None and sk.active(_mat.LAND_ENVS[mode]):
+            prog, vao = self._sprogs[mode], self._svaos[mode]         # only a world with a skinned slot pays for skins
+            sk.bind(prog, _mat.LAND_ENVS[mode])
+            self.skinned_decks += 1
         w, h = self._size
         folds, ph, k = float(min(max(round(_f(v, "folds", 8.0)), 3), 16)), self._ph, min(mode, 2)
         nx = math.floor(max(folds * 2.0, 12.0) + 0.5)                 # hex cells around the dome (as in HEX_FS)
@@ -582,7 +673,7 @@ class LandPass:
             warp_tex.use(0)
         self._fbo[which].use()
         self.ctx.viewport = (0, 0, w, h)
-        self._vaos[mode].render(moderngl.TRIANGLE_STRIP)
+        vao.render(moderngl.TRIANGLE_STRIP)
 
     def _swarm_pass(self, v, dt, cam_mat, fov, bands):
         w, h = self.swarm_size
@@ -647,7 +738,7 @@ class LandPass:
             en, enums, get = self._gl_enums
             blend_on = bool(self._gl.glIsEnabled(en))
             blend_state = [get(self._gl, e) for e in enums]
-        self.decks_rendered, self.swarm_rendered = 0, False
+        self.decks_rendered, self.swarm_rendered, self.skinned_decks = 0, False, 0
         try:
             ctx.viewport = (0, 0, w, h)
             ctx.disable(moderngl.BLEND)

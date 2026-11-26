@@ -11,12 +11,15 @@ Everything runs on the caller's (GL) thread except MIDI input, which arrives thr
 Files in state_dir: scenes.json (16 scene slots), midi_map.json (bindings), live_state.json (autosave,
 restored on start so a crash restart resumes the same look). All writes are atomic and never raise.
 """
+import copy
 import json
 import math
 import queue
 import random
+import re
 import threading
 import time
+import weakref
 from collections import deque
 from pathlib import Path
 
@@ -40,7 +43,7 @@ OPTIONS = {
     "chase_mode": ["Single", "Dual", "Counter"],
     "fractal_mode": ["Crystal KIFS", "Mandelbox tunnel", "Hyperbolic tiling", "Apollonian", "Julia jewels", "4D polytope"],
     "serpent_count": [],
-    "palette": ["Aya Jewel", "Cosmic Gold/Violet", "Gorge Twilight", "Emerald Shipibo", "Spectral"],
+    "palette": ["Aya Jewel", "Cosmic Gold/Violet", "Gorge Twilight", "Emerald Jungle", "Spectral"],
     # TouchVDMX merge (fx_stack.LandPass)
     "land_a": ["Sacred corridor", "Torus wormhole", "Prismatic vortex", "Hex dome"],
     "land_b": ["Sacred corridor", "Torus wormhole", "Prismatic vortex", "Hex dome"],
@@ -73,6 +76,18 @@ try:                                                 # math stack: the layer mod
     import stack as _stack
 except ImportError:
     _stack = None
+try:                                                 # environment skins: the slot model + its commands (pure python part)
+    import materials as _skins
+except ImportError:
+    _skins = None
+try:                                                 # timeline: moving playhead, cues, automation (timeline.py)
+    import timeline as _tl
+except ImportError:
+    _tl = None
+try:                                                 # shows / presets: save and load later (shows.py, worker thread)
+    import shows as _shows
+except ImportError:
+    _shows = None
 try:                                                 # ONLINE plugin hooks (pure python; the plugin itself is only
     from plugins.online import protocol as _online   # imported when the performer switches ONLINE on)
 except Exception:
@@ -158,6 +173,8 @@ def valid_target(t):
             return p[1] in BYPASS_COVER
         if p[0] == "stack" and len(p) == 3:          # stack:<layer id>:<field> (a knob on a field, a pad on mute / solo)
             return _stack is not None and _stack.parse_target(t) is not None
+        if p[0] == "skin" and len(p) == 4:           # skin:<env>:<slot>:<field> (a knob on a skin slot's field)
+            return _skins is not None and _skins.parse_target(t) is not None
         if p[0] == "ripple" and len(p) == 3:
             return 0 <= float(p[1]) <= 1 and 0 <= float(p[2]) <= 1
     except ValueError:
@@ -183,6 +200,13 @@ def _v_mod(c):
         if t is None or t[1] not in _stack.NUM:
             raise ValueError("unknown stack field")
         return _stack.validate(dict(c, op="mod", id=t[0], f=t[1]))
+    if isinstance(name, str) and name.startswith("skin:"):       # a skin slot's field: skin:<env>:<slot>:<field>
+        t = _skins.parse_target(name) if _skins is not None else None
+        if t is None or t[2] not in _skins.NUM:
+            raise ValueError("unknown skin field")
+        return _skins.validate(dict(cmd="skin", op="mod", env=t[0], slot=t[1], f=t[2], mslot=_int(c, "slot", 0, 1),
+                                    src=_name(c, MOD_SOURCES, "src"), amt=c.get("amt", 0.0), rate=c.get("rate", 1.0),
+                                    phase=c.get("phase", 0.0)))
     return {"cmd": "mod", "name": _name(c, CONT), "slot": _int(c, "slot", 0, 1),
             "src": _name(c, MOD_SOURCES, "src"), "amt": _num(c, "amt", -1.0, 1.0, 0.0),
             "rate": _num(c, "rate", 1 / 64, 64.0, 1.0), "phase": _num(c, "phase", 0.0, 1.0, 0.0)}
@@ -378,11 +402,141 @@ _VALIDATORS = {
 if _stack is not None:                               # {"cmd": "stack", "op": ...}: stack.py; NEW CANVAS / RESTORE PREVIOUS
     _VALIDATORS["stack"] = _stack.validate
     _VALIDATORS["canvas"] = lambda c: {"cmd": "canvas", "op": _name(c, ("new", "restore"), "op")}
+if _skins is not None:                               # {"cmd": "skin", "op": ...}: materials.py (environment skins)
+    _VALIDATORS["skin"] = _skins.validate
 if _textlayer is not None:                           # text, text_phrases, text_add, text_del, text_go, text_cycle
     _VALIDATORS.update(_textlayer.VALIDATORS)
 if _online is not None:                              # {"cmd": "online", "op": ...}: plugins/online/protocol.py
     _VALIDATORS["online"] = _online.validate
+# ---- TIMELINE (timeline.py) + SHOWS / PRESETS (shows.py)
+TL_EVENTS = ("bypass", "text", "text_go", "art_step", "ripple", "seq_rand", "next_video", "show_texture", "art_pick")
+_TEX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(png|jpg|jpeg|webp)$", re.I)
+TL_FLASH_GAP = 0.4          # s between two timeline flash-type triggers (<= 2.5 Hz)
+TL_SAFE_HZ = 2.5            # timeline strobe only when the strobe rate is at or under this
+TL_LUMA_RATE = 5.0          # luminance-critical automation: at most 5 full ranges / s (a full swing >= 0.2 s)
+TL_GLIDE = 1.0              # s: hand-back glide after a live override, and after RELEASE
+TL_HOLD = 1.5               # s: TOUCH override holds this long after the performer's last move (op "hold")
+TL_CHASE_S = 0.15           # s: crossfade of a chased cue (a seek never cuts hard)
+SHOW_DEFAULT_PARTS = ("look", "scenes", "timeline", "settings", "recorder")   # venue rig (mapping, MIDI) kept by default
+SHOW_DEBOUNCE, SHOW_MAX_WAIT = 15.0, 60.0                                       # s: autosave after the last edit / at most
+
+
+def _v_tl_event(c):
+    """A command a timeline EVENT item may carry: allowlisted, validated like the panel's own. Webcam on / off is
+    deliberately not here (a shared show must never switch a camera on); the CAMERA layer's bypass is."""
+    if not isinstance(c, dict) or c.get("cmd") not in TL_EVENTS:
+        raise ValueError("timeline event must be one of " + ", ".join(TL_EVENTS))
+    k = c["cmd"]
+    if k in _VALIDATORS:
+        out = _VALIDATORS[k](c)
+        if k == "bypass" and "on" not in out:
+            raise ValueError("a timeline bypass event needs 'on' (true = switch off)")
+        return out
+    if k == "next_video":
+        return passthrough(k)
+    if k == "show_texture":
+        name = c.get("name")
+        if not isinstance(name, str) or not _TEX_NAME.match(name) or ".." in name:
+            raise ValueError("'name' must be a texture file name")
+        return passthrough(k, name=name)
+    src, name = c.get("source", "art"), c.get("name")
+    if src not in ("art", "ai") or not isinstance(name, str) or not 0 < len(name) <= 200 or name in (".", "..") or any(
+            ch in name for ch in '/\\:\0') or any(ord(ch) < 32 for ch in name) or (src == "ai" and not _TEX_NAME.match(name)):
+        raise ValueError("'art_pick' needs source art | ai and a file name")
+    return passthrough(k, source=src, name=name)
+
+
+def _v_show(c):
+    op = _name(c, ("new", "open", "save", "save_as", "delete", "rescan"), "op")
+    out = {"cmd": "show", "op": op}
+    if op in ("open", "delete") or (op == "new" and c.get("from") == "template"):
+        out["slug"] = _shows.check_slug(c.get("slug"))
+    if op == "new":
+        out["from"] = _name(c, ("clean", "factory", "current", "template"), "from")
+    if op == "open":
+        out["recover"] = _bool(c, "recover") if "recover" in c else False
+        b = c.get("backup")
+        if b is not None:
+            if not isinstance(b, str) or not re.match(r"^show\.\d{8}-\d{6}\.json$", b):
+                raise ValueError("bad backup name")
+            out["backup"] = b
+    if op in ("open", "new") and c.get("parts") is not None:
+        p = c["parts"]
+        if not isinstance(p, list) or any(x not in _shows.PARTS for x in p):
+            raise ValueError("'parts' must be a list of " + ", ".join(_shows.PARTS))
+        out["parts"] = list(dict.fromkeys(p))
+    if op in ("save", "save_as"):
+        out["media"] = _bool(c, "media") if "media" in c else False
+    if op == "save_as":
+        out["name"] = _shows.clean_name(c.get("name"))
+        out["template"] = _bool(c, "template") if "template" in c else False
+    return out
+
+
+def _groups(c):
+    g = c.get("groups")
+    if g is None:
+        return None
+    groups = set(v[3] for v in PARAMS.values())
+    if not isinstance(g, list) or len(g) > 64 or any(x not in groups for x in g):
+        raise ValueError("'groups' must be a list of param groups")
+    return list(dict.fromkeys(g))
+
+
+def _v_preset(c):
+    op = _name(c, ("save", "recall", "set", "delete", "rescan"), "op")
+    out = {"cmd": "preset", "op": op}
+    if op == "save":
+        out["kind"] = _name(c, _shows.KINDS, "kind")
+        out["name"] = _shows.clean_name(c.get("name"))
+        out["tags"] = _shows.clean_tags(c.get("tags"))
+        out["groups"] = _groups(c)
+        if out["kind"] == "layer":
+            if c.get("stack_id") is not None:
+                out["stack_id"] = _int(c, "stack_id", 1, 2 ** 31)
+            else:
+                out["layer"] = _name(c, [n for n in CONT if n.startswith("l_") or n == "serpent"], "layer")
+    elif op in ("recall", "set", "delete"):
+        out["ref"] = _tl.preset_ref(c.get("ref")) if _tl is not None else None
+        if out["ref"].split("/")[0] not in _shows.KINDS:
+            raise ValueError("unknown preset kind")
+    if op == "recall":
+        out["groups"] = _groups(c)
+        out["morph"] = _num(c, "morph", 0.0, 64.0, 0.0)
+    if op == "set":
+        if "name" in c:
+            out["name"] = _shows.clean_name(c["name"])
+        if "tags" in c:
+            out["tags"] = _shows.clean_tags(c["tags"])
+        if "fav" in c:
+            out["fav"] = _bool(c, "fav")
+    return out
+
+
+TL_CTX = None
+if _tl is not None:
+    TL_CTX = _tl.Ctx({n: PARAMS[n] for n in CONT}, DISCRETE, _v_tl_event, N_SCENES)
+    _VALIDATORS["tl"] = lambda c: _tl.validate(c, TL_CTX)
+if _shows is not None and _tl is not None:
+    _VALIDATORS["show"] = _v_show
+    _VALIDATORS["preset"] = _v_preset
+LUMA = frozenset(n for n in CONT if n == "master" or n.startswith("l_") or n == "serpent" or "bright" in n
+                 or n == "saturation")
 CONTROL_CMDS = frozenset(_VALIDATORS)
+_BLOB_OWNER = None
+
+
+def blob(name):
+    """(rev, bytes) of a big document of the controller that last published its state (any thread: the tuple is
+    immutable and built on the GL thread in state()), or None."""
+    owner = _BLOB_OWNER() if _BLOB_OWNER is not None else None
+    cache = getattr(owner, "blob_cache", None) if owner is not None else None
+    return cache.get(name) if cache else None
+
+
+_NOT_EDITS = frozenset(("tap", "trigger", "ripple", "panic", "show", "preset", "midi_learn", "gen", "gen_cancel",
+                        "online", "resync", "latch"))     # commands that do not change what a show file holds
+_TL_TRANSPORT = frozenset(("play", "stop", "seek", "home", "rec", "rec_mode", "ovr_mode", "reenable", "release", "hold"))
 
 
 def mark_local(c):
@@ -438,6 +592,8 @@ def _clean_scene(raw):
                mods=_clean_mods(raw.get("mods")))
     if _stack is not None and isinstance(raw.get("stack"), dict):      # scenes saved before the math stack have none:
         out["stack"] = _stack.clean_stack(raw["stack"])               # recalling one leaves the stack alone
+    if _skins is not None and isinstance(raw.get("skins"), dict):      # same rule for environment skins
+        out["skins"] = _skins.clean_skins(raw["skins"])
     return out
 
 
@@ -478,7 +634,8 @@ def meta():
         clock_sources=list(CLOCK_SOURCES), cue_cc={str(k): v for k, v in CUE_CC.items()},
         bypass=dict(keys=list(BYPASS_COVER), cover={k: list(v) for k, v in BYPASS_COVER.items()},
                     group_key=dict(_params.BYPASS_GROUP_KEY)),
-        stack=_stack.meta() if _stack is not None else None, canvas_keys=list(CANVAS_KEYS))
+        stack=_stack.meta() if _stack is not None else None, canvas_keys=list(CANVAS_KEYS),
+        skins=_skins.meta() if _skins is not None else None)
 
 
 # ------------------------------------------------------------------ factory scenes
@@ -670,7 +827,7 @@ class LinkBridge:
 
 class Controller:
     def __init__(self, state_dir=None, restore=True, midi=True, bpm=124.0, time_fn=None, seed=None,
-                 ai=True, ai_url="http://127.0.0.1:8766", art_dir=None, autosave=None):
+                 ai=True, ai_url="http://127.0.0.1:8766", art_dir=None, autosave=None, threads=True):
         self.dir = Path(state_dir) if state_dir is not None else Path(__file__).resolve().parent
         # Nothing on disk is written, renamed or quarantined by a controller that does not also restore
         # (headless / test runs with restore=False are read-only) unless autosave says otherwise.
@@ -699,6 +856,8 @@ class Controller:
         self._byp_once = None                          # s: fade time for the transition in progress (NEW CANVAS)
         self.stack = _stack.StackState() if _stack is not None else None      # math stack: hand-built layers
         self._stack_morph = False
+        self.skins = _skins.SkinState() if _skins is not None else None       # environment skins (materials.py)
+        self.gov_level = 0                             # the engine copies the governor's level here (0 ok .. 2 critical)
         self.canvas_prev = None                        # the look before NEW CANVAS (base, mods, bypass, stack)
         self.fresh = 0                                 # start time of a --fresh launch (the panel opens in SIMPLE)
 
@@ -763,7 +922,45 @@ class Controller:
         self.ext = {}                                  # settings owned by other modules (governor.py: ext.governor.mode)
         self.signals = {}                              # external mod sources set each frame (camera_layer: crowd_*, hand_*)
         self.edits, self.panics = {}, 0                # per-param count of direct set() moves; PANIC count
+
+        # timeline (timeline.py): automation lives in its own layer (_auto) over the fader bases, never in them
+        self.tl = _tl.Timeline(TL_CTX) if _tl is not None else None
+        self.tl_engaged = False                        # automation drives its params (after PLAY / a seek; RELEASE ends it)
+        self.tl_hold = TL_HOLD
+        self.tl_limited = 0                            # timeline flashes / strobes held back by the photosensitive rules
+        self._auto = {}                                # param -> automation value this frame (the target instead of base)
+        self._tl_ovr = {}                              # param -> [last performer move (tl clock), glide-from, glide start]
+        self._tl_fade = {}                             # param -> [value, start]: RELEASE glides back to the fader
+        self._tl_trig = set()                          # trigger names a timeline span holds this frame
+        self._tl_buf, self._tl_span_ids, self._tl_blocked = [], set(), set()
+        self._tl_clock = 0.0                           # s: sum of update() dt (deterministic, never the wall clock)
+        self._tl_beat = None
+        self._tl_flash_t = -1e9
+        self._tl_cue_t = -1e9                          # last timeline cue (photosensitive: no rapid hard cuts)
+        self._tl_byp_t = {}                            # bypass key -> last timeline toggle
+        self._tl_firing = False                        # True while the timeline itself acts (nothing is re-recorded)
+        self._tl_last_cue = None
+        self._rec_g, self._rec_trig, self._rec_ids = {}, {}, set()
+        self._rec_dirty, self._rec_compile_t = False, 0.0
+        self._tl_blob = (0, b"{}")
+        self._tl_blob_t = -1e9
+        self.tl_docs, self.tl_i = [None], 0            # every timeline of the show; the active one is live in self.tl
+
+        # shows + presets (shows.py): files on a worker thread
+        self.shows = None
+        if _shows is not None and _tl is not None:
+            try:
+                self.shows = _shows.ShowManager(self.dir, enabled=self.autosave, art_dir=self.art_dir, start=bool(threads))
+            except Exception:
+                self.shows = None
+        self._show_dirty_t = self._show_first_t = None
+        self._save_req_t = 0.0
+        # thumbnails: a scene / preset save asks the engine for one snapshot frame. Only for the real show (state in
+        # the code folder); tests and the panel demo (temp folders, no engine) do not get the extra command.
+        self.thumbs = bool(restore and threads and self.dir.resolve() == Path(__file__).resolve().parent)
         self.restored = self._restore() if restore else False
+        if restore and self.shows is not None:
+            self.shows.submit("session")               # the open show's timeline comes back (transport stopped)
         self._save_t = self.now()
         self.online = None                             # plugins/online: loaded only while ext.online.on is true
         if _online is not None:
@@ -784,6 +981,9 @@ class Controller:
         self.edits[name] = self.edits.get(name, 0) + 1  # direct moves only (governor.py: the user wins)
         if self._morph:
             self._morph["names"].discard(name)         # a hand on the fader overrides the morph
+        self._changed()
+        if self.tl is not None and not self._tl_firing and name not in TRIGGERS:
+            self._tl_touch(name)                       # performer wins over automation; RECORD writes the move
 
     def nudge(self, name, delta):
         if name in PARAMS:
@@ -800,6 +1000,15 @@ class Controller:
             self.held[name] = on
         if on and name in self.env:
             self.env[name] = 1.0                       # instant attack: a tap shorter than a frame still shows
+        if self.tl is not None and not self._tl_firing and self.tl.recording():
+            pos = self.tl.pos
+            if self.held[name] and name not in self._rec_trig:
+                self._rec_trig[name] = pos
+            elif not self.held[name] and name in self._rec_trig:
+                t0 = self._rec_trig.pop(name)
+                it = self.tl.add_item("trigger", {"t": t0, "len": max(pos - t0, _tl.REC_GAP[self.tl.units]), "name": name})
+                if it:
+                    self._rec_ids.add(it["id"])
 
     def ripple(self, x, y):
         try:
@@ -858,6 +1067,32 @@ class Controller:
         self.learn = None
         self.auto["on"] = False                        # nothing may move the look away from the safe scene
         self._auto_next = None
+        if self.tl is not None:                        # the timeline stops and lets go of everything it held
+            self._tl_pass_end()
+            self.tl.playing = self.tl.rec = False
+            self.tl_engaged = False
+            self._auto.clear()
+            self._tl_ovr.clear()
+            self._tl_fade.clear()
+            self._tl_trig.clear()
+            self._tl_span_ids.clear()
+        if self.stack is not None:                     # the math stack is not part of the safe look: off, at once,
+            self._stack_morph = False                  # and no half-finished stack morph left running
+            self.stack.morph_cancel()
+            self.stack.load(dict(layers=[]), fade=False)
+            if self.skins is not None and self.skins.any():      # an image on a wall is not part of the safe look either:
+                j = self.skins.to_json()                         # every slot back to procedural (its settings are kept)
+                for d in j["slots"].values():
+                    d.pop("src", None)
+                self.skins.load(j)
+                self.skins.gen = None
+            if self.canvas_prev is not None:           # on a clean canvas every engine layer is bypassed: with the stack
+                keep = set(self.canvas_prev["bypass"])  # gone that would be a black wall. PANIC leaves the canvas: the
+                for k in CANVAS_KEYS:                   # switches go back to what they were before NEW CANVAS.
+                    if k not in keep:
+                        self.bypass.discard(k)
+                        self._byp.pop(k, None)
+                self.canvas_prev, self._byp_once = None, None
         self.bypass.discard("layers")                  # the one bypass that is a blackout: PANIC must recover from it
         self._byp.pop("layers", None)                  # (single layers / tabs the performer killed stay killed)
         if _online is not None:
@@ -876,6 +1111,13 @@ class Controller:
 
     def close(self):
         self._autosave()
+        if self.shows is not None:
+            try:
+                if self._show_dirty_t is not None:
+                    self._show_autosave()
+                self.shows.close()
+            except Exception:
+                pass
         if _online is not None:
             _online.close(self)
         for part in (self.midi, self.ai, self.linkb):
@@ -955,6 +1197,10 @@ class Controller:
             on = key not in self.bypass
         if on != (key in self.bypass):                 # persist soon (0.5 s), not at the next 5 s autosave: a crash
             self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)   # must not bring a killed layer back
+            if self.tl is not None and not self._tl_firing and self.tl.recording():
+                it = self.tl.add_item("event", {"t": self.tl.pos, "cmd": {"cmd": "bypass", "key": key, "on": bool(on)}})
+                if it:
+                    self._rec_ids.add(it["id"])
         (self.bypass.add if on else self.bypass.discard)(key)
 
     def _step_bypass(self, dt):
@@ -1064,8 +1310,15 @@ class Controller:
         if not 0 <= i < N_SCENES:
             return
         snap = dict(name="", base={n: self.base[n] for n in CONT}, mods=_copy_mods(self.mods))
+        if self.skins is not None:
+            snap["skins"] = self.skins.to_json()
         if self.stack is not None:
             snap["stack"] = self.stack.to_json()
+            if self.canvas_prev is not None:           # saved on a clean canvas: scenes do not store bypass switches, so
+                for key in self.bypass & set(CANVAS_KEYS):      # the hidden layers / effects are stored at neutral.
+                    for n in BYPASS_COVER[key]:        # Recalled anywhere, the scene looks like what was on the wall.
+                        snap["base"][n] = _params.NEUTRAL[n]
+                        snap["mods"].pop(n, None)
         if not self._scenes_ok:
             self._load_scenes()                        # the file was unreadable earlier: try again before writing
         if self.scenes[i]:
@@ -1073,6 +1326,10 @@ class Controller:
         self.scenes[i] = snap
         self.cur = i
         self._save_scenes()
+        self._changed()
+        if self.thumbs and self.shows is not None and self.shows.enabled:   # pad thumbnail: one low-res output frame
+            self._out.append(passthrough("snapshot"))
+            self.shows.submit("scene_thumb", slot=i, snap_t=time.time())
 
     def scene_clear(self, i):
         if not 0 <= i < N_SCENES:
@@ -1084,6 +1341,9 @@ class Controller:
             if self.cur == i:
                 self.cur = -1
             self._save_scenes()
+            self._changed()
+            if self.shows is not None and self.shows.enabled:
+                self.shows.submit("scene_thumb_clear", slot=i)
 
     def scene_recall(self, i, now=False):
         """Recall slot i at the next quantize boundary (or immediately), morphing over morph_bars."""
@@ -1102,6 +1362,10 @@ class Controller:
         self._start_recall(i, self.morph_bars)
         if self.auto["on"]:
             self._auto_next = self.beat + self.auto["bars"] * 4.0
+        if self.tl is not None and not self._tl_firing and self.tl.recording():
+            it = self.tl.add_item("cue", {"t": self.tl.pos, "kind": "scene", "slot": i, "morph": self.morph_bars})
+            if it:
+                self._rec_ids.add(it["id"])
 
     def _start_recall(self, i, bars, keep_palette=False):
         sc = self.scenes[i]
@@ -1121,6 +1385,8 @@ class Controller:
             old = [(self.mods, 1.0)]
         old = [(m, w) for m, w in old if w > 0.01 and m][:4]
         self.mods = _copy_mods(sc["mods"])
+        if self.skins is not None and "skins" in sc:   # the engine crossfades a changed source by itself (0.4 s)
+            self.skins.load(sc["skins"])
         if self.stack is not None:
             self._stack_morph = False
             self.stack.morph_cancel()
@@ -1206,7 +1472,8 @@ class Controller:
                     seq=dict(vals=list(self.seq["vals"]), gates=list(self.seq["gates"])),
                     text=self.text.to_json() if self.text is not None else None,
                     bypass=sorted(self.bypass), bypass_fade=self.bypass_fade, ext=dict(self.ext),
-                    stack=self.stack.to_json() if self.stack is not None else None, canvas=self.canvas_prev)
+                    stack=self.stack.to_json() if self.stack is not None else None, canvas=self.canvas_prev,
+                    skins=self.skins.to_json() if self.skins is not None else None)
 
     def _autosave(self):
         if not self.autosave:
@@ -1223,33 +1490,49 @@ class Controller:
             d = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(d, dict):
                 return False
-            self.base.update(_clean_base(d.get("base"), {n: self.base[n] for n in CONT}))
-            self.mods = _clean_mods(d.get("mods"))
-            self._sm = dict(self.base)
-            self._pal_target = self.base["palette"]
+            return self._apply_state(d)
+        except Exception:
+            return False
+
+    def _apply_state(self, d):
+        """A live_state-shaped dict -> the live state; each field validated as at a restart. Keys that are absent are
+        left alone (OPEN SHOW applies only the parts it was asked for). Never raises."""
+        try:
+            if "base" in d:
+                self.base.update(_clean_base(d.get("base"), {n: self.base[n] for n in CONT}))
+                self._sm = dict(self.base)
+                self._pal_target = self.base["palette"]
+            if "mods" in d:
+                self.mods = _clean_mods(d.get("mods"))
             cur = d.get("cur")
             if isinstance(cur, int) and not isinstance(cur, bool) and 0 <= cur < N_SCENES and self.scenes[cur]:
                 self.cur = cur
             s = d.get("settings") if isinstance(d.get("settings"), dict) else {}
-            for cmd in (dict(cmd="bpm", v=s.get("bpm")), dict(cmd="clock_src", src=s.get("clock_src")),
-                        dict(cmd="strobe_rate", v=s.get("strobe_rate")), dict(cmd="morph", bars=s.get("morph")),
-                        dict(cmd="quantize", q=s.get("quantize")), dict(cmd="glide", bars=s.get("glide")),
-                        dict(cmd="safe", i=s.get("safe")), dict(cmd="cue_ch", ch=s.get("cue_ch")),
-                        dict(s.get("autopilot") if isinstance(s.get("autopilot"), dict) else {}, cmd="autopilot")):
+            for key, cmd in (("bpm", dict(cmd="bpm", v=s.get("bpm"))), ("clock_src", dict(cmd="clock_src", src=s.get("clock_src"))),
+                             ("strobe_rate", dict(cmd="strobe_rate", v=s.get("strobe_rate"))),
+                             ("morph", dict(cmd="morph", bars=s.get("morph"))),
+                             ("quantize", dict(cmd="quantize", q=s.get("quantize"))), ("glide", dict(cmd="glide", bars=s.get("glide"))),
+                             ("safe", dict(cmd="safe", i=s.get("safe"))), ("cue_ch", dict(cmd="cue_ch", ch=s.get("cue_ch"))),
+                             ("autopilot", dict(s.get("autopilot") if isinstance(s.get("autopilot"), dict) else {}, cmd="autopilot"))):
+                if key not in s:
+                    continue
                 try:
                     self._do(validate(cmd))
                 except Exception:
                     pass                               # one bad field does not spoil the rest
-            self.seq = _clean_seq(s.get("seq"))
+            if "seq" in s:
+                self.seq = _clean_seq(s.get("seq"))
             if isinstance(s.get("ext"), dict):         # other modules' settings (small JSON dicts, keyed by module)
                 self.ext = {k: v for k, v in s["ext"].items() if isinstance(k, str) and isinstance(v, dict)}
-            if self.text is not None:
+            if self.text is not None and "text" in s:
                 self.text.restore(s.get("text"))
             if isinstance(s.get("bypass"), list):      # come back already bypassed: no fade-out on the projector
                 self.bypass = {k for k in s["bypass"] if isinstance(k, str) and k in BYPASS_COVER}
                 self._byp = {k: 1.0 for k in self.bypass}
             if self.stack is not None and isinstance(s.get("stack"), dict):
                 self.stack.restore(s["stack"])         # comes back as it was: no fade-in on the projector
+            if self.skins is not None and isinstance(s.get("skins"), dict):
+                self.skins.restore(s["skins"])
             cv = s.get("canvas")
             if self.stack is not None and isinstance(cv, dict) and isinstance(cv.get("base"), dict):
                 self.canvas_prev = dict(base=_clean_base(cv["base"]), mods=_clean_mods(cv.get("mods")),
@@ -1282,7 +1565,10 @@ class Controller:
                     rest.append(c)
                     continue
                 try:
-                    self._do(validate(c))
+                    v = validate(c)
+                    self._do(v)
+                    if v["cmd"] not in _NOT_EDITS and not (v["cmd"] == "tl" and v["op"] in _TL_TRANSPORT):
+                        self._changed()
                 except Exception:
                     pass
         except TypeError:
@@ -1303,8 +1589,20 @@ class Controller:
         elif cmd == "stack":                           # math stack edit (also what a "mod" on stack:<id>:<field> becomes)
             self._stack_morph = False
             self.stack.do(c)
+            self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)   # a crash restart resumes the build
+        elif cmd == "skin":                            # environment skins (also what a "mod" on skin:<env>:<slot>:<f> becomes)
+            if self.skins is not None:
+                self.skins.do(c)
+                self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)
         elif cmd == "canvas":
             (self.new_canvas if c["op"] == "new" else self.restore_canvas)()
+            self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)
+        elif cmd == "tl":
+            self._tl_do(c)
+        elif cmd == "show":
+            self._show_do(c)
+        elif cmd == "preset":
+            self._preset_do(c)
         elif cmd == "trigger":
             self.trigger(c["name"], c["on"])
         elif cmd == "latch":
@@ -1412,6 +1710,728 @@ class Controller:
             self._clock_lock = None
             self.mclock.reset()
 
+    # ================================================================ TIMELINE (timeline.py)
+    # Automation is a layer of its own (self._auto: param -> value, the target instead of the fader's base), so the
+    # faders, scenes and morphs are never written by the timeline: RELEASE glides every param back to its fader.
+    # Order in update(): clock -> pending recall -> autopilot -> morph -> TIMELINE -> slew + mods -> bypass -> triggers,
+    # so slew, mods, bypass, the governor (frame values) and PANIC all still apply on top of it.
+
+    def _changed(self):
+        """Something the show file holds changed (autosave is debounced in _step_shows)."""
+        if self.shows is not None:
+            t = self.now()
+            self._show_dirty_t = t
+            if self._show_first_t is None:
+                self._show_first_t = t
+            self.shows.dirty = True
+
+    def _tl_touch(self, name):
+        """A performer move (set() from the panel, MIDI, cue channel). On an automated param while the timeline drives
+        it: that lane is overridden (TOUCH: until TL_HOLD s after the last move, then it glides back; LATCH: until
+        RE-ENABLE). While RECORD is armed and the transport runs: the move is written into the lane."""
+        tl = self.tl
+        if name not in TL_CTX.params:
+            return
+        if self.tl_engaged and name in tl.by_param:
+            self._tl_ovr[name] = [self._tl_clock, None, 0.0, False]
+        if not tl.recording():
+            return
+        pos = tl.pos
+        g = self._rec_g.get(name)
+        if g is None:
+            lane = tl.by_param.get(name)                # compiled before any write: the old curve, kept for the anchors
+            tr = tl.ensure_lane(name)
+            if tr is None:
+                return
+            eps = _tl.EPS[tl.units]
+            old = _tl.lane_value(lane, pos) if lane is not None else None
+            if old is not None and pos - eps > 0:     # the curve before the gesture stays as it was
+                tl.write_key(tr, pos - eps, old, pos - eps - 1e-9)
+            g = self._rec_g[name] = dict(tr=tr, a=max(0.0, pos - eps), last=pos - eps, w=-1e18, old=lane)
+            self._tl_ovr[name] = [self._tl_clock, None, 0.0, False]
+        g["touch"] = self._tl_clock
+        self._tl_rec_write(name, g, force=True)
+
+    def _tl_rec_write(self, name, g, force=False):
+        tl = self.tl
+        pos = tl.pos
+        if pos <= g["last"] or (not force and pos - g["w"] < _tl.REC_GAP[tl.units]):
+            return
+        if force and pos - g["w"] < _tl.REC_GAP[tl.units] and g["w"] > -1e17:
+            for it in reversed(g["tr"]["items"]):     # thin: move the newest key of this gesture instead of adding one
+                if it["t"] == g["w"]:
+                    it["v"] = self.base[name]
+                    self._rec_dirty = True
+                    return
+        tl.write_key(g["tr"], pos, self.base[name], g["last"])
+        g["last"] = g["w"] = pos
+        self._rec_dirty = True
+
+    def _tl_gesture_end(self, name, g, pos):
+        tl = self.tl
+        if tl.ovr_mode == "latch" and pos > g["last"]:   # LATCH: the held value runs right up to the end of the take
+            tl.write_key(g["tr"], pos, self.base[name], g["last"])
+        if g["old"] is not None and g["old"].ts:         # after the take (touch release, punch-out, stop) the old
+            eps = _tl.EPS[tl.units]                      # curve carries on exactly as it was
+            t = min(tl.data["length"], pos + eps)
+            if t > g["last"]:
+                tl.write_key(g["tr"], t, _tl.lane_value(g["old"], t), max(g["last"], pos))
+        tl.simplify_range(g["tr"], g["a"] + 1e-9, pos)
+        self._rec_dirty = True
+
+    def _tl_pass_start(self):
+        """A record pass begins (RECORD armed and the transport running): one undo step for the whole pass."""
+        self.tl.snapshot()
+        self._rec_g, self._rec_trig, self._rec_ids = {}, {}, set()
+
+    def _tl_pass_end(self, pos=None):
+        tl = self.tl
+        if tl is None:
+            return
+        pos = tl.pos if pos is None else pos
+        for name, g in list(self._rec_g.items()):
+            self._tl_gesture_end(name, g, pos)
+        for name, t0 in self._rec_trig.items():
+            it = tl.add_item("trigger", {"t": t0, "len": max(pos - t0, _tl.REC_GAP[tl.units]), "name": name})
+            if it:
+                self._rec_ids.add(it["id"])
+        self._rec_g, self._rec_trig = {}, {}
+        if self._rec_dirty:
+            tl.compile()
+            self._rec_dirty = False
+            self._changed()
+
+    def _step_timeline(self, dt):
+        tl = self.tl
+        self._tl_clock += dt
+        clock = self._tl_clock
+        beat = self.beat
+        if tl.units == "beats":                        # follow the show clock (tap / MIDI clock / Link) beat for beat
+            prev, self._tl_beat = self._tl_beat, beat
+            d = 0.0 if prev is None else beat - prev
+            if not 0.0 <= d <= dt * BPM_MAX / 60.0 * 2.0 + 1e-9:
+                d = dt * self.bpm / 60.0               # the clock jumped (DOWNBEAT, song position): run at tempo
+        else:
+            d = dt
+        p0 = tl.pos
+        rec = tl.recording()
+        if tl.playing:
+            self._tl_firing = True
+            try:
+                for tr, it in tl.advance(d):
+                    self._tl_fire(tr, it)
+            finally:
+                self._tl_firing = False
+        wrapped = tl.pos < p0
+        if rec and (wrapped or not tl.recording()):    # loop wrap, punch-out, end: close the take where it ended
+            lp, pu = tl.data["loop"], tl.data["punch"]
+            end = lp["b"] if wrapped else (pu["b"] if pu["on"] and tl.pos >= pu["b"] else tl.pos)
+            if wrapped and tl.rec_mode == "replace":
+                tl.clear_range(("cue", "trigger"), p0, end, self._rec_ids)
+            self._tl_pass_end(end)
+            if wrapped and tl.recording():
+                self._rec_ids = set()
+        # trigger spans (declarative: a pure function of the position; only while the transport runs)
+        th = self._tl_trig
+        th.clear()
+        if tl.playing and tl.trig:
+            ids = set()
+            for it in tl.active_triggers(tl.pos, self._tl_buf):
+                i, n = it["id"], it["name"]
+                ids.add(i)
+                if i not in self._tl_span_ids:         # the span starts now
+                    ok = True
+                    if n in _tl.FLASHY:
+                        ok = clock - self._tl_flash_t >= TL_FLASH_GAP and not (
+                            n == "strobe" and self.bpm / 60.0 / max(self.strobe_rate, 1e-6) > TL_SAFE_HZ)
+                        if ok:
+                            self._tl_flash_t = clock
+                    if not ok:
+                        self._tl_blocked.add(i)
+                        self.tl_limited += 1
+                    elif n in self.env:
+                        self.env[n] = 1.0
+                if n == "strobe" and self.bpm / 60.0 / max(self.strobe_rate, 1e-6) > TL_SAFE_HZ and i not in self._tl_blocked:
+                    self._tl_blocked.add(i)
+                    self.tl_limited += 1
+                if i not in self._tl_blocked:
+                    th.add(n)
+            self._tl_span_ids = ids
+            self._tl_blocked &= ids
+        elif self._tl_span_ids:
+            self._tl_span_ids, self._tl_blocked = set(), set()
+        # automation layer
+        au = self._auto
+        if self.tl_engaged:
+            for lane in tl.lanes:
+                n = lane.param
+                v = None if lane.mute else _tl.lane_value(lane, tl.pos)
+                if v is None:
+                    if n in au and n in LUMA:
+                        pv, b, step = au[n], self.base[n], TL_LUMA_RATE * (lane.hi - lane.lo) * dt
+                        if abs(b - pv) > step:
+                            au[n] = pv + (step if b > pv else -step)
+                            continue
+                    au.pop(n, None)
+                    continue
+                o = self._tl_ovr.get(n)
+                if o is not None:
+                    if not o[3] and (tl.ovr_mode == "latch" or clock - o[0] < self.tl_hold):
+                        au.pop(n, None)                # the performer has it
+                        continue
+                    if o[1] is None:
+                        o[1], o[2] = self.base[n], clock
+                    f = (clock - o[2]) / TL_GLIDE
+                    if f >= 1.0:
+                        del self._tl_ovr[n]
+                    else:
+                        v = o[1] + (v - o[1]) * f * f * (3.0 - 2.0 * f)
+                if n in LUMA:                          # photosensitive: no luminance swing faster than 0.2 s
+                    pv = au[n] if n in au else self.base[n]
+                    step = TL_LUMA_RATE * (lane.hi - lane.lo) * dt
+                    v = pv + step if v > pv + step else (pv - step if v < pv - step else v)
+                au[n] = v
+            if len(au) > len(tl.lanes) or any(n not in tl.by_param for n in au):
+                for n in [n for n in au if n not in tl.by_param]:
+                    del au[n]
+        if self._tl_fade:                              # RELEASE: glide from the automation value back to the fader
+            for n, (v0, t0) in list(self._tl_fade.items()):
+                f = (clock - t0) / TL_GLIDE
+                if f >= 1.0 or self.tl_engaged:
+                    del self._tl_fade[n]
+                    if not self.tl_engaged:
+                        au.pop(n, None)
+                else:
+                    au[n] = v0 + (self.base[n] - v0) * f * f * (3.0 - 2.0 * f)
+        # recording bookkeeping
+        if rec and tl.playing and not wrapped:
+            for name, g in list(self._rec_g.items()):
+                if tl.ovr_mode == "touch" and clock - g.get("touch", clock) >= self.tl_hold:
+                    self._tl_gesture_end(name, g, tl.pos)
+                    del self._rec_g[name]
+                else:
+                    self._tl_rec_write(name, g)        # held still: keeps writing (and replacing) as the playhead runs
+            if tl.rec_mode == "replace" and tl.pos > p0:
+                if tl.clear_range(("cue", "trigger"), p0, tl.pos, self._rec_ids):
+                    self._rec_dirty = False             # clear_range compiled
+        if self._rec_dirty and (not rec or clock - self._rec_compile_t >= 0.25):
+            self._rec_compile_t = clock
+            self._rec_dirty = False
+            tl.compile()
+            self._changed()
+
+    def _tl_fire(self, tr, it):
+        """A discrete item the playhead crossed (cue, event, text). Already validated when it was placed / loaded."""
+        k = tr["kind"]
+        if k == "cue":
+            self._tl_last_cue = it["id"]
+            if self._tl_clock - self._tl_cue_t < TL_FLASH_GAP:     # photosensitive: no rapid hard cuts
+                it = dict(it, morph=max(it["morph"], TL_FLASH_GAP * self.bpm / 60.0 / 4.0))
+            self._tl_cue_t = self._tl_clock
+            if it["kind"] == "scene":
+                if self.scenes[it["slot"]] is not None:
+                    self._start_recall(it["slot"], it["morph"])
+                    if self.auto["on"]:
+                        self._auto_next = self.beat + self.auto["bars"] * 4.0
+            elif self.shows is not None:
+                p = self.shows.cache.get(it["preset"])
+                if p is not None:
+                    self._apply_preset(p, {"groups": it.get("groups"), "morph": it["morph"]})
+                else:                                   # not prefetched (yet): load now, applied when it arrives
+                    self.shows.submit("preset_load", ref=it["preset"], opts={"groups": it.get("groups"), "morph": it["morph"]})
+        elif k == "event":
+            c = dict(it["cmd"])
+            if c["cmd"] == "bypass":                       # photosensitive: a layer cannot blink faster than 2.5 Hz
+                last = self._tl_byp_t.get(c["key"], -1e9)
+                if self._tl_clock - last < TL_FLASH_GAP:
+                    self.tl_limited += 1
+                    return
+                self._tl_byp_t[c["key"]] = self._tl_clock
+            if c["cmd"] in CONTROL_CMDS:
+                self._do(c)
+            else:
+                self._out.append(c)
+        elif k == "text" and self.text is not None:
+            try:
+                self.text.do(_VALIDATORS["text"]({"cmd": "text", "text": it["text"]}))
+            except Exception:
+                pass
+
+    def _tl_chase(self):
+        """Play / seek: bring back the state the timeline would have at this position (latest cue with a short
+        crossfade, latest text, latest bypass per key, latest media pick). Flashes and one-shots are never chased."""
+        tl = self.tl
+        if not tl.data["chase"]:
+            return
+        self._tl_firing = True
+        try:
+            for tr, it in tl.chase_items(tl.pos, inclusive=not tl.playing):
+                if tr["kind"] == "cue":
+                    if it["id"] == self._tl_last_cue:
+                        continue
+                    it = dict(it, morph=min(it["morph"], TL_CHASE_S * self.bpm / 60.0 / 4.0))
+                self._tl_fire(tr, it)
+        finally:
+            self._tl_firing = False
+
+    def _tl_home(self):
+        lp = self.tl.data["loop"]
+        return lp["a"] if lp["on"] else 0.0
+
+    def _tl_release(self):
+        """Hand every automated param back to its fader (gliding over TL_GLIDE s)."""
+        for n, v in self._auto.items():
+            self._tl_fade[n] = [v, self._tl_clock]
+        self.tl_engaged = False
+        self._tl_ovr.clear()
+
+    def _tl_docs_all(self):
+        docs = list(self.tl_docs)
+        docs[self.tl_i] = self.tl.to_json()
+        return docs
+
+    def _tl_load_docs(self, docs, active=0):
+        docs = [d for d in docs if isinstance(d, dict)][:_tl.MAX_TIMELINES] or [_tl.empty()]
+        active = min(max(0, int(active)), len(docs) - 1)
+        self._tl_pass_end()
+        self.tl.playing = self.tl.rec = False
+        self.tl.pos = 0.0
+        self.tl.load(docs[active])
+        docs[active] = None
+        self.tl_docs, self.tl_i = docs, active
+        self.tl_engaged = False
+        self._tl_release()
+        self._tl_last_cue = None
+        self._tl_prefetch()
+
+    def _tl_prefetch(self):
+        if self.shows is not None and self.shows.enabled:
+            refs = self.shows._preset_cues(self.tl.data)
+            if any(r not in self.shows.cache for r in refs):
+                self.shows.submit("prefetch", refs=refs)
+
+    def _tl_do(self, c):
+        tl, op = self.tl, c["op"]
+        if op == "play":
+            if "t" in c:
+                self._tl_pass_end()
+                tl.seek(c["t"])
+            if tl.pos >= tl.data["length"]:
+                tl.seek(self._tl_home())
+            if not tl.playing:
+                tl.playing, self.tl_engaged, self._tl_beat = True, True, None
+                self._tl_last_cue = None
+                self._tl_chase()
+                if tl.rec:
+                    self._tl_pass_start()
+        elif op == "stop":                             # first STOP pauses, the second returns to the start
+            if tl.playing:
+                self._tl_pass_end()
+                tl.playing = False
+            else:
+                tl.seek(self._tl_home())
+                self._tl_last_cue = None
+        elif op == "home":
+            self._tl_pass_end()
+            tl.seek(self._tl_home())
+            self._tl_last_cue = None
+            if tl.playing:
+                self._tl_chase()
+                if tl.rec:
+                    self._tl_pass_start()
+        elif op == "seek":
+            self._tl_pass_end()
+            tl.seek(c["t"])
+            self.tl_engaged = True
+            self._tl_fade.clear()
+            self._tl_chase()
+            if tl.playing and tl.rec:
+                self._tl_pass_start()
+        elif op == "rec":
+            if c["on"] and not tl.rec:
+                tl.rec = True
+                if tl.playing:
+                    self._tl_pass_start()
+            elif not c["on"] and tl.rec:
+                self._tl_pass_end()
+                tl.rec = False
+        elif op == "rec_mode":
+            tl.rec_mode = c["mode"]
+        elif op == "ovr_mode":
+            tl.ovr_mode = c["mode"]
+        elif op == "reenable":                         # every overridden lane glides back to its automation
+            for o in self._tl_ovr.values():
+                o[3] = True
+        elif op == "release":
+            self._tl_release()
+        elif op == "hold":
+            self.tl_hold = c["s"]
+        elif op == "units":
+            self._tl_pass_end()
+            if tl.convert_units(c["units"], self.bpm):
+                self._tl_beat = None
+        elif op in ("tl_new", "tl_dup", "tl_select", "tl_delete"):
+            docs = self._tl_docs_all()
+            i = self.tl_i
+            if op == "tl_new" and len(docs) < _tl.MAX_TIMELINES:
+                d = _tl.empty(tl.units)
+                d["name"] = f"Timeline {len(docs) + 1}"
+                docs.insert(i + 1, d)
+                i += 1
+            elif op == "tl_dup" and len(docs) < _tl.MAX_TIMELINES:
+                d = json.loads(json.dumps(docs[i]))
+                d["name"] = (d.get("name") or "Timeline")[:34] + " copy"
+                docs.insert(i + 1, d)
+                i += 1
+            elif op == "tl_select" and c["i"] < len(docs):
+                if c["i"] == i:
+                    return
+                i = c["i"]
+            elif op == "tl_delete" and len(docs) > 1 and c["i"] < len(docs):
+                del docs[c["i"]]
+                i = min(i if c["i"] > i else max(0, i - 1), len(docs) - 1)
+            self._tl_load_docs(docs, i)
+        else:
+            self._tl_pass_end()
+            if tl.do(c):
+                self._tl_prefetch()
+
+    def _tl_state(self):
+        tl = self.tl
+        r = lambda x: round(x, 4)
+        d = tl.data
+        out = dict(playing=tl.playing, rec=tl.rec, pos=r(tl.pos), units=d["units"], length=d["length"], rev=tl.rev,
+                   engaged=self.tl_engaged, rec_mode=tl.rec_mode, ovr_mode=tl.ovr_mode, name=d.get("name", ""),
+                   next=[[r(t), lab] for t, lab in tl.upcoming(3)], active=self.tl_i)
+        # only what is not at its default (a phone polls this once a second)
+        for k in ("loop", "punch"):
+            if d[k]["on"]:
+                out[k] = dict(d[k])
+        opt = dict(recording=tl.recording(), auto=sorted(self._auto), overrides=sorted(self._tl_ovr),
+                   held=sorted(self._tl_trig), limited=self.tl_limited, section=tl.section(), audio=d["audio"],
+                   chase=not d["chase"] and "off", hold=self.tl_hold != TL_HOLD and self.tl_hold)
+        out.update({k: v for k, v in opt.items() if v})
+        if len(self.tl_docs) > 1:
+            out["timelines"] = [x.get("name", "") if x is not None else d.get("name", "") for x in self.tl_docs]
+        return out
+
+    def _blobs(self):
+        """Big documents the panel fetches only when their rev changes: built here at most every 0.5 s while a
+        record pass runs (json of the timeline), the listings on the shows worker."""
+        out = {}
+        if self.tl is not None:
+            rev = self.tl.rev
+            if rev != self._tl_blob[0] and (not self.tl.recording() or self._tl_clock - self._tl_blob_t >= 0.5):
+                self._tl_blob_t = self._tl_clock
+                try:
+                    self._tl_blob = (rev, json.dumps(self.tl.data, allow_nan=False, separators=(",", ":")).encode())
+                except (TypeError, ValueError):
+                    pass
+            out["timeline"] = self._tl_blob
+        if self.shows is not None:
+            out.update(self.shows.blobs)
+        return out
+
+    # ================================================================ SHOWS + PRESETS (shows.py)
+
+    def _show_snapshot(self):
+        """Cheap copies of everything the controller owns, for the worker to serialize (GL thread, ~1 ms)."""
+        docs = []
+        if self.tl is not None:                        # the inactive timelines are never mutated: no copy needed
+            docs = list(self.tl_docs)
+            rev, data = self._tl_blob
+            docs[self.tl_i] = json.loads(data) if rev == self.tl.rev and data != b"{}" else self.tl.to_json()
+        st = copy.deepcopy(self._settings())
+        st["ext"] = {k: v for k, v in st.get("ext", {}).items() if k != "online"}
+        return dict(controller=dict(base={n: self.base[n] for n in CONT}, mods=_copy_mods(self.mods), cur=self.cur,
+                                    scenes=copy.deepcopy(self.scenes), settings=st),
+                    midi=[dict(b) for b in self.midi.bindings], timeline=docs[self.tl_i] if docs else None,
+                    timelines=docs, timeline_active=self.tl_i)
+
+    def _show_autosave(self):
+        m = self.shows
+        self._show_dirty_t = self._show_first_t = None
+        m.submit("autosave", snap=self._show_snapshot(), slug=m.current, name=m.current_name)
+
+    def _step_shows(self, now):
+        m = self.shows
+        if not m.enabled:
+            return
+        if m._thread is None:
+            m.run_sync()
+        for kind, payload in m.poll():
+            if kind == "saved":
+                m.current, m.current_name = payload["slug"], payload["name"]
+                if self._show_dirty_t is None or self._show_dirty_t <= self._save_req_t:
+                    m.dirty = False
+                    self._show_dirty_t = self._show_first_t = None
+            elif kind == "opened":
+                self._apply_show(payload)
+            elif kind == "session":
+                if payload.get("timelines") and self.tl is not None:
+                    self._tl_load_docs(payload["timelines"], payload.get("timeline_active", 0))
+                m.current, m.current_name = payload["slug"], payload["name"]
+                m.thumbs = {i: 1 for i in payload.get("thumbs", [])}
+            elif kind == "preset":
+                ref, p, opts = payload
+                self._apply_preset(p, opts)
+            elif kind == "thumb":
+                m.rev["thumbs"] += 1
+                m.thumbs[payload] = m.rev["thumbs"]
+            elif kind == "thumb_gone":
+                m.thumbs.pop(payload, None)
+        t = self._show_dirty_t
+        if t is not None and (now - t >= SHOW_DEBOUNCE or now - self._show_first_t >= SHOW_MAX_WAIT):
+            if not (self.tl is not None and self.tl.recording()) or now - self._show_first_t >= 2 * SHOW_MAX_WAIT:
+                self._show_autosave()
+
+    def _show_do(self, c):
+        m, op = self.shows, c["op"]
+        if m is None:
+            return
+        self._save_req_t = self.now()
+        if op == "save":
+            if m.current is None:
+                op, c = "save_as", dict(c, name=m.current_name, template=False)
+            else:
+                m.submit("save", snap=self._show_snapshot(), name=m.current_name, slug=m.current, media=c["media"])
+                return
+        if op == "save_as":
+            m.submit("save", snap=self._show_snapshot(), name=c["name"], slug=None, media=c["media"],
+                     template=c["template"])
+        elif op == "open":
+            m.submit("open", slug=c["slug"], recover=c["recover"], backup=c.get("backup"),
+                     parts=c.get("parts") or list(SHOW_DEFAULT_PARTS))
+        elif op == "new":
+            self._new_show(c["from"], c.get("slug"), c.get("parts"))
+        elif op == "delete":
+            if c["slug"] == m.current:
+                m.current, m.current_name = None, "Untitled"
+                m.submit("session_clear")
+            m.submit("delete_show", slug=c["slug"])
+        elif op == "rescan":
+            m.submit("rescan")
+
+    def _new_show(self, src, slug=None, parts=None):
+        m = self.shows
+        if src == "template":
+            m.submit("open", slug=slug, parts=parts or [p for p in _shows.PARTS if p not in ("midi", "mapping")],
+                     template=True)
+            return
+        if self.tl is not None:
+            self._tl_load_docs([_tl.empty(self.tl.units)])
+        if src == "factory":
+            self._do(dict(cmd="init"))
+            self.bypass, self._byp = set(), {}
+        elif src == "clean":
+            self.new_canvas()
+        if src in ("factory", "clean"):
+            self.scenes, self._scenes_ok = factory_scenes(), True
+            self.cur = -1
+            self._save_scenes()
+            for i in list(m.thumbs):
+                m.submit("scene_thumb_clear", slot=i)
+        m.current, m.current_name, m.missing = None, "Untitled", []
+        m.submit("session_clear")
+        self._changed()
+        m.say("ok", "new show" + {"clean": " on a clean canvas", "factory": " from the factory looks",
+                                  "current": " from what is on now"}.get(src, ""))
+
+    def _morph_base(self, to, names, bars):
+        """Glide the fader bases of `names` to `to` over `bars` (0 = snap), like a scene recall that is no scene."""
+        if bars <= 0:
+            for n in names:
+                self.base[n] = to[n]
+            if self._morph:
+                self._morph["names"] -= set(names)
+            return
+        tgt = dict(self.base)
+        tgt.update({n: to[n] for n in names})
+        self._morph = dict(src={n: self.base[n] for n in CONT}, to=tgt, names=set(names), start=self.beat,
+                           dur=bars * 4.0, old=[(self.mods, 1.0)] if self.mods else [], t=0.0)
+
+    def _apply_show(self, plan):
+        """An opened show (cleaned on the worker) -> live. Only the asked-for parts; the rig (mapping, MIDI) only when
+        asked. Commands for the engine (surfaces, recorder, camera, governor) go out validated, like the panel's."""
+        m, parts = self.shows, set(plan.get("parts") or SHOW_DEFAULT_PARTS)
+        bars = self.morph_bars                         # the performer's crossfade now, not the one the show brings
+        self.pending = None
+        if "timeline" in parts and self.tl is not None and plan.get("timelines"):
+            self._tl_load_docs(plan["timelines"], plan.get("timeline_active", 0))
+        st = dict(plan.get("settings") or {})
+        look_keys = ("stack", "bypass", "canvas", "skins")
+        if "look" not in parts:
+            st = {k: v for k, v in st.items() if k not in look_keys}
+        if "settings" not in parts:
+            st = {k: v for k, v in st.items() if k in look_keys}
+        ext = st.pop("ext", None)
+        if st:
+            self._apply_state({"settings": st})
+        if "settings" in parts and isinstance(ext, dict):
+            for k, v in ext.items():
+                self.ext[k] = v
+            if "camera" in ext:
+                try:
+                    import camera_layer
+                    self._out.append(camera_layer.validate_command(dict(ext["camera"], cmd="camera", op="set")))
+                except Exception:
+                    pass
+            if "governor" in ext:
+                try:
+                    import governor
+                    self._out.append(governor.validate_command({"cmd": "gov", "op": "mode", "mode": ext["governor"]["mode"]}))
+                except Exception:
+                    pass
+        if "look" in parts and plan.get("look"):
+            lk = plan["look"]
+            old_mods = self.mods
+            self._morph_base(lk["base"], CONT, bars)
+            if self._morph:
+                self._morph["old"] = [(old_mods, 1.0)] if old_mods else []
+            self.mods = _copy_mods(lk["mods"])
+            self.cur = lk["cur"]
+        if "scenes" in parts and plan.get("scenes"):
+            self.scenes, self._scenes_ok = plan["scenes"], True
+            if not 0 <= self.cur < N_SCENES or self.scenes[self.cur] is None:
+                self.cur = -1
+            self._save_scenes()
+            m.rev["thumbs"] += 1
+            m.thumbs = {i: m.rev["thumbs"] for i in plan.get("thumbs", [])}
+        if "midi" in parts and plan.get("midi") is not None:
+            self.midi.bindings = [dict(b) for b in plan["midi"]]
+            self.midi.save()
+        if "mapping" in parts and plan.get("mapping"):
+            self._out.append(dict(plan["mapping"]))
+        if "recorder" in parts and plan.get("recorder"):
+            self._out.append(dict(plan["recorder"]))
+        if plan.get("template"):
+            m.current, m.current_name = None, plan["name"] + " (new)"
+            self._changed()
+        elif not plan.get("switch", True):
+            self._changed()                            # parts of another show merged into this one
+        else:
+            m.current, m.current_name, m.dirty = plan["slug"], plan["name"], False
+            self._show_dirty_t = self._show_first_t = None
+        m.missing = list(plan.get("missing") or [])
+        m.say("warn" if m.missing else "ok", f"opened '{plan['name']}'" + (
+            f": {len(m.missing)} media file(s) missing" if m.missing else ""))
+
+    def _preset_do(self, c):
+        m, op = self.shows, c["op"]
+        if m is None:
+            return
+        if op == "save":
+            p = self._preset_data(c)
+            if p is None:
+                m.say("error", "nothing to save for that preset")
+                return
+            snap_t = None
+            if self.thumbs and c["kind"] in ("look", "layer", "fx", "mapping"):
+                self._out.append(passthrough("snapshot"))  # thumbnail: one low-res frame of the output
+                snap_t = time.time()
+            m.submit("preset_save", preset=p, snap_t=snap_t)
+        elif op == "recall":
+            opts = {"groups": c.get("groups"), "morph": c["morph"]}
+            p = m.cache.get(c["ref"])
+            if p is not None:
+                self._apply_preset(p, opts)
+            else:
+                m.submit("preset_load", ref=c["ref"], opts=opts)
+        elif op == "set":
+            m.submit("preset_set", ref=c["ref"], name=c.get("name"), tags=c.get("tags"), fav=c.get("fav"))
+        elif op == "delete":
+            m.submit("preset_delete", ref=c["ref"])
+        elif op == "rescan":
+            m.submit("rescan", what=("presets",))
+
+    def _preset_data(self, c):
+        """The preset as JSON-able data (copies), cleaned again on the worker (shows.clean_preset)."""
+        kind, g = c["kind"], c.get("groups")
+        keep = (lambda n: PARAMS[n][3] in g) if g else (lambda n: True)
+        data = {}
+        if kind == "look":
+            names = [n for n in CONT if n != "master" and keep(n)]
+            data["values"] = {n: self.base[n] for n in names}
+            data["mods"] = {n: p for n, p in _copy_mods(self.mods).items() if n in data["values"]}
+            if self.stack is not None and (not g or "layers" in g):
+                data["stack"] = self.stack.to_json()
+            if self.skins is not None and self.skins.any() and (not g or "layers" in g):
+                data["skins"] = self.skins.to_json()   # "skin preset": a look preset carries the skins it was saved with
+        elif kind == "layer":
+            if c.get("stack_id") is not None:
+                lay = self.stack.find(c["stack_id"]) if self.stack is not None else None
+                if lay is None:
+                    return None
+                data["stack_layer"] = copy.deepcopy(lay)
+                data["values"] = {}
+            else:
+                names = _shows.layer_params(c["layer"])
+                data["layer"] = c["layer"]
+                data["values"] = {n: self.base[n] for n in names}
+            data["mods"] = {n: p for n, p in _copy_mods(self.mods).items() if n in data["values"]}
+        elif kind == "fx":
+            data["values"] = {n: self.base[n] for n in _shows.fx_params() if keep(n)}
+            data["mods"] = {n: p for n, p in _copy_mods(self.mods).items() if n in data["values"]}
+        elif kind == "mod":
+            data["mods"] = {n: p for n, p in _copy_mods(self.mods).items() if keep(n)}
+        elif kind == "mapping":
+            data["surfaces"] = None                    # read from surfaces.json on the worker
+        elif kind == "midi":
+            data["bindings"] = [dict(b) for b in self.midi.bindings]
+        return {"format": _shows.PRESET_FORMAT, "version": _shows.PRESET_VERSION, "kind": kind, "name": c["name"],
+                "tags": c.get("tags") or [], "fav": False, "created": time.time(), "data": data}
+
+    def _apply_preset(self, p, opts):
+        """A clean preset -> live. groups = partial recall (only those param groups); morph in bars (0 = snap)."""
+        kind, d = p["kind"], p["data"]
+        groups = opts.get("groups")
+        keep = (lambda n: PARAMS[n][3] in groups) if groups else (lambda n: True)
+        bars = float(opts.get("morph") or 0.0)
+        if kind in ("look", "layer", "fx"):
+            vals = {n: v for n, v in d.get("values", {}).items() if n in CONT and keep(n)}
+            if vals:
+                old_mods = _copy_mods(self.mods)
+                self._morph_base(vals, list(vals), bars)
+                if self._morph:
+                    self._morph["old"] = [(old_mods, 1.0)] if old_mods else []
+                for n in vals:                         # the preset's modulation replaces what those params had
+                    pair = d.get("mods", {}).get(n)
+                    if pair:
+                        self.mods[n] = [dict(x) if x else None for x in pair]
+                    else:
+                        self.mods.pop(n, None)
+                self.cur = -1
+            if self.stack is not None and kind == "look" and "stack" in d and (not groups or "layers" in groups):
+                self._stack_morph = False
+                self.stack.morph_cancel()
+                if bars > 0 and self._morph:
+                    self.stack.morph_start(d["stack"])
+                    self._stack_morph = True
+                else:
+                    self.stack.load(d["stack"])
+            if self.skins is not None and kind == "look" and "skins" in d and (not groups or "layers" in groups):
+                self.skins.load(d["skins"])
+            if self.stack is not None and kind == "layer" and "stack_layer" in d:
+                lay = d["stack_layer"]
+                self.stack.add(lay.get("gen", 0), lay)
+        elif kind == "mod":
+            mods = {n: pr for n, pr in d.get("mods", {}).items() if n in CONT and keep(n)}
+            if not groups:
+                self.mods = {}
+            else:
+                for n in [n for n in self.mods if keep(n)]:
+                    self.mods.pop(n)
+            for n, pair in mods.items():
+                self.mods[n] = [dict(x) if x else None for x in pair]
+        elif kind == "mapping":
+            m = _shows.clean_surfaces(d.get("surfaces"))
+            if m is not None:
+                self._out.append(m)
+        elif kind == "midi":
+            self.midi.bindings = [dict(b) for b in d.get("bindings", [])]
+            self.midi.save()
+        self._changed()
+
     # ---------------------------------------------------------------- MIDI (drained inside update)
 
     def _midi_in(self, now):
@@ -1512,6 +2532,13 @@ class Controller:
                     self.stack.midi(t[0], t[1], val / 127.0, rel=rel)
                 else:
                     self.stack.midi(t[0], t[1], 1.0 if press else 0.0, press=edge)
+        elif p[0] == "skin":                           # a knob on a skin slot's field (a pad steps a stepped field)
+            t = _skins.parse_target(target) if self.skins is not None else None
+            if t and kind == "cc":
+                rel = (val if val < 64 else val - 128) if b.get("mode") == "rel" else None
+                self.skins.midi(t[0], t[1], t[2], val / 127.0, rel=rel)
+            elif t and kind == "note_on" and t[2] in _skins.INT:
+                self.skins.midi(t[0], t[1], t[2], 1.0, press=edge)
         elif target == "xfade":
             if kind == "cc":                           # soft takeover: a physical fader that is somewhere else does
                 v, last, cur = val / 127.0, self._xf_cc, self.xfade["x"]     # nothing until it reaches the position
@@ -1644,6 +2671,11 @@ class Controller:
             self._manual_recall(i)                     # before autopilot, which then stands down for a period
         self._step_autopilot(dt)
         self._step_morph()
+        if self.tl is not None:
+            try:
+                self._step_timeline(dt)
+            except Exception:
+                pass
 
         try:
             b = [float(x) for x in list(bands)[:3]] if bands is not None else []
@@ -1657,9 +2689,10 @@ class Controller:
         w_new = mo["t"] if mo else 1.0
         drift_amt = self.auto["drift_amt"] if self.auto["drift"] else 0.0
         vals = {}
+        au = self._auto
         for n in CONT:
             lo, hi = PARAMS[n][0], PARAMS[n][1]
-            target = self.base[n]
+            target = au[n] if n in au else self.base[n]   # timeline automation (its own layer) wins over the fader
             if n == "palette" and self.glide_bars > 0:
                 if target != self._pal_target:         # new destination: cross the gap in glide_bars
                     self._pal_target = target
@@ -1686,16 +2719,18 @@ class Controller:
                 vals[n] += (_params.NEUTRAL[n] - vals[n]) * w
 
         decay = math.exp(-dt / ENV_TAU)
+        th = self._tl_trig                             # trigger spans the timeline holds this frame
         for n in self.env:
-            self.env[n] = 1.0 if self.held[n] else (self.env[n] * decay if self.env[n] > 2e-3 else 0.0)
+            self.env[n] = 1.0 if (self.held[n] or n in th) else (self.env[n] * decay if self.env[n] > 2e-3 else 0.0)
         gate = 1.0 if (beat / self.strobe_rate) % 1.0 < 0.5 else 0.0
         for n in TRIGGERS:
+            hn = self.held[n] or n in th
             if n in self.env:
                 v = max(self.base[n], self.env[n])
             elif n == "strobe":
-                v = gate if (self.held[n] or self.base[n] > 0) else 0.0
+                v = gate if (hn or self.base[n] > 0) else 0.0
             else:
-                v = 1.0 if self.held[n] else self.base[n]
+                v = 1.0 if hn else self.base[n]
             vals[n] = min(1.0, max(0.0, v))
         self.values = {n: vals[n] for n in PARAMS}     # PARAMS order
         if self.stack is not None:                     # math stack: phases (float64) + modulated fields -> stack.frame
@@ -1705,10 +2740,22 @@ class Controller:
                                 source=lambda m, name, slot: self._source(m, name, slot, beat))
             except Exception:
                 pass
+        if self.skins is not None and (self.skins.frame or self.skins.gen is not None):   # nothing skinned: not even a call
+            try:
+                self.skins.step(dt, None, source=lambda m, name, slot: self._source(m, name, slot, beat))
+                if self.skins.gen is not None:         # "generate a skin": sent only when calm + the worker is idle
+                    self.skins.gen_tick(now, self.ai.status(), self.ai.submit, strained=self.gov_level > 0)
+            except Exception:
+                pass
 
         if now - self._save_t >= AUTOSAVE_S:
             self._save_t = now
             self._autosave()
+        if self.shows is not None:
+            try:
+                self._step_shows(now)
+            except Exception:
+                pass
         if now - self._led_t >= 0.08:
             self._led_t = now
             try:
@@ -1743,6 +2790,9 @@ class Controller:
     # ---------------------------------------------------------------- panel snapshot
 
     def state(self):
+        global _BLOB_OWNER
+        self.blob_cache = self._blobs()                # GET /timeline, /shows, /presets read these (see blob())
+        _BLOB_OWNER = weakref.ref(self)
         r = lambda x: round(x, 4)
         c = self._clock()
         mo = self._morph
@@ -1775,6 +2825,9 @@ class Controller:
             text=self.text.state() if self.text is not None else None,
             bypass=sorted(self.bypass), bypass_fade=self.bypass_fade,
             stack=self.stack.state() if self.stack is not None else None,
+            skins=self.skins.state() if self.skins is not None else None,
             canvas=dict(active=self.canvas_prev is not None, fresh=self.fresh),
             online=_online.state(self) if _online is not None else dict(on=False, missing=True),
+            tl=self._tl_state() if self.tl is not None else None,
+            show=self.shows.state() if self.shows is not None else None,
         )

@@ -264,11 +264,16 @@ PARAMS = {
     "crowd_beings":  (-1.0, 1.0, 0.0, "camera", "Beings follow hands"),   # + follow, - flee
     "crowd_ripples": (0.0, 1.0, 0.0, "camera", "Hand ripples"),    # fast hand moves spawn ripples (max 2 per second)
     "crowd_serpent": (0.0, 1.0, 0.0, "camera", "Serpent on arm"),  # serpent 1 rides the dancer's arm, head at the hand
+    # ---- image cycling (APPENDED 2026-11-25): the AI/image layer used to step to the next image every 12 s.
+    #      Default now HOLDS the current image; cycling only when the performer switches it on.
+    "img_auto":      (0.0, 1.0, 0.0, "layers", "Cycle images"),    # rounded: 0 hold the current image, 1 auto-cycle
+    "img_hold":      (5.0, 600.0, 60.0, "layers", "Image hold (s)"),  # seconds per image while cycling
 }
 
 # Option names for selectable (rounded) params that live here; index = rounded value - min. The panel shows them as a
 # dropdown / tiles (control.py merges this into its own OPTIONS table when it builds the panel meta).
 OPTIONS = {
+    "img_auto": ["Hold", "Cycle"],
     "being": ["Anaconda spirit", "Feathered dragon", "Jaguar spirit", "Hummingbird", "Butterflies & moths", "Jellyfish",
               "Manta rays", "Koi", "Firebird", "All-seeing eyes", "Light beings", "Jester sprites", "Octopus",
               "Spirit vine", "Fireflies", "Whale", "Kittens"],
@@ -280,6 +285,52 @@ OPTIONS = {
                   "Echo trails"],
     "crowd_mode": ["Bodies reveal", "Glow outline", "Patterns inside", "Knockout", "Motion trails", "Flow push"],
 }
+
+# ---- generative kené / kenê kuin STUDY layers (kene_real.KenePass), APPENDED 2026-11-25. Both layers default to 0
+#      (off = the pass is not rendered, the show is pixel-identical). These are procedural studies of the visual
+#      grammar documented in research/kene_reference/README.md, NOT kené: never label them as authentic. For public
+#      shows, credit and collaborate with the originating communities. ("l_kene" above is the unrelated Folding Blocks.)
+PARAMS.update({
+    "l_kene_shipibo":  (0.0, 1.0, 0.0, "layers", "Kené study (Shipibo-Konibo inspired)"),
+    "l_kene_hunikuin": (0.0, 1.0, 0.0, "layers", "Bead study (Huni Kuin inspired)"),
+    "kene_style":   (0.0, 4.0, 0.0, "kene", "Medium"),            # rounded: OPTIONS (light on black, mud-dyed cloth, ...)
+    "kene_colors":  (0.0, 5.0, 2.0, "kene", "Colours"),           # rounded: 0 follows the show palette
+    "kene_layout":  (0.0, 4.0, 0.0, "kene", "Field"),             # rounded: single panel, panels, band, medallion, follow the show
+    "kene_seed":    (0.0, 31.0, 0.0, "kene", "Design"),           # rounded: every number is a different generated design
+    "kene_scale":   (0.0, 1.0, 0.5, "kene", "Line density"),      # how many cells the field has
+    "kene_curve":   (0.0, 1.0, 0.25, "kene", "Straight / curving"),   # 0 rectilinear stepped lines .. 1 rounded, swirling
+    "kene_weight":  (0.0, 1.0, 0.5, "kene", "Line weight"),
+    "kene_fill":    (0.0, 1.0, 0.85, "kene", "Fine fill"),        # the third tier: fine lines filling every cell
+    "kene_draw":    (0.0, 1.0, 1.0, "kene", "Drawn"),             # 0 = empty field .. 1 = whole design (a pen draws it in)
+    "kene_pen":     (0.0, 4.0, 0.0, "kene", "Pen"),               # rounded: draw the design in over N bars, again and again
+    "kene_pen_new": (0.0, 1.0, 1.0, "kene", "Pen: next design"),  # rounded: a new design each time the pen starts over
+    "kene_flow":    (0.0, 1.0, 0.35, "kene", "Flowing light"),    # light travelling the primary lines, one train per bar
+    "kene_breathe": (0.0, 1.0, 0.3, "kene", "Breathing"),
+    "kene_glow":    (0.0, 1.0, 0.4, "kene", "Glow"),
+    "kene_chase":   (0.0, 1.0, 0.0, "kene", "Follow light chase"),
+    "hk_motif":     (0.0, 4.0, 0.0, "kene", "Bead motif (study)"),        # rounded: OPTIONS (names as in the reference README)
+    "hk_medium":    (0.0, 2.0, 0.0, "kene", "Bead medium"),       # rounded: glass beads, woven, painted
+    "hk_colors":    (0.0, 5.0, 1.0, "kene", "Bead colours"),      # rounded: 5 follows the show palette
+    "hk_cycle":     (0.0, 3.0, 0.0, "kene", "Motif morph"),       # rounded: morph to the next motif every N bars
+    "hk_size":      (0.0, 1.0, 0.5, "kene", "Bead count"),
+    "hk_seq":       (0.0, 1.0, 0.5, "kene", "Beads light in sequence"),
+    "hk_glow":      (0.0, 1.0, 0.4, "kene", "Bead glow"),
+})
+OPTIONS.update({     # the same lists as kene_real.OPTIONS (tests/test_kene_real.py keeps them equal)
+    "kene_style": ["Light on black", "Mud-dyed cloth", "Embroidery", "Ceramic", "Beadwork"],
+    "kene_colors": ["Follow show palette", "Cotton white", "Magenta / gold / red", "Gold / white / green",
+                    "Turquoise / white / magenta", "Red / violet / lime"],
+    "kene_layout": ["Single panel", "Panels", "Band", "Medallion", "Follow the show"],
+    "kene_seed": [str(i + 1) for i in range(32)],
+    "kene_pen": ["Off (Drawn fader)", "Draw in: 4 bars", "Draw in: 8 bars", "Draw in: 16 bars", "Draw in: 32 bars"],
+    "kene_pen_new": ["Same design", "New design each time"],
+    "hk_motif": ["txede bedu (study)", "dunu kenê (study)", "inu tae (study)", "inu tae txede bedu (study)",
+                 "kapë hina (study)"],
+    "hk_medium": ["Glass beads", "Woven", "Painted"],
+    "hk_colors": ["Black & white", "Red / yellow / white", "Blue / turquoise / orange", "Green / yellow / red",
+                  "All eight bead colours", "Follow show palette"],
+    "hk_cycle": ["Hold", "Morph every 8 bars", "Morph every 16 bars", "Morph every 32 bars"],
+})
 
 TRIGGERS = ["flash", "strobe", "invert", "freeze", "blackout", "punch"]   # momentary buttons in the panel / MIDI
 EVENTS = ["ripple"]                                                        # ("ripple", x, y)
@@ -384,6 +435,7 @@ NEUTRAL = {     # the value at which the param does nothing
 }
 NEUTRAL = {k: v for k, v in NEUTRAL.items() if k in PARAMS}
 BYPASS_KEEP = {  # bypass leaves these alone: "off" has no meaning (selectors, counts, sizes, colours, quality, triggers)
+    "img_auto", "img_hold",
     "master", "flash", "strobe", "invert", "freeze", "blackout", "punch",
     "symmetry", "folds", "speed", "flow_dir",
     "travel_mode", "depth_fog", "serpent_mode", "serpent_count", "serpent_segments", "serpent_speed", "serpent_wiggle",
@@ -424,6 +476,11 @@ NEUTRAL.update({n: 0.0 for n in ("l_camera", "crowd_push", "crowd_swarm", "crowd
                                  "crowd_serpent") if n in PARAMS})
 BYPASS_KEEP |= {n for n in ("crowd_mode", "crowd_glow", "crowd_hue", "crowd_soft") if n in PARAMS}
 BYPASS_LINKS["camera"] = ["l_camera"]
+# generative kené / kenê kuin study layers (kene_real.py): the two layer amounts go to 0, every look setting is kept;
+# the tab's switch drops both layers.
+NEUTRAL.update({n: 0.0 for n in ("l_kene_shipibo", "l_kene_hunikuin") if n in PARAMS})
+BYPASS_KEEP |= {n for n, v in PARAMS.items() if v[3] == "kene"}
+BYPASS_LINKS["kene"] = ["l_kene_shipibo", "l_kene_hunikuin"]
 
 
 def bypass_cover():

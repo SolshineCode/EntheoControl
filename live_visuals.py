@@ -7,7 +7,7 @@ params.py (faders, modulation, scenes, MIDI and the web panel live in control.py
 
 Negative-space design for projection (black = no light). Layers, all sampled through one warp chain
 (ripples -> serpentine warp -> wave -> pan/rotate -> punch -> bulge -> twirl -> zoom / travel):
-  kene   - generative crawling labyrinth line field (inspired by Amazonian kene, not a copy of any design):
+  blocks - Folding Blocks (param l_kene): generative crawling labyrinth line field (not kene, not a copy of any design):
            hash-seeded pivoting walls, bold primary lines, fine parallel infill, stepped diamonds
   beads  - Huichol-style hex-offset beadwork in nested petal medallions
   lines  - flower-of-life arcs + petal contours with analytic glow
@@ -31,7 +31,7 @@ Run:
                     --batch jobs.json, --test-audio silent, --phase-offset K, --no-nan-guard, --limit-mean X
 
 Keys (projector / preview window)
-  looks      M layer preset (kene / kene+beads / beads / ai / both / lines / all) | P next palette (4 s glide)
+  looks      M layer preset (Folding Blocks / +beads / beads / ai / both / lines / all) | P next palette (4 s glide)
              1-9 fold count | TAB flat field <-> mandala | T twirl | F echo on/off | UP/DOWN trails
              SPACE next AI texture | V next video clip
   space      - / = zoom out / in | [ / ] density | LEFT/RIGHT crawl speed | A/D crawl angle
@@ -104,10 +104,22 @@ try:
     from beings import BeingsPass                    # living / supernatural creatures layer (l_beings)
 except ImportError:
     BeingsPass = None
-try:                                                 # post-FX filter chain (group "filters"): dream, oil, halftone, ...
-    from filters import FilterPass, active as filters_active
+try:
+    from kene_real import KenePass                   # generative kené / kenê kuin study layers (l_kene_shipibo, l_kene_hunikuin)
 except ImportError:
-    FilterPass, filters_active = None, (lambda vals: False)
+    KenePass = None
+try:                                                 # post-FX filter chain (group "filters"): dream, oil, halftone, ...
+    from filters import FilterPass, active as filters_active, run as filters_run
+except ImportError:
+    FilterPass, filters_active, filters_run = None, (lambda vals: False), None
+try:                                                 # [skins] environment skins (materials.py): images as materials
+    import materials as skin_mod
+except ImportError:
+    skin_mod = None
+try:                                                 # [flashguard] engine-wide photosensitive limiter (flashguard.py)
+    import flashguard as fg_mod
+except ImportError:
+    fg_mod = None
 try:                                                 # text layer (l_text): SDF letters + the compositor GLSL for SCENE_FS
     from text_layer import CPU_ONLY_PARAMS as TEXT_CPU_ONLY, SCENE_GLSL as TEXT_GLSL, TextPass
 except ImportError:
@@ -123,6 +135,10 @@ try:
     import recorder as rec_mod                       # show recorder -> recordings/*.mp4 (REC in the panel, Ctrl+R)
 except ImportError:
     rec_mod = None
+try:                                                 # AUTO MAP: camera-assisted mapping wizard (MAPPING tab)
+    import automap as automap_mod
+except ImportError:
+    automap_mod = None
 try:                                                 # crowd camera (camera_layer.py; the webcam runs in camera_worker.py)
     import camera_layer as cam_mod
     CAMERA_GLSL = cam_mod.SCENE_GLSL
@@ -130,7 +146,7 @@ except ImportError:
     cam_mod = None
     CAMERA_GLSL = ("uniform float p_l_camera, p_crowd_mode, p_crowd_glow, p_crowd_hue, p_crowd_push; "
                    "vec2 camWarp(vec2 a, vec2 b){ return vec2(0.0*(p_crowd_mode+p_crowd_glow+p_crowd_hue+p_crowd_push)); } "
-                   "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b){}")
+                   "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b, float e){}")
 
 HERE = Path(__file__).parent
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)   # it warns on every (intended) decode-time rescale
@@ -146,6 +162,8 @@ LAYER_PRESETS = [
     ("all", (1.0, 0.7, 0.5, 0.5)),
 ]
 MODES = [n for n, _ in LAYER_PRESETS]
+# what key M prints: the "kene" presets are the Folding Blocks layer (internal names kept for --mode / tests)
+MODE_LABELS = [n.replace("kene", "Folding Blocks") for n in MODES]
 MODE_W = [w for _, w in LAYER_PRESETS]
 PRESET_KEYS = ("l_kene", "l_beads", "l_lines", "l_ai")
 # 5 jewel stops each, cycled smoothly (lines / AI tint) or as discrete bead colours
@@ -153,7 +171,7 @@ PALETTES = [
     ("Aya Jewel", [(0.00, 0.85, 0.80), (1.00, 0.05, 0.55), (1.00, 0.70, 0.05), (0.28, 0.10, 1.00), (0.10, 0.90, 0.30)]),
     ("Cosmic Gold/Violet", [(1.00, 0.68, 0.08), (1.00, 0.30, 0.02), (0.55, 0.08, 1.00), (0.10, 0.75, 1.00), (0.85, 0.10, 0.75)]),
     ("Gorge Twilight", [(0.05, 0.22, 1.00), (1.00, 0.52, 0.05), (0.00, 0.90, 0.75), (0.90, 0.15, 0.42), (0.30, 0.10, 0.90)]),
-    ("Emerald Shipibo", [(0.00, 0.85, 0.35), (0.55, 1.00, 0.12), (1.00, 0.78, 0.08), (0.00, 0.62, 0.60), (1.00, 0.16, 0.08)]),
+    ("Emerald Jungle", [(0.00, 0.85, 0.35), (0.55, 1.00, 0.12), (1.00, 0.78, 0.08), (0.00, 0.62, 0.60), (1.00, 0.16, 0.08)]),
     ("Spectral", [(1.00, 0.06, 0.10), (1.00, 0.80, 0.00), (0.05, 0.95, 0.25), (0.05, 0.40, 1.00), (0.85, 0.05, 1.00)]),
 ]
 TWISTS = [0.0, 0.35, -0.35, 0.8]  # key T: twirl presets (0 = straight)
@@ -170,9 +188,11 @@ CPU_ONLY = {"speed", "flow", "rotate", "palette", "travel", "serpent_speed", "ch
     {"l_swarm"} & set(PARAMS)) | (set(TEXT_CPU_ONLY) & set(PARAMS))            # (l_swarm is mixed inside fx_stack.LandPass)
 CPU_ONLY |= {"crowd_soft", "crowd_swarm", "crowd_beings", "crowd_ripples", "crowd_serpent"} & set(PARAMS)   # camera_layer.py
 CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "filters"}             # consumed by filters.FilterPass
+CPU_ONLY |= {"img_auto", "img_hold"} & set(PARAMS)                          # image cycling (main loop)
+CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "kene"} | ({"l_kene_hunikuin"} & set(PARAMS))   # kene_real.KenePass (one texture, both layers)
 RESET_GROUPS = ("space", "shape", "motion")
 # engine-drawn layers (everything but the math stack, the echo and the text overlay): see the coreOn uniform
-CORE_LAYERS = [n for n in PARAMS if (n.startswith("l_") and n not in ("l_stack", "l_echo", "l_text")) or n == "serpent"]
+CORE_LAYERS = [n for n in PARAMS if (n.startswith("l_") and n not in ("l_stack", "l_echo", "l_text", "l_camera")) or n == "serpent"]
 VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 VS = """
@@ -186,9 +206,12 @@ SCENE_FS = """
 uniform sampler2D texA, texB, prevFrame, texV, texF, texR, texL, texG;
 uniform sampler2D texK;             // math stack (stack.StackPass): rgb = its light, a = how much it hides of the rest
 uniform float p_l_stack;            // 1 while that pass rendered this frame (the amount is applied inside it), else 0
+uniform sampler2D texN;             // kené / kenê kuin study layers (kene_real.KenePass): rgb = light, a = cover
+uniform float p_l_kene_shipibo;     // 1 while that pass rendered this frame (both layer amounts are applied inside it), else 0
 uniform float coreOn;               // 1 normally; fades to 0 only when EVERY engine layer is at 0 (clean canvas): no core jewel
 uniform float t, mixAB, bass, mid, high, aspect, pxh, hasVideo, limiter, nanGuard;
 uniform float rotPh, chasePh, chaseCol, travelAct, breath, calm;
+uniform float tK, tS;               // kene clocks, wrapped at 64 on the CPU: wall pivots (t x 0.11), shimmer (t x 3)
 uniform float spinPh, spinV, p_spin_twist;   // barrel-roll phase (wrapped at TAU), signed spin speed, corkscrew amount
 uniform sampler2D texS;             // the chosen image, flat (uploaded art piece); AI textures are texA / texB
 uniform float artUse, srcAI, srcAsp;   // art_use mode (0 = fly-through relief in texR), 1 = use the AI texture, image aspect
@@ -300,7 +323,7 @@ vec3 keneM(vec2 g, float eg, out float kcov){
   for (int dy=-1; dy<=1; dy++) for (int dx=-1; dx<=1; dx++){
     vec2 c = cid + vec2(dx,dy);
     vec2 ij = vec2(c.x+c.y+1.0, c.x-c.y);
-    float ph = t*0.11 + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
+    float ph = tK + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
     float s = keneBitM(ij, slot);
     if (ph-slot > 0.82) s = mix(s, keneBitM(ij, slot+1.0), smoothstep(0.82, 1.0, ph-slot));
     vec2 cs = normalize(vec2(1.0-s, s)+1e-4);                        // wall direction (pivots while s moves)
@@ -315,7 +338,7 @@ vec3 keneM(vec2 g, float eg, out float kcov){
   float thin = aa(dt-0.036, e)*step(0.14, d)*smoothstep(1.06, 0.92, d)*smoothstep(0.13, 0.05, e)*(1.0-G_sparse);
   float along = (wid.x+wid.y)/16.0;                                  // steps 1/8 per wall along a staircase
   float i1 = fract(along), i2 = fract(along + 0.09*(lv+1.0));
-  float sh = 0.82+0.5*high*vnoise(q*3.0+t*3.0);
+  float sh = 0.82+0.5*high*vnoise(q*3.0+tS);
   float pp = 0.03125*(q.x+q.y) + t*0.02 + chaseCol;
   vec3 c = palette(pp)*bold*chaseKey(i1) + palette(pp+0.37+0.06*lv)*thin*chaseKey(i2);
   kcov = mix(smoothstep(0.30, 0.20, d), smoothstep(0.26, 0.17, d), G_sparse);
@@ -347,7 +370,7 @@ vec3 kene(vec2 g, float eg, out float kcov){
   for (int dy=-1; dy<=1; dy++) for (int dx=-1; dx<=1; dx++){
     vec2 c = cid + vec2(dx,dy);
     vec2 ij = vec2(c.x+c.y+1.0, c.x-c.y);
-    float ph = t*0.11 + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
+    float ph = tK + hash21(mod(ij, 64.0)+0.5), slot = floor(ph);
     float P = keneBit(ij, slot);
     if (ph-slot > 0.82) P = mix(P, keneBit(ij, slot+1.0), smoothstep(0.82, 1.0, ph-slot));
     float s = abs(P - mod(ij.x, 2.0));                               // 0 = horizontal, 1 = vertical
@@ -369,7 +392,7 @@ vec3 kene(vec2 g, float eg, out float kcov){
   float motA = (aa(sA-0.20, e) + aa(abs(sA-0.46)-0.045, e))*step(1.2, dA)*step(sA, 0.6)*fine;
   float motB = (aa(sB-0.11, e) + aa(abs(sB-0.33)-0.035, e))*step(1.2, dB)*step(sB, 0.5)*fine;
   float i1 = fract((wA.x+wA.y)/16.0), i2 = fract((wB.x+wB.y)/16.0 + 0.09);   // steps 1/8 per wall along a staircase
-  float sh = 0.82+0.5*high*vnoise(q*3.0+t*3.0);
+  float sh = 0.82+0.5*high*vnoise(q*3.0+tS);
   float pp = 0.03125*(q.x+q.y) + t*0.02 + chaseCol;
   float k1 = chaseKey(i1), k2 = chaseKey(i2);
   vec3 c = palette(pp)*(bold + 0.9*motA)*k1 + palette(pp+0.20)*outl*(0.35+0.65*k1)*0.8
@@ -610,6 +633,7 @@ vec2 sway(float s){ return vec2(sin(s*0.20)+0.5*sin(s*0.46+1.3), cos(s*0.18)+0.5
 
 //@TEXT_GLSL
 //@CAMERA_GLSL
+//@SKIN_GLSL
 void main(){
   vec2 asp = vec2(aspect, 1.0);
   vec2 p0 = (v_uv-0.5)*asp, p = p0;
@@ -782,7 +806,7 @@ void main(){
       vec2 zq = pf_; float L, fgf = 1.0;
       if (tmode > 2.5) {
         float lr = log(r0*bf), th = atan(p.y, p.x), cc = LN2/TAU;
-        vec2 w = vec2(lr - th*cc, th + lr*cc + p_twirl*1.1*lr);      // conformal: one turn = one octave
+        vec2 w = vec2(lr - th*cc, th + lr*cc + tw*lr);               // conformal: one turn = one octave (tw = twirl + spin twist)
         w.x -= (zl + trZ)*LN2;
         float Lr = w.x/LN2 + 1.152;                                  // octave level (annulus 0.45 .. 0.9)
         L = Lr - floor(Lr);
@@ -826,6 +850,29 @@ void main(){
     col += cf*cl*(1.0-sym); cov += cvf*(1.0-sym);
   }
 
+  // [skins> environment skin on the travel tunnel (materials.py). skA[0].w is 0 unless a skin is on a slot: the whole
+  // block is skipped and no texture is sampled. ONE fetch (hardware-filtered); analytic gradients = no atan seam.
+  if (skA[0].w > 0.0005) {
+    float em = skB[0].x, rK = length(pt)+1e-5, thK = atan(pt.y, pt.x), fd, fogk = clamp(p_depth_fog, 0.0, 1.0); vec3 S;
+    if (em > 3.5) {                                                   // ground + sky planes (flat field, travel mode 1)
+      float ay = max(abs(pf_.y), 1e-3), z = 0.32/ay;
+      S = skTap(0, vec2(pf_.x*z + step(0.0, pf_.y)*3.7, z), vec2(min(ps*z, 4.0), 0.0), vec2(0.0, min(ps*z/ay, 4.0)));
+      fd = exp(-(z-0.64)*mix(0.03, 0.75, fogk))*smoothstep(0.015, 0.06, ay);
+    } else if (em > 2.5) {                                            // screen
+      S = skTap(0, pscr, vec2(pxh, 0.0), vec2(0.0, pxh)); fd = 1.0;
+    } else if (em > 1.5) {                                            // tube: depth along it, angle round it
+      float z = 0.5/rK;
+      S = skTap(0, vec2(thK/TAU, z), vec2(min(ps/(TAU*rK), 4.0), 0.0), vec2(0.0, min(ps*z/rK, 4.0)));
+      fd = exp(-(z-0.5)*mix(0.03, 0.85, fogk))*smoothstep(0.02, 0.07, rK);
+    } else {                                                          // log-polar: the endless zoom tunnel / Droste
+      S = skTap(0, vec2(thK/TAU, log(rK)), vec2(min(ps/(TAU*rK), 4.0), 0.0), vec2(0.0, min(ps/rK, 4.0)));
+      fd = smoothstep(0.02, mix(0.10, 0.45, fogk), rK);
+    }
+    col = skMix(0, col, S*fd, smoothstep(0.02, 0.28, max3(col)), 1.0);
+    cov = max(cov, min(max3(col), 1.0)*skA[0].w);
+  }
+  // <skins]
+
   // ---- pure-math fractal pass (already palette-coloured), screen-blended
   if (p_l_fractal > 0.0) {
     vec3 fc = clamp(texture(texF, pscr/asp+0.5).rgb, 0.0, 1.0)*p_l_fractal;
@@ -841,7 +888,7 @@ void main(){
       // 1 inside the lines: the pattern is a stencil, the image is the light coming through it
       vec3 im = srcImg(srcFit(pscr*0.92 + 0.03*vec2(cos(srcPh*PI), sin(srcPh*PI))), 0.0);
       float m = smoothstep(0.02, 0.28, max3(col));
-      col = mix(col, (im*1.55+0.06)*m*(0.55+0.45*max3(col)), p_l_art);
+      col = mix(col, (im*1.55+0.06)*m*(0.55+0.45*min(max3(col), 1.0)), p_l_art);
     } else if (amode == 2.0) {
       // 2 kaleidoscope source: a slowly turning slice of the image, mirrored round the fold count
       float hsK = PI/floor(clamp(p_folds, 2.0, 24.0)+0.5);
@@ -870,6 +917,13 @@ void main(){
     vec3 lc = clamp(texture(texL, pscr/asp+0.5).rgb, 0.0, 1.0);
     col = col + lc*(1.0-clamp(col, 0.0, 1.0));
     cov = max(cov, max3(lc));
+  }
+
+  // ---- generative kené / kenê kuin study layers (kene_real.KenePass): the layer amounts are already applied in the pass
+  if (p_l_kene_shipibo > 0.0) {
+    vec4 kn = clamp(texture(texN, pscr/asp+0.5), 0.0, 1.0);
+    col = col*(1.0-0.92*kn.a) + kn.rgb;
+    cov = max(cov, max(kn.a, max3(kn.rgb)));
   }
 
   // ---- beings (beings.BeingsPass): rgb = light, a = silhouette; the layer amount is already applied in the pass
@@ -916,12 +970,12 @@ void main(){
   bool held = hold > 0.999;                                          // fully frozen: copy the texel, no resampling
   vec3 prev = held ? texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb : texture(prevFrame,q).rgb;
   if (nanGuard > 0.5 && !(prev.r >= 0.0 && prev.g >= 0.0 && prev.b >= 0.0)) prev = vec3(0);
-  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)), 0.0, 1.0)*mix(mix(min(p_trails*0.94 + 1.6*max(p_trails-0.94, 0.0) + 0.30*max(p_l_echo-0.6, 0.0), 0.960), 0.972, melt), 1.0, hold);   // above 0.94 (no factory scene goes higher): long trails, up to 0.96 / frame (longer ones wash out to pastel)
+  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)*(1.0-0.6*melt)), 0.0, 1.0)*mix(mix(min(p_trails*0.94 + 1.6*max(p_trails-0.94, 0.0) + 0.30*max(p_l_echo-0.6, 0.0), 0.960), 0.958, melt), 1.0, hold);   // above 0.94 (no factory scene goes higher): long trails, up to 0.96 / frame (longer ones wash out to pastel)
   trail *= mix(smoothstep(0.05, 0.24, max3(trail)), 1.0, hold);
   fbE = vec4(max(col, trail), 1.0);
   vec3 o = max(col, trail*mix(min((0.30+0.25*p_trails)*(min(p_l_echo/0.6, 1.0) + 3.0*max(p_l_echo-0.6, 0.0)), 0.95), 0.92, melt));   // echo above its default: x2.2 at 1
   if (p_l_text > 0.0) textMix(o, cov, pscr, pt, asp, edge);          // text layer (text_layer.SCENE_GLSL): display only
-  if (p_l_camera > 0.0) camShow(o, cov, pscr, asp);                  // crowd camera: reveal / outline / knockout
+  if (p_l_camera > 0.0) camShow(o, cov, pscr, asp, edge);            // crowd camera: reveal / outline / knockout
 
   // ---- performance stage (display only; the echo buffer never sees it)
   float mx = max3(o);
@@ -950,6 +1004,10 @@ void main(){
 """
 SCENE_FS = SCENE_FS.replace("//@TEXT_GLSL", TEXT_GLSL)   # the text compositor lives in text_layer.py
 SCENE_FS = SCENE_FS.replace("//@CAMERA_GLSL", CAMERA_GLSL)   # crowd camera compositor (camera_layer.py)
+if skin_mod is not None:                                      # [skins] one slot (the tunnel walls), the scene's own palette
+    SCENE_FS = SCENE_FS.replace("//@SKIN_GLSL", skin_mod.glsl(1, "palette"))
+else:                                                         # no materials.py: the block is cut out again
+    SCENE_FS = SCENE_FS[:SCENE_FS.index("  // [skins>")] + SCENE_FS[SCENE_FS.index("  // <skins]") + len("  // <skins]"):]
 
 OUT_FS = """
 #version 330
@@ -1828,6 +1886,7 @@ class Phases:
         self.T = self.swim = self.serp = self.travel = 0.0        # raw doubles
         self.flowM = self.flowF = self.trU = self.trT = self.trG = self.trZ = self.trSway = self.rot = 0.0
         self.spin = 0.0                                           # barrel-roll angle (radians, wrapped at TAU)
+        self.spin_v = 0.0                                         # spin speed the shader sees: slewed, held while frozen
         self.act = self.tex = 0.0
 
     @staticmethod
@@ -1849,6 +1908,8 @@ class Phases:
         self.flowM, self.flowF = (self.flowM + dflow) % pu, (self.flowF + dflow) % pf
         self.rot = (self.rot + dts * vals.get("rotate", 0.0) * 0.3) % (2 * math.pi)
         self.spin = (self.spin + dts * vals.get("spin", 0.0) * SPIN_RATE) % (2 * math.pi)
+        if dtf > 0.0:                                              # frozen: the corkscrew holds its shape
+            self.spin_v += (min(max(vals.get("spin", 0.0), -1.0), 1.0) - self.spin_v) * (1 - math.exp(-dtf / 0.07))
         trav = vals.get("travel", 0.0)
         dtr = dts * trav * 0.6 * (1.0 + 1.2 * bass)
         if abs(trav) > 0.02:
@@ -1921,7 +1982,8 @@ class Phases:
             sb[:, 2], sb[:, 3] = cur[:, 5], prev[:, 5]
         return dict(
             t=self.T, rotPh=self.rot + k * tau, travelAct=self.act,
-            spinPh=self.spin + k * tau, spinV=min(max(vals.get("spin", 0.0), -1.0), 1.0),
+            spinPh=self.spin + k * tau, spinV=self.spin_v,
+            tK=(self.T * 0.11) % 64.0 + k * 64.0, tS=(self.T * 3.0) % 64.0 + k * 64.0,
             swN=np.array([(self.swim * c) % NOISE_P + k * NOISE_P for c in SWN_K], dtype="f4"),
             swS=np.array([(self.swim * c) % tau + k * tau for c in SWS_K], dtype="f4"),
             aiDrift=(self.swim * 0.008) % 1.0 + k,
@@ -1968,12 +2030,18 @@ def main():
                          "panel brings the saved look back) and open the panel in SIMPLE mode")
     ap.add_argument("--stack", default=None, metavar="FILE.json",
                     help="headless: load this math stack ({\"layers\": [...]}, see stack.py) at start")
+    ap.add_argument("--skins", default=None, metavar="FILE.json",
+                    help="headless: load these environment skins ({\"slots\": {\"corridor:walls\": {...}}}, see materials.py)")
+    ap.add_argument("--skin-size", type=int, default=512, choices=(512, 1024),
+                    help="resolution of the skin texture array (8 layers; 512 = 11 MB of VRAM, 1024 = 43 MB)")
     ap.add_argument("--surfaces", default=None, metavar="FILE.json",
                     help="headless: render through this surfaces file (read-only; the show always uses surfaces.json)")
     ap.add_argument("--remote", action="store_true", help="start the touch remote web page (Ctrl+W toggles it at runtime)")
     ap.add_argument("--remote-port", type=int, default=8765)
     ap.add_argument("--remote-token", default=None, help="panel token (default: persistent, stored in .remote_token)")
     ap.add_argument("--panel", action="store_true", help="open the control panel in a browser on this laptop (implies --remote)")
+    ap.add_argument("--flashguard", action="store_true",
+                    help="headless: run the photosensitive limiter too (a show always runs it; there is no off switch here)")
     ap.add_argument("--governor", default=None, choices=["off", "suggest", "auto"],
                     help="resource governor mode (show default: saved setting, else suggest; headless: not started unless given)")
     ap.add_argument("--record", nargs="?", const=0.0, type=float, default=None, metavar="SECONDS",
@@ -2122,6 +2190,12 @@ def main():
             extra.append(dict(param="l_beings", gate=1.0, uniform="texG", unit=6, obj=BeingsPass(ctx, (rw, rh)), fails=0))
         except Exception as ex:
             print(f"[l_beings] disabled: {ex}")
+    if KenePass is not None and "l_kene_shipibo" in PARAMS:   # one texture carries both study layers (unit 17; its inputs use 20 / 21)
+        try:
+            extra.append(dict(param="l_kene_shipibo", keys=("l_kene_shipibo", "l_kene_hunikuin"), gate=1.0, uniform="texN",
+                              unit=17, obj=KenePass(ctx, (rw, rh)), fails=0))
+        except Exception as ex:
+            print(f"[l_kene_shipibo] disabled: {ex}")
     if TextPass is not None and "l_text" in PARAMS:      # letter field (unit 10) + its trail buffer (unit 11)
         try:
             extra.append(dict(param="l_text", uniform="texT", unit=10, obj=TextPass(ctx, (rw, rh)), fails=0))
@@ -2137,6 +2211,18 @@ def main():
             print(f"[l_stack] disabled: {ex}")
     extra.append(dict(param="l_stack", gate=1.0, uniform="texK", unit=16, obj=stack_obj, fails=0))
     own_stack = stack_mod.StackState() if stack_mod is not None else None   # used when the controller has no stack
+    # [skins> environment skins: ONE texture array on unit 22, shared by the 3D decks and the travel tunnel. With no
+    # skin assigned nothing below costs anything (the decks keep their original programs, the tunnel block is skipped).
+    skins, own_skins, sk_eff, sk_st = None, None, {"tunnel": 1}, dict(on=False, travel=None)
+    if skin_mod is not None:
+        own_skins = skin_mod.SkinState()             # used when the controller has none (static controller)
+        skins = guarded("skins", skin_mod.SkinEngine, ctx, skin_mod.roots_for(args.textures, args.art),
+                        size=args.skin_size, sync=bool(headless))
+        if skins is not None:
+            _land = next((e["obj"] for e in extra if e["param"] == "l_land"), None)
+            if _land is not None:
+                _land.skins = skins
+    sk_zero = np.zeros((1, 4), dtype="f4")       # <skins]
     preview = guarded("preview", PreviewTap, ctx) if PreviewTap is not None and not headless else None
     filt = None                                  # post-FX filter chain (filters.py); never called while every filter is off
     if FilterPass is not None:
@@ -2146,6 +2232,11 @@ def main():
             print(f"[filters] disabled: {ex}")
     filt_fails = 0
 
+    fguard = None                                # [flashguard] last stage before Spout / preview / recorder / mapping
+    if fg_mod is not None and not sheet and (args.flashguard or not headless):
+        fguard = guarded("flashguard", fg_mod.FlashGuard, ctx, (rw, rh))
+    if fguard is not None or not (headless or sheet):
+        print("[flashguard] " + ("on: 3 flashes / s at most" if fguard is not None else "NOT RUNNING: the output is unguarded"))
     controller = make_controller(headless, args.live_controller)
     print(f"[control] {type(controller).__name__}")
     gov = None                                   # resource governor (show mode, or headless with --governor)
@@ -2154,6 +2245,13 @@ def main():
     cam = None                                   # crowd camera: OFF until the panel switches it on (no process, no cost)
     if cam_mod is not None and not sheet:
         cam = guarded("camera", cam_mod.CameraLayer.for_engine, ctx, controller, extra, rw / rh)
+    if gov and skins is not None and hasattr(gov, "skins_source"):   # VRAM the skins hold, in the governor's status
+        gov.skins_source = skins.status
+    if gov and cam is not None:                  # the governor's status / HEALTH card shows what the camera costs
+        gov.camera_source = cam.cost
+    amap = None                                  # AUTO MAP wizard: idle until the MAPPING tab starts a step
+    if automap_mod is not None and cam is not None and not headless:
+        amap = guarded("automap", automap_mod.EngineBridge, ctx, cam, tuple(mapper.set.output), controller)
     DEF = defaults()
 
     def apply_start(ctl):
@@ -2183,6 +2281,8 @@ def main():
                     controller.set(k, v)
             own_stack.add(stack_mod.CANVAS_START["gen"], stack_mod.CANVAS_START)
             own_stack.restore(own_stack.to_json())
+    if args.skins and own_skins is not None and headless:
+        (getattr(controller, "skins", None) or own_skins).load(json.loads(Path(args.skins).read_text(encoding="utf-8")))
     if args.stack and stack_mod is not None and headless:
         the_stack().restore(json.loads(Path(args.stack).read_text(encoding="utf-8")))
     apply_start(controller)
@@ -2208,7 +2308,7 @@ def main():
         st["preset"] = i % len(MODES)
         for k, v in zip(PRESET_KEYS, MODE_W[st["preset"]]):
             controller.set(k, v)
-        print("layers", MODES[st["preset"]])
+        print("layers", MODE_LABELS[st["preset"]])
 
     def set_palette(i):                          # the controller glides the (fractional) palette value itself
         controller.set("palette", float(i % len(PALETTES)))
@@ -2458,12 +2558,16 @@ def main():
                 if name in PARAMS and math.isfinite(v):
                     vals[name] = min(max(v, PARAMS[name][0]), PARAMS[name][1])
             st["vals"] = vals
+            if cam is not None:                      # the camera's wrappers / ripples read this frame's values (not last frame's)
+                cam._vals = vals
             clock = dict(bpm=124.0, beat=0.0, beat_phase=0.0, bar_phase=0.0, phrase_phase=0.0)
             clock.update({k2: float(v2) for k2, v2 in (fr.clock or {}).items() if isinstance(v2, (int, float)) and math.isfinite(v2)})
 
             # ---- commands: the controller takes what it owns (call it every frame: MIDI- and AI-raised
             # commands come out of it too); corner pin / grid / textures / snapshot stay here
             map_pull()
+            if amap is not None:                     # AUTO MAP: apply its surface edits here (GL thread), refresh its snapshot
+                guarded("automap", amap.tick, mapper, vals.get("blackout", 0.0) > 0.05 or vals.get("master", 1.0) < 0.05)
             cmds = guarded("remote", remote.drain, default=[]) if remote.running else []
             rest = guarded("control", controller.apply, cmds, default=[])
             own = []
@@ -2475,12 +2579,16 @@ def main():
                 elif kind == "art_pick": guarded("art_pick", art_pick, c, now)
                 elif kind == "show_texture": st["show"] = (str(c.get("name", "")), now + 10.0)
                 elif kind == "next_video": guarded("video", video.next)
+                elif kind == "flashguard":
+                    if fguard is not None: guarded("flashguard", fguard.command, c)
                 elif kind == "gov":
                     if gov: guarded("governor", gov.command, c)
                 elif kind == "rec":
                     if recorder is not None: guarded("rec", recorder.command, c)
                 elif kind == "camera":
                     if cam is not None: guarded("camera", cam.command, c)
+                elif kind == "automap":
+                    if amap is not None: guarded("automap", amap.command, c)
                 elif kind in ("text_show", "text"): guarded("text", text_show, c)
                 elif kind == "surf": guarded("map", mapper.command, c)
                 elif isinstance(c.get("cmd"), str): own.append(c)
@@ -2545,6 +2653,27 @@ def main():
                 guarded("stack", own_stack.step, dtf, clock, None, None, rw / rh, fz >= 0.5,
                         args.phase_offset if headless else 0)
 
+            if skins is not None:                    # [skins> crossfades, phases, uploads (returns at once with no skin)
+                _ss = getattr(controller, "skins", None)
+                if _ss is None:
+                    _ss = own_skins
+                    own_skins.step(dtf)
+                _lvl = getattr(gov, "level", 0) if gov else 0
+                if hasattr(controller, "gov_level"):
+                    controller.gov_level = _lvl      # "generate a skin" waits while the governor reports strain
+                if _lvl != skins.level:
+                    skins.govern(_lvl)
+                _tm = int(round(vals.get("travel_mode", 0.0)))
+                sk_eff["tunnel"] = ((skin_mod.EFF_TUBE if vals.get("symmetry", 1.0) >= 0.5 else skin_mod.EFF_GROUND)
+                                    if _tm == 1 else skin_mod.EFF_LOGPOLAR)
+                guarded("skins", skins.update, _ss.frame, dtf, clock, (not headless) and dt > 0.022, sk_eff)
+                if skins.active("tunnel"):
+                    if sk_st["travel"] is not None:
+                        skins.advance("tunnel", ph.travel - sk_st["travel"])
+                    sk_st["travel"] = ph.travel
+                else:
+                    sk_st["travel"] = None           # <skins]
+
             # touch remote / panel: publish state ~6x/s
             if remote.running and now - pub_t > 0.15:
                 def publish():
@@ -2562,8 +2691,11 @@ def main():
                                  projector=bool(st["proj"]), palettes=[n for n, _ in PALETTES],
                                  palette_colors=[[list(c) for c in stops] for _, stops in PALETTES])
                     if gov: state["gov"] = gov.status()
+                    if fguard is not None: state["flashguard"] = fguard.state()
                     if recorder is not None: state["rec"] = recorder.state()
                     if cam is not None: state["camera"] = cam.state()
+                    if skins is not None: state["skin_lib"] = skins.status()
+                    if amap is not None: state["automap"] = amap.state()
                     remote.publish_state(state)
 
                 guarded("publish", publish)
@@ -2595,7 +2727,9 @@ def main():
                     if hit != ti:
                         tj, fade_t0 = hit, tc
                     last_switch = tc
-            if fade_t0 is None and (st["next"] or tc - last_switch > args.cycle):
+            _cyc = vals.get("img_auto", 0.0) > 0.5 if "img_auto" in PARAMS else True    # default: HOLD the image
+            _hold = vals.get("img_hold", args.cycle) if "img_hold" in PARAMS else args.cycle
+            if fade_t0 is None and (st["next"] or (_cyc and tc - last_switch > _hold)):
                 st["next"] = False; fade_t0 = tc; tj = (ti + 1) % len(texs)
             mix = 0.0
             if fade_t0 is not None:
@@ -2640,14 +2774,20 @@ def main():
                 amount = max(vals.get(k, 0.0) for k in ex.get("keys", (ex["param"],)))
                 layer_on[ex["param"]] = 0.0
                 if ex["param"] == "l_art" and amount > 0.001 and (art_mode != 0 or src_ai or ex["obj"] is None or ex["fails"] >= 5):
-                    got = None
+                    got, loading = None, False
                     if not src_ai and ex["obj"] is not None:
-                        got = guarded("art", ex["obj"].source, vals, dts, default=None)
+                        # wall time (held by freeze only): speed 0 must not stall a piece switch
+                        got = guarded("art", ex["obj"].source, vals, dtf, default=None)
+                        loading = not got and bool(guarded("art", ex["obj"].library, default=None))
                     if got:
                         got[0].use(8)
                         src_asp = got[1]
+                        st["art_in"] = min(1.0, st.get("art_in", 1.0) + dt / 0.4)
+                        amount *= got[2] * st["art_in"]  # dips through a piece switch, fades in after a load
+                    elif loading:
+                        st["art_in"], amount = 0.0, 0.0  # the chosen piece is still decoding: show nothing, not an AI texture
                     else:
-                        src_ai = True                    # nothing uploaded (yet): the AI texture stands in
+                        src_ai = True                    # no art uploaded at all: the AI texture stands in
                     layer_on["l_art"] = amount
                     continue
                 if ex["obj"] is None or amount <= 0.001 or ex["fails"] >= 5:
@@ -2661,6 +2801,8 @@ def main():
                         tex = ex["obj"].render(fvals, clock, T, ph.travel, [tuple(map(float, c)) for c in pal])
                     elif ex["param"] == "l_beings":
                         tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0), clock, T, dts, smr, pal)
+                    elif ex["param"] == "l_kene_shipibo":
+                        tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0, rot_phase=ph.rot + ph.spin), clock, T, dts, smr, pal)
                     elif ex["param"] == "l_text":
                         tex = ex["obj"].render(vals, clock, T, dts, smr, pal)
                     elif ex["param"] == "l_stack":
@@ -2681,7 +2823,7 @@ def main():
             fbos[dst].use()
             ctx.viewport = (0, 0, rw, rh)
             texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
-            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, texK=16, mixAB=mix,
+            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, texK=16, texN=17, mixAB=mix,
                        bass=smr[0], mid=smr[1], high=smr[2], aspect=rw / rh, pxh=1.0 / rh,
                        hasVideo=1.0 if has_video else 0.0, limiter=limiter.value, nanGuard=0.0 if args.no_nan_guard else 1.0,
                        chasePh=chase % 1.0, chaseCol=(chase * 0.15) % 1.0, breath=breath, calm=calm,
@@ -2689,7 +2831,11 @@ def main():
                        bar_phase=clk["bar_phase"], phrase_phase=clk["phrase_phase"])
             uni.update(ph.uniforms(vals, args.phase_offset if headless else 0))
             # the mandala's core jewel belongs to the engine's own layers: with all of them at 0 (NEW CANVAS) it goes too
-            uni["coreOn"] = min(1.0, 8.0 * max([vals[n] for n in CORE_LAYERS] or [1.0]))
+            # (only on a clean canvas: any other look keeps the jewel it always had, even with every layer down)
+            on_canvas = getattr(controller, "canvas_prev", None) is not None or (args.fresh and not hasattr(controller, "new_canvas"))
+            core_want = min(1.0, 8.0 * max([vals[n] for n in CORE_LAYERS] or [1.0])) if on_canvas else 1.0
+            st["core"] = core_want if headless else st.get("core", 1.0) + (core_want - st.get("core", 1.0)) * (1.0 - math.exp(-dt / 0.3))
+            uni["coreOn"] = st["core"]
             uni.update(texS=8, artUse=float(art_mode), srcAI=1.0 if src_ai else 0.0, srcAsp=src_asp,
                        srcPh=(ph.swim * 0.035) % 2.0, srcTr=(ph.travel * 0.45 + ph.T * 0.04) % 2.0)
             for name, v in vals.items():
@@ -2700,7 +2846,8 @@ def main():
                 uni.update(guarded("camera", cam.uniforms, vals, uni, default=None) or {"p_l_camera": 0.0})
             # [filters> post-FX chain: while a filter is on, the scene draws without limiter / master / blackout and
             # FilterPass applies them after the filters (same maths); its post-filter level feeds the meter below.
-            filt_on = filt is not None and filt_fails < 5 and filters_active(vals)
+            filt_on = (filt is not None and filt_fails < 5 and bo < 0.999 and vals["master"] > 0.001
+                       and filters_active(vals))     # blacked out: the scene's own path gives true black
             if filt_on:
                 uni.update(limiter=0.0, p_master=1.0, p_blackout=0.0)
             # <filters]
@@ -2714,22 +2861,38 @@ def main():
                 scene_prog["pal"].write(np.ascontiguousarray(pal, dtype="f4").tobytes())
             if "rip" in scene_prog:
                 scene_prog["rip"].write(ripples.tobytes())
+            if skins is not None and "skA" in scene_prog:   # [skins> tunnel skin: bound only while one is on
+                if skins.active("tunnel"):
+                    guarded("skins", skins.bind, scene_prog, "tunnel")
+                    sk_st["on"] = True
+                elif sk_st["on"]:
+                    scene_prog["skA"].write(sk_zero)
+                    sk_st["on"] = False              # <skins]
             if gov: gov.timer.start("scene")
             scene_vao.render(moderngl.TRIANGLE_STRIP)
             if gov: gov.timer.stop()
             if filt_on:                                  # [filters> in place on disp, before Spout / preview / mapping
-                try:
-                    if gov: gov.timer.start("filters")
-                    filt.apply(disp, vals, clk, dt, limiter=limiter.value, master=vals["master"], blackout=bo, pal=pal)
-                    filt_fails = 0
-                except Exception as ex:
-                    filt_fails += 1
-                    print(f"[filters] failed ({filt_fails}/5): {ex}")
-                    filt_on = False
+                if gov: gov.timer.start("filters")
+                filt_ok = filters_run(filt, disp, vals, clk, dt, limiter.value, vals["master"], bo, pal)
                 if gov: gov.timer.stop()
                 fbos[dst].use()
                 ctx.viewport = (0, 0, rw, rh)            # the scene's units back for preview.service's redraw
-                texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)   # <filters]
+                texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
+                for kname, v in (("limiter", limiter.value), ("p_master", vals["master"]), ("p_blackout", bo)):
+                    uni[kname] = v                       # real values back (PreviewTap's redraws use them too)
+                    if kname in scene_prog:
+                        scene_prog[kname].value = v
+                if filt_ok:
+                    filt_fails = 0
+                else:                                    # NEVER show the unlimited frame: redraw the scene the normal way
+                    filt_fails += 1                      # (idempotent: it reads pp[src], rewrites disp + pp[dst])
+                    print(f"[filters] fell back to the plain scene ({filt_fails}/5)")
+                    filt_on = False
+                    scene_vao.render(moderngl.TRIANGLE_STRIP)   # <filters]
+            if fguard is not None:                   # [flashguard] in place on disp: everything below shows the guarded frame
+                if gov: gov.timer.start("flashguard")
+                guarded("flashguard", fguard.process, disp, t)
+                if gov: gov.timer.stop()
 
             if spout:
                 try:
@@ -2785,6 +2948,8 @@ def main():
                 out_prog["corners"].write(np.array(corners, dtype="f4").tobytes())
                 out_vao.render(moderngl.TRIANGLE_STRIP)
 
+            if amap is not None and plan != "skip":  # AUTO MAP calibration pattern: over everything, mapping bypassed
+                guarded("automap", amap.draw, target, (fw, fh), vals.get("blackout", 0.0) > 0.05 or vals.get("master", 1.0) < 0.05)
             if recorder is not None:                 # show recorder: async PBO readback, never waits on the encoder
                 guarded("rec", recorder.frame, {"program": ((fbos[dst], 0), (rw, rh)), "projector": ((target, 0), (fw, fh))})
                 if headless and recorder.active:     # headless recording: real-time pace, since t = frame / 60
@@ -2834,6 +2999,8 @@ def main():
                     frame, prev_t, env, bo, chase = 0, 0.0, 0.0, 0.0, 0.0
                     sm[:] = 0; smr[:] = 0
                     ph, limiter = Phases(rw / rh), Limiter(mean=args.limit_mean, black=LIMIT_BLACK)
+                    if filt is not None:                 # [filters] each job starts with clean filter state
+                        filt.reset()
                     prev_bar, prev_bass, last_auto = None, 0.0, -1e9
                     ripples[:] = -1.0
                     ti, fade_t0, last_switch = ((jobs[job_i][0] * 3 + jobs[job_i][1]) % len(texs) if args.gallery else 0), None, 0.0
@@ -2865,8 +3032,20 @@ def main():
             guarded("exit", fn)
         if gov:
             guarded("exit", gov.close)
+        if amap is not None:
+            guarded("exit", amap.close)
         if cam is not None:
             guarded("exit", cam.close)               # CAMERA OFF: the worker quits and releases the webcam
+        if fguard is not None:                       # [flashguard]
+            if headless:                             # tests read this line
+                print("[flashguard] " + " ".join(f"{k}={v}" for k, v in fguard.summary().items()))
+            guarded("exit", fguard.release)
+        if filt is not None:                         # [filters]
+            guarded("exit", filt.release)
+        if skins is not None:                        # [skins]
+            if headless:
+                print(f"[skins] binds={skins.binds} uploads={skins.lib.uploads} vram_mb={skins.status()['vram_mb']}")
+            guarded("exit", skins.release)
         for ex in extra:
             if headless and hasattr(ex["obj"], "draws"):          # tests: a layer at 0 must not have drawn at all
                 print(f"[{ex['param']}] draws={ex['obj'].draws}")

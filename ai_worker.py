@@ -105,15 +105,34 @@ class RealPipes:
         self.i2i = AutoPipelineForImage2Image.from_pipe(self.pipe)
         self.base = base
 
+    on_gpu = True
+
     def offload(self):
         """Move the weights to system RAM (DREAMIFY needs the VRAM); restore() brings them back."""
         self.pipe.to("cpu")
+        self.on_gpu = False
         self.torch.cuda.empty_cache()
 
     def restore(self):
-        self.pipe.to("cuda")
+        """Back to the GPU. On failure (OOM) the WHOLE pipe goes back to the CPU (never half on each) and the
+        next txt2img / img2img tries again; raises so the caller can report it."""
+        try:
+            self.pipe.to("cuda")
+            self.on_gpu = True
+        except Exception:
+            try:
+                self.pipe.to("cpu")
+            finally:
+                self.on_gpu = False
+                _free_cuda()
+            raise
+
+    def _ready(self):
+        if not self.on_gpu:
+            self.restore()
 
     def txt2img(self, prompt, negative, seed, size):
+        self._ready()
         g = self.torch.Generator("cuda").manual_seed(seed)
         kw = dict(num_inference_steps=self.cfg["steps"], guidance_scale=self.cfg["cfg"],
                   height=size, width=size, generator=g)
@@ -122,6 +141,7 @@ class RealPipes:
         return self.pipe(prompt, **kw).images[0]
 
     def img2img(self, prompt, negative, seed, init, strength):
+        self._ready()
         g = self.torch.Generator("cuda").manual_seed(seed)
         steps = max(self.cfg["steps"], math.ceil(1.0 / strength), 2)   # steps*strength must be >= 1
         return self.i2i(prompt, image=init, strength=strength, num_inference_steps=steps,
@@ -298,7 +318,8 @@ class Worker:
                 return None
             jid = secrets.token_hex(4)
             self.pending.append((jid, job))
-        self.q.put((jid, job, self.cancel_gen))
+            gens = (self.cancel_gen, self.dream_cancel_gen)
+            self.q.put((jid, job, gens[0], gens[1]))       # inside the lock: no cancel can slip in between
         return jid
 
     def cancel(self):
@@ -350,7 +371,8 @@ class Worker:
             item = self.q.get()
             if item is None:
                 break
-            jid, job, gen = item
+            jid, job, gen = item[:3]
+            dgen = item[3] if len(item) > 3 else self.dream_cancel_gen
             if jid == "warmup":
                 if pipes is None:
                     try:
@@ -360,13 +382,14 @@ class Worker:
                         print(f"[ai] model load failed: {ex}", flush=True)
                 continue
             with self.lock:
-                if gen != self.cancel_gen:
-                    continue
+                if gen != self.cancel_gen or (job.get("kind") == "dream" and dgen != self.dream_cancel_gen):
+                    self.pending = [(j, jb) for j, jb in self.pending if j != jid]
+                    continue                             # cancelled while it waited in the queue
                 self.pending = [(j, jb) for j, jb in self.pending if j != jid]
             self._set(busy=True, current=dict(id=jid, prompt=job["prompt"][:80]), error="")
             if job.get("kind") == "dream":
                 try:
-                    self._dream(jid, job, gen, pipes)
+                    self._dream(jid, job, gen, pipes, dgen)
                 finally:
                     self._set(busy=False, current=None, dream=None)
                 continue
@@ -438,9 +461,9 @@ class Worker:
                 self._set(busy=False, current=None)
 
 
-    def _dream(self, jid, job, gen, pipes):
+    def _dream(self, jid, job, gen, pipes, dgen=None):
         """One DREAMIFY job: pick the device by free VRAM (moving SD-Turbo to RAM if that makes room), dream, save."""
-        g0 = self.dream_cancel_gen
+        g0 = self.dream_cancel_gen if dgen is None else dgen
 
         def cancelled():
             return gen != self.cancel_gen or g0 != self.dream_cancel_gen
@@ -469,6 +492,8 @@ class Worker:
                 info.update(octave=octave + 1, step=step, steps=total, pct=round(100.0 * step / max(total, 1), 1))
                 self._set(dream=dict(info))
             with Image.open(folder / job["name"]) as im:
+                if im.width * im.height > 60_000_000:
+                    raise ValueError(f"image too large ({im.width}x{im.height})")
                 im.load()
                 im = ImageOps.exif_transpose(im)
                 if im.mode in ("RGBA", "LA", "P", "PA"):
@@ -481,7 +506,7 @@ class Worker:
                 self._set(error="dreamify cancelled")
                 print(f"[ai] dreamify cancelled: {job['name']}", flush=True)
                 return
-            name = dreamify.out_name(job["source"], job["name"], job["preset"], time.strftime("%Y%m%d_%H%M%S"))
+            name = dreamify.out_name(job["source"], job["name"], job["preset"], time.strftime("%Y%m%d_%H%M%S"), folder)
             secs = round(time.time() - t, 1)
             dreamify.save_png(out, folder / name, dict(
                 prompt=job["prompt"], dream_source=job["name"], dream_preset=job["preset"],
@@ -509,11 +534,24 @@ class Worker:
                     dreamer.release()
                 except Exception:
                     pass
+                dreamer = None
+            _free_cuda()                                 # GoogLeNet + its activations gone before SD-Turbo returns
             if offloaded:
                 try:
                     pipes.restore()
-                except Exception as ex:
-                    self._set(error=f"SD-Turbo could not move back to the GPU: {ex}"[:300])
+                except Exception as ex:                  # RealPipes stays whole on the CPU and retries on its next job
+                    self._set(error=f"SD-Turbo stays in RAM for now (restore failed, retried on the next image): {ex}"[:300])
+
+
+def _free_cuda():
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def lower_priority():

@@ -40,7 +40,14 @@ STOP_MIN, STOP_MAX = 2, 6
 SAFE_HZ = 2.5                    # full-frame changes per second a layer may make (WCAG 2.3.1 allows 3)
 FAST_HZ = 8.0                    # band passes per second for fine patterns (60 fps still resolves them)
 HUE_HZ = 0.5
-SLEW = 2.0 * SAFE_HZ             # opacity / brightness units per second: a full 0 -> 1 -> 0 swing takes 1 / SAFE_HZ
+SLEW = 2.0 * SAFE_HZ             # full ranges per second: a full swing there and back takes 1 / SAFE_HZ
+OCT_SLEW = 15.0                  # octaves per second for the log-scaled fields (band count, zoom)
+# Every numeric field that changes what is on the wall is slewed AFTER modulation (see StackState._limit): a square
+# LFO, a MIDI jump or a typed value moves it at most one full range per 1 / SLEW seconds, so nothing can flip the
+# frame's level or colour faster than SAFE_HZ. The rates (speed, spin, warp_speed, hue_speed, pulse_div) only set
+# how fast a phase runs; they have their own caps in _resolve.
+RATE_FIELDS = ("speed", "spin", "warp_speed", "hue_speed", "pulse_div")
+OCT_FIELDS = ("freq", "warp_freq")               # limited in log2 space; zoom is already in octaves
 PAL_N = 5                        # colours in a show palette (live_visuals.PALETTES)
 PAL_FALLBACK = [(0.00, 0.85, 0.80), (1.00, 0.05, 0.55), (1.00, 0.70, 0.05), (0.28, 0.10, 1.00), (0.10, 0.90, 0.30)]
 WRAP = 60                        # scroll wrap (cycles) when nothing angular is involved: LCM of 2..6 colour stops
@@ -265,6 +272,14 @@ def _cmd_id(c):
 
 
 def validate(c):
+    """See _validate. Anything malformed (unhashable keys included) is a ValueError, so the panel server answers 400."""
+    try:
+        return _validate(c)
+    except (TypeError, KeyError, AttributeError, IndexError) as ex:
+        raise ValueError(f"malformed stack command ({type(ex).__name__})")
+
+
+def _validate(c):
     """Normalised copy of one {"cmd": "stack", "op": ...} command (clamped, unknown keys dropped); ValueError if
     malformed. Runs on the panel's server thread, so nothing unvalidated reaches the render loop.
 
@@ -302,8 +317,12 @@ def validate(c):
         vals = {}
         src = dict(c["set"]) if isinstance(c.get("set"), dict) else {}
         if "f" in c:
+            if not isinstance(c["f"], str):
+                raise ValueError("'f' must be a field name")
             src[c["f"]] = c.get("v")
         for k, v in src.items():
+            if not isinstance(k, str):
+                raise ValueError("field names must be text")
             if k == "stops":
                 if not (isinstance(v, list) and STOP_MIN <= len(v) <= STOP_MAX and all(
                         isinstance(s, (list, tuple)) and len(s) == 4 and all(_isnum(x) for x in s) for s in v)):
@@ -396,14 +415,24 @@ def blend(a, b, t):
     if t >= 1.0:
         return copy.deepcopy(b)
     la, lb = {x["id"]: x for x in a["layers"]}, {x["id"]: x for x in b["layers"]}
-    first, second = (a, b) if t < 0.5 else (b, a)
-    order = [x["id"] for x in first["layers"]]
-    for i, x in enumerate(second["layers"]):         # the other side's own layers keep their place in the pile
-        if x["id"] not in order:
-            order.insert(min(i, len(order)), x["id"])
+    # Slots: a layer both sides have (same id) glides. The layers only one side has are paired in pile order (ids are
+    # never reused, so two scenes built separately share none): a pair dips to nothing at the midpoint and comes back
+    # as the other side's layer, the rest fade. So a morph never needs more than max(len a, len b) <= 8 layers.
+    only_a = [x for x in a["layers"] if x["id"] not in lb]
+    only_b = [x for x in b["layers"] if x["id"] not in la]
+    mate_a = {x["id"]: y for x, y in zip(only_a, only_b)}
+    mate_b = {y["id"]: x for x, y in zip(only_a, only_b)}
+    first_a = t < 0.5
+    slots = []
+    for i, x in enumerate(a["layers"] if first_a else b["layers"]):
+        other = (lb.get(x["id"]) or mate_a.get(x["id"])) if first_a else (la.get(x["id"]) or mate_b.get(x["id"]))
+        slots.append((i, 0, x if first_a else other, other if first_a else x))
+    for i, x in enumerate(only_b[len(only_a):] if first_a else only_a[len(only_b):]):
+        pos = (b["layers"] if first_a else a["layers"]).index(x)
+        slots.append((pos, 1, None if first_a else x, x if first_a else None))
+    slots.sort(key=lambda s: (s[0], s[1]))
     out = []
-    for i in order[:MAX_LAYERS]:
-        xa, xb = la.get(i), lb.get(i)
+    for _, _, xa, xb in slots[:MAX_LAYERS]:
         if xa is None or xb is None:
             lay = copy.deepcopy(xa or xb)
             lay["opacity"] = lay["opacity"] * ((1.0 - t) if xb is None else t)
@@ -414,6 +443,8 @@ def blend(a, b, t):
             lay[k] = xa[k] + (xb[k] - xa[k]) * t
         if len(xa["stops"]) == len(xb["stops"]):
             lay["stops"] = [[round(p + (q - p) * t, 4) for p, q in zip(sa, sb)] for sa, sb in zip(xa["stops"], xb["stops"])]
+        if xa["id"] != xb["id"]:                     # two different layers sharing a slot: invisible while they swap
+            lay["opacity"] *= abs(2.0 * t - 1.0)
         out.append(lay)
     side = b if t >= 0.5 else a
     return dict(v=VERSION, next=max(a["next"], b["next"]), layers=out, mods=copy.deepcopy(side["mods"]))
@@ -436,9 +467,14 @@ class StackState:
     def to_json(self):
         return dict(v=VERSION, next=self.next, layers=copy.deepcopy(self.layers), mods=copy.deepcopy(self.mods))
 
-    def load(self, raw, fade=True):
-        """Replace the stack. Layers that vanish fade out (unless fade=False); phases of kept ids carry on."""
-        st = clean_stack(raw)
+    def _sig(self):
+        return [(x["id"], x["name"], len(x["stops"])) + tuple(x[k] for k in INT) for x in self.layers]
+
+    def load(self, raw, fade=True, trusted=False):
+        """Replace the stack. Layers that vanish fade out (unless fade=False); phases of kept ids carry on.
+        trusted=True: `raw` is already clean (a blend of two clean stacks) and is taken over without a copy."""
+        st = raw if trusted else clean_stack(raw)
+        sig = self._sig()
         keep = {x["id"] for x in st["layers"]}
         if fade:
             for i, lay in enumerate(self.layers):
@@ -449,7 +485,8 @@ class StackState:
             self._ghost = []
         self._ghost = [g for g in self._ghost if g[1]["id"] not in keep]
         self.layers, self.mods, self.next = st["layers"], st["mods"], max(self.next, st["next"])
-        self.edits += 1
+        if self._sig() != sig:                       # the panel rebuilds its list on `edits`: not on every morph frame
+            self.edits += 1
 
     def restore(self, raw):
         """From live_state.json: comes back as it was, no fade-in on the projector."""
@@ -470,7 +507,7 @@ class StackState:
         if self._morph is None:
             return
         a, b = self._morph
-        self.load(blend(a, b, t))
+        self.load(blend(a, b, t), trusted=True)
         if t >= 1.0:
             self._morph = None
 
@@ -585,8 +622,27 @@ class StackState:
     def _phase(self, i):
         ph = self._ph.get(i)
         if ph is None:
-            ph = self._ph[i] = dict(scroll=0.0, spin=0.0, warp=0.0, hue=0.0, pulse=0.0, env=0.0, op=0.0, bright=None)
+            ph = self._ph[i] = dict(scroll=0.0, spin=0.0, warp=0.0, hue=0.0, pulse=0.0, env=0.0, op=0.0, bright=1.0)
         return ph
+
+    def _limit(self, ph, v, dt):
+        """Slew every look-changing numeric field of one layer toward its (modulated) value. First sight snaps."""
+        cur = ph.get("v")
+        if cur is None:
+            cur = ph["v"] = {f: v[f] for f in NUM if f not in RATE_FIELDS and f != "opacity"}
+        for f, x in cur.items():
+            want = v[f]
+            if dt > 0 and x != want:
+                lo, hi = NUM[f][0], NUM[f][1]
+                if f in OCT_FIELDS:
+                    d = math.log2(want / x)
+                    lim = OCT_SLEW * dt
+                    x = want if abs(d) <= lim else x * 2.0 ** math.copysign(lim, d)
+                else:
+                    lim = (OCT_SLEW if f == "zoom" else SLEW if f == "bright" else (hi - lo) * SLEW) * dt
+                    x = want if abs(want - x) <= lim else x + math.copysign(lim, want - x)
+                cur[f] = x
+            v[f] = cur[f]
 
     def step(self, dt, clock=None, source=None, palette=None, aspect=1.6, hold=False, k=0):
         """Advance every phase by dt seconds (0 or hold=True: freeze) and resolve the layers for the shader.
@@ -608,6 +664,9 @@ class StackState:
             items.append((hint - 0.5, x, True))
         items.sort(key=lambda it: it[0])
         frame, live, capped, alive = [], {}, [], set()
+        # the shader holds 8: while 8 are still visible (ghosts fading out included) a new layer waits at 0 for a slot
+        showing = sum(1 for _, x, _g in items if (self._ph.get(x["id"]) or {}).get("op", 0.0) is None
+                      or (self._ph.get(x["id"]) or {}).get("op", 0.0) > 1e-4)
         for _, lay, ghost in items:
             i = lay["id"]
             ph = self._phase(i)
@@ -623,12 +682,16 @@ class StackState:
             want = 0.0 if ghost or v["mute"] or (solo and not v["solo"]) else v["opacity"]
             if ph["op"] is None:                     # restored from disk: already there
                 ph["op"] = want
-            if ph["bright"] is None:
-                ph["bright"] = v["bright"]
+            elif ph["op"] <= 1e-4 and want > 0.0:
+                if showing >= MAX_LAYERS:
+                    want = 0.0
+                else:
+                    showing += 1
             if dt > 0:
                 lim = SLEW * dt
                 ph["op"] += min(lim, max(-lim, want - ph["op"]))
-                ph["bright"] += min(2.0 * lim, max(-2.0 * lim, v["bright"] - ph["bright"]))
+            self._limit(ph, v, dt)
+            ph["bright"] = v["bright"]
             if ghost:
                 if ph["op"] <= 1e-4:
                     continue
@@ -637,11 +700,15 @@ class StackState:
             if res.pop("capped"):
                 capped.append(i)
             if ph["op"] > 1e-4:
+                res["ghost"] = ghost
                 frame.append(res)
         self._ghost = [g for g in self._ghost if g[1]["id"] in alive]
         for i in [i for i in self._ph if i not in alive and self.find(i) is None]:
             del self._ph[i]
-        self.frame, self.live, self.capped = frame[-MAX_LAYERS:], live, capped
+        while len(frame) > MAX_LAYERS:               # over the shader's 8: a fading ghost goes first (the faintest),
+            gh = [r for r in frame if r["ghost"]]      # never a live layer from the bottom of the pile
+            frame.remove(min(gh, key=lambda r: r["F"][0]) if gh else frame[0])
+        self.frame, self.live, self.capped = frame, live, capped
         return self.frame
 
 
@@ -740,7 +807,14 @@ def _resolve(v, ph, dt, bpm, beat, hold, palette, aspect, k=0):
     # the band coordinate runs toward the viewer on the floor / in the tunnel, outward and "with the arrow" elsewhere
     sign = 1.0 if (space in (S_TUNNEL, S_FLOOR) and gen not in RADIAL) else -1.0
     W = s["W"]
-    phase = (sign * (ph["scroll"] + v["phase"])) % W + k * W
+    raw = sign * (ph["scroll"] + v["phase"])
+    if ph.get("W") not in (None, W) and ph.get("sign") == sign:      # W changed (band count / direction moved in a
+        ph["base"] = raw - (ph["sent"] % W)                          # circular space): keep the band index, no re-colour
+    elif ph.get("sign") not in (None, sign):
+        ph["base"] = 0.0
+    sent = (raw - ph.get("base", 0.0)) % W
+    ph["W"], ph["sign"], ph["sent"] = W, sign, sent
+    phase = sent + k * W
     warp_amp = 0.0
     if gen in RADIAL:
         warp_amp = v["warp"]
@@ -825,7 +899,7 @@ vec3 stepCol(int b, int n, float k, float D){
 float profile(int wv, float fx, float w, float duty, float soft){
   float t = abs(fx-0.5);
   if (wv == 0) {                                     // sine: duty sharpens / widens the crest
-    float c = 0.5+0.5*cos(TAU*t);
+    float c = clamp(0.5+0.5*cos(TAU*t), 0.0, 1.0);
     return pow(c, (1.0-duty)/max(duty, 0.02));
   }
   if (wv == 1) {                                     // square: crisp band, edge = one pixel or the softness
@@ -922,6 +996,7 @@ void main(){
       val = mix(val, dk*(wv == 1 ? 1.0 : 0.6)*gain, smoothstep(0.5, 1.2, w));   // finer than a pixel: the mean
     }
     val *= fade;
+    if (!(val >= 0.0)) val = 0.0;                    // a NaN (exact centre pixel) must not reach the alpha
 
     // ---- colour: each band takes the next stop (flat), or the stops as one smooth loop
     float fxc = x-floor(x), kk = (gen == 4) ? k : floor(x);
@@ -950,6 +1025,7 @@ void main(){
   acc = max(acc, 0.0);
   acc /= max(1.0, max3(acc));                        // hue-preserving clip
   if (!(acc.r >= 0.0 && acc.g >= 0.0 && acc.b >= 0.0)) acc = vec3(0.0);
+  if (!(keep >= 0.0)) keep = 1.0;
   f = vec4(acc*amount, clamp((1.0-keep)*amount, 0.0, 1.0));
 }
 """
@@ -1009,6 +1085,7 @@ class StackPass:
                 blend_on = bool(self._gl.glIsEnabled(self._gl_blend))
             except Exception:
                 blend_on = False
+        prev_fbo, prev_vp = ctx.fbo, ctx.viewport
         ctx.disable(self._mgl.BLEND)
         self._fbo.use()
         ctx.viewport = (0, 0, *self.out_size)
@@ -1024,6 +1101,11 @@ class StackPass:
         self.draws += 1
         if blend_on:
             ctx.enable(self._mgl.BLEND)
+        try:                                         # the caller's framebuffer and viewport, as they were
+            prev_fbo.use()
+            ctx.viewport = prev_vp
+        except Exception:
+            pass
         return self._tex
 
     def read(self):

@@ -228,3 +228,87 @@ def test_widened_faders_change_the_picture_and_keep_their_default(tmp_path):
         a = _img(res[n]["path"])
         assert np.abs(a - base).mean() / 255 * 100 > 1.0, f"{n}: still barely visible"
         assert (a.max(axis=2) < 8).mean() > 0.25 and (a.min(axis=2) > 235).mean() < 0.01, n
+
+
+# ---------------------------------------------------------------- review round (research/gemini_review_polish_governor.md)
+
+def test_palette_names_do_not_claim_a_living_tradition():
+    import control
+    names = [n for n, _ in lv.PALETTES]
+    assert len(names) == 5 and "Emerald Jungle" in names and not any("Shipibo" in n for n in names)
+    assert control.OPTIONS["palette"] == names                               # the panel shows the same labels
+
+
+def test_flat_droste_gets_the_spin_twist(tmp_path):                           # finding 4
+    assert "p_twirl*1.1*lr" not in lv.SCENE_FS and "tw*lr" in lv.SCENE_FS
+    base = dict(symmetry=0, travel_mode=3, travel=0.4, rotate=0, l_ai=0, spin=0.5)
+    res = _batch(tmp_path, {"spin": dict(sets=base, frames=90), "twist": dict(sets=dict(base, spin_twist=1.0), frames=90)},
+                 "--render", "640x400")
+    d = np.abs(_img(res["twist"]["path"]) - _img(res["spin"]["path"])).mean() / 255 * 100
+    assert d > 4.0, f"spin twist does next to nothing in flat Droste ({d:.2f} %)"   # was 0.8 % (antialias scale only)
+
+
+def test_spin_speed_seen_by_the_shader_is_slewed_and_held_by_freeze():        # finding 5
+    ph = lv.Phases()
+    vals = dict(lv.defaults(), spin=1.0, spin_twist=1.0)
+    ph.advance(1 / 60, vals, np.zeros(3))
+    first = ph.uniforms(vals)["spinV"]
+    assert 0.0 < first < 0.35, f"a step in spin reaches the corkscrew in one frame ({first:.2f})"
+    for _ in range(40):
+        ph.advance(1 / 60, vals, np.zeros(3))
+    assert ph.uniforms(vals)["spinV"] == pytest.approx(1.0, abs=0.01)         # and settles within two thirds of a second
+    held = ph.uniforms(vals)["spinV"]
+    for s in (-1.0, 0.3, -0.7):                                               # frozen: modulated spin must not twitch the picture
+        v = dict(vals, spin=s, freeze=1.0)
+        ph.advance(1 / 60, v, np.zeros(3))
+        assert ph.uniforms(v)["spinV"] == held
+    assert ph.uniforms(dict(vals, spin=5.0))["spinV"] <= 1.0
+
+
+def test_melt_keeps_under_the_pastel_ceiling():                               # finding 10
+    line = next(ln for ln in lv.SCENE_FS.splitlines() if ln.strip().startswith("vec3 trail = held"))
+    assert "0.972" not in lv.SCENE_FS and "0.958, melt)" in line              # melt decay <= the 0.96 cap on the same line
+    assert "(1.0-0.6*melt)" in line                                           # and the hue turns slower while it melts
+
+
+def test_art_piece_loading_never_flashes_an_ai_texture(tmp_path):             # finding 11
+    import art_layer
+    art = tmp_path / "art"
+    art_layer.write_test_art(art)
+    for mode in (2, 5):
+        res = _batch(tmp_path / f"m{mode}", {"art": dict(sets=dict(l_art=1.0, art_use=mode, art_source=0), frames=3),
+                                             "off": dict(sets=dict(l_art=0.0), frames=3)}, "--render", "640x400", "--art", art)
+        d = np.abs(_img(res["art"]["path"]) - _img(res["off"]["path"])).mean() / 255 * 100
+        assert d < 0.05, f"art_use {mode}: something other than the chosen piece is shown while it decodes ({d:.1f} %)"
+    code = Path(lv.__file__).read_text(encoding="utf-8")
+    assert '.source, vals, dtf,' in code and '.source, vals, dts,' not in code   # speed 0 does not stall a piece switch
+    # an empty library still falls back to the AI texture (the layer is not dead without uploads)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    res = _batch(tmp_path / "e", {"art": dict(sets=dict(l_art=1.0, art_use=2, art_source=0), frames=30),
+                                  "off": dict(sets=dict(l_art=0.0), frames=30)}, "--render", "640x400", "--art", empty)
+    assert np.abs(_img(res["art"]["path"]) - _img(res["off"]["path"])).mean() / 255 * 100 > 2.0
+
+
+def test_kene_clocks_are_wrapped_on_the_cpu():                                # finding 14
+    body = lv.SCENE_FS[lv.SCENE_FS.index("float keneBitM("):lv.SCENE_FS.index("vec3 vidSample(")]
+    import re
+    code = re.sub(r"//[^\n]*", "", body)
+    # (the palette phase t*0.02 stays: at 20 h its float32 step is 1e-4 of a palette cycle, invisible)
+    assert "t*0.11" not in code and "t*3.0" not in code, "the kene pivots / shimmer still use the unbounded clock"
+    assert code.count("tK + hash21") == 2 and code.count("+tS)") == 2
+    ph = lv.Phases()
+    vals = dict(lv.defaults(), speed=2.0)
+    for _ in range(360000):                                                   # 20 h of show time at speed 2
+        ph.T += 0.1 * 2.0
+    u = ph.uniforms(vals)
+    assert ph.T > 7e4 and 0.0 <= u["tK"] < 64.0 and 0.0 <= u["tS"] < 64.0
+    a, b = lv.Phases(), lv.Phases()
+    a.T, b.T = 1000.0, 1000.0 + 1 / 60                                        # one frame on: the clocks move by exactly t x rate
+    da = (b.uniforms(vals)["tS"] - a.uniforms(vals)["tS"]) % 64.0
+    assert da == pytest.approx(3.0 / 60, abs=1e-9)
+    assert ph.uniforms(vals, 3)["tK"] - u["tK"] == pytest.approx(192.0)       # +k periods, like every wrapped phase
+
+
+def test_stencil_floor_is_not_amplified_by_stacked_layers():                  # finding 15
+    assert "(im*1.55+0.06)*m*(0.55+0.45*min(max3(col), 1.0))" in lv.SCENE_FS

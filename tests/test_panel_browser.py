@@ -73,7 +73,9 @@ def test_panel_loads_and_drives_the_controller(served, size):
         want = {n for n in control.CONT if n != "art_index"}
         assert want <= have, want - have
         page.click('#tabs button[data-tab="perform"]')
-        box = page.locator('#pg-perform [data-mt="param:zoom"] .sl').bounding_box()
+        zoom = page.locator('#pg-perform [data-mt="param:zoom"] .sl')
+        zoom.scroll_into_view_if_needed()                 # phone: the macros sit below the scene grid
+        box = zoom.bounding_box()
         page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] * 0.1)
         page.keyboard.down("KeyB")
         page.wait_for_timeout(500)
@@ -148,7 +150,8 @@ def test_bypass_switches_on_tabs_pages_and_layer_rows(served):
         keys = set(control.BYPASS_COVER)
         tabs = page.eval_on_selector_all("#tabs button[data-tab]", "els => els.map(e => [e.dataset.tab, !!e.querySelector('.pw')])")
         for t, has in tabs:
-            assert has == (t in keys), f"tab {t}: power switch {'missing' if t in keys else 'unexpected'}"
+            want = t in keys and t != "layers"     # LAYERS has no header icon: one click there blacked out everything (Opus review A2)
+            assert has == want, f"tab {t}: power switch {'missing' if want else 'unexpected'}"
         assert dict(tabs)["motion"] and not dict(tabs)["mapping"] and not dict(tabs)["perform"]
         base = dict(ctl.base)
         page.click('#tabs button[data-tab="motion"] .pw')                # header icon: toggles, does not switch tab
@@ -239,3 +242,170 @@ def test_preview_is_off_by_default_and_one_state_poll(tmp_path):
         th.join(timeout=2)
         ctl.close()
         rc.stop()
+
+
+def _open(pw, url, w=1920, h=1080):
+    br = launch(pw)
+    page = br.new_page(viewport=dict(width=w, height=h))
+    errors = []
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(url)
+    page.wait_for_function("window.__panel && window.__panel.state().online", timeout=10000)
+    page.click('#tabs button[data-tab="perform"]')
+    page.wait_for_timeout(300)
+    return br, page, errors
+
+
+FITS = """(() => { const m = document.getElementById('main'), t = document.getElementById('trig').getBoundingClientRect();
+    const low = Math.max(...[...document.querySelectorAll('#pg-perform > .pfz')].map(e => e.getBoundingClientRect().bottom));
+    return [m.scrollHeight - m.clientHeight, document.documentElement.scrollWidth - innerWidth, low <= t.top + 1,
+            document.documentElement.scrollHeight - innerHeight]; })()"""
+
+
+def test_perform_fits_one_screen_at_1920x1080(served):
+    """PERFORM is one screen on a 1920x1080 laptop: no vertical or horizontal scrolling, every zone above the trigger
+    row, also with every layer switched on (the layer strip at its tallest)."""
+    url, ctl = served
+    with pw_api.sync_playwright() as pw:
+        br, page, errors = _open(pw, url)
+        zones = page.eval_on_selector_all("#pg-perform > *", "els => els.map(e => e.className)")
+        assert len(zones) == 4 and all("pfz" in z for z in zones), zones      # scenes, macros, live layers, quick boxes
+        assert page.locator("#pg-perform .pfs .sc").count() == control.N_SCENES
+        for n in ("zoom", "speed", "spin", "travel", "symmetry", "chase", "trails"):
+            assert page.locator(f'#pg-perform .pfm [data-mt="param:{n}"] .fm').count() == 1, n   # fader + its MOD button
+        assert page.is_visible("#pg-perform .pfm .rip") and page.is_visible("#pg-perform .pfsrc")
+        assert page.is_visible("#pg-perform .txmini input") and page.is_visible("#pfaip")
+        over, wide, above, doc = page.evaluate(FITS)
+        assert over <= 1 and wide <= 2 and above and doc <= 1, (over, wide, above, doc)
+        layers = [n for n in control.CONT if n.startswith("l_")] + ["serpent"]
+        for n in layers:
+            ctl.set(n, 0.5)
+        page.wait_for_timeout(700)
+        assert page.locator("#pg-perform .pfl .lrow:not(.gone)").count() == len(layers)
+        over, wide, above, doc = page.evaluate(FITS)
+        assert over <= 1 and wide <= 2 and above and doc <= 1, ("all layers on", over, wide, above, doc)
+        br.close()
+    assert errors == []
+
+
+def test_perform_zones_drive_the_same_commands(served):
+    """Scene pads, transition + autopilot selectors, the live layer strip and the drawers of the PERFORM tab."""
+    url, ctl = served
+    ctl.quantize, ctl.morph_bars = "off", 0.0
+    with pw_api.sync_playwright() as pw:
+        br, page, errors = _open(pw, url)
+        page.click("#pg-perform .pfs .sc >> nth=2")
+        assert until(lambda: ctl.cur == 2)
+        page.click("#pg-perform .pftr .seg >> nth=0 >> text=4")
+        page.click("#pg-perform .pftr .seg >> nth=2 >> text=64")                # the slower autopilot periods
+        assert until(lambda: ctl.morph_bars == 4 and ctl.auto["bars"] == 64)
+        # only the layers that are showing have a row; the rest is a count with a drawer
+        on = [n for n in list(control.CONT) if (n.startswith("l_") or n == "serpent") and ctl.base[n] > 0.02]
+        assert page.locator("#pg-perform .pfl .lrow:not(.gone)").count() == len(on)
+        assert ctl.base["l_fractal"] == 0
+        page.click("#pg-perform .pfoffb")
+        page.click(".pfdw.on .pfoff button:has-text('Math fractals')")
+        assert until(lambda: ctl.base["l_fractal"] > 0.5), "the OFF drawer brings a layer in"
+        page.wait_for_timeout(300)
+        assert page.locator("#pg-perform .pfl .lrow:not(.gone)").count() == len(on) + 1
+        # Esc closes a drawer; it does not start PANIC
+        page.click("#pg-perform .pfm .pfh button")
+        assert page.locator(".pfdw.on [data-mt='param:rotate']").count() == 1
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(700)
+        assert page.locator(".pfdw.on").count() == 0 and ctl.panics == 0
+        # a row switched off with EYE stays in place so it can be switched straight back on
+        row = page.locator("#pg-perform .pfl .lrow:not(.gone)").first
+        row.locator(".ey").click()
+        assert until(lambda: len(ctl.bypass) == 1)
+        assert row.is_visible() and row.locator(".ey").inner_text() == "OFF"
+        row.locator(".ey").click()
+        assert until(lambda: ctl.bypass == set())
+        # the ripple pad sends ripples; + ADD opens BUILD
+        box = page.locator("#pg-perform .pfm .rip").bounding_box()
+        page.mouse.click(box["x"] + box["width"] * 0.25, box["y"] + box["height"] * 0.5)
+        page.click("#pg-perform .pfadd")
+        assert page.evaluate("window.__panel.state().tab") == "build"
+        br.close()
+    assert errors == []
+
+
+def _hold_panic_button(page):
+    box = page.locator("#panic").bounding_box()
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    assert page.evaluate("([x, y]) => !!document.elementFromPoint(x, y).closest('#panic')", [x, y]), "PANIC is covered"
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.wait_for_timeout(750)
+    page.mouse.up()
+
+
+@pytest.mark.parametrize("size", [(1920, 1080), (1366, 768), (390, 844)])
+def test_panic_is_one_hold_away_whatever_is_open_or_focused(served, size):
+    """Opus review H3: a drawer, the MOD editor or the key sheet never covers the top bar, and holding Esc reaches PANIC
+    on the SAME press that closed a drawer or left a text box."""
+    url, ctl = served
+    with pw_api.sync_playwright() as pw:
+        br, page, errors = _open(pw, url, *size)
+        more = "#pg-perform .pfm .pfh button"
+        # 1. the PANIC button under an open drawer, the MOD editor and the key sheet
+        for n, opener in enumerate([lambda: page.click(more), lambda: page.evaluate("window.__panel.openMod('zoom')"),
+                                    lambda: page.keyboard.press("?")]):
+            opener()
+            page.wait_for_timeout(200)
+            assert page.locator(".pfdw.on, #modp.on, #ov.on").count() == 1
+            _hold_panic_button(page)
+            assert until(lambda: ctl.panics == n + 1), f"overlay {n}: PANIC did not fire"
+            page.keyboard.press("Escape")                       # a tap only closes
+            page.wait_for_timeout(200)
+            assert page.locator(".pfdw.on, #modp.on, #ov.on").count() == 0 and ctl.panics == n + 1
+        # 2. hold Esc with a drawer open: it closes AND the same hold is PANIC
+        page.click(more)
+        page.keyboard.down("Escape")
+        page.wait_for_timeout(750)
+        page.keyboard.up("Escape")
+        assert page.locator(".pfdw.on").count() == 0 and until(lambda: ctl.panics == 4), "hold-Esc with a drawer open"
+        # 3. hold Esc while typing in the PERFORM text box and the AI box: focus is released, PANIC fires
+        for k, sel in enumerate(("#pg-perform .txmini input", "#pfaip")):
+            page.click(sel)
+            page.keyboard.type("om")
+            page.keyboard.down("Escape")
+            page.wait_for_timeout(750)
+            page.keyboard.up("Escape")
+            assert page.evaluate("document.activeElement.tagName") != "INPUT", sel
+            assert until(lambda: ctl.panics == 5 + k), sel
+        page.click("#pfaip")                                    # a tap of Esc leaves the box and is not a PANIC
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(700)
+        assert ctl.panics == 6 and page.evaluate("document.activeElement.tagName") != "INPUT"
+        br.close()
+    assert errors == []
+
+
+def test_drawers_survive_other_tabs_and_touch_targets_are_44px(served):
+    """Opus review L5 (a drawer opened from another tab stays open) and L6 (touch screens: 44 px targets)."""
+    url, ctl = served
+    with pw_api.sync_playwright() as pw:
+        br = launch(pw)
+        for w, h in ((1366, 768), (820, 1180), (390, 844)):
+            ctx = br.new_context(viewport=dict(width=w, height=h), has_touch=True, is_mobile=True)
+            page = ctx.new_page()
+            page.goto(url)
+            page.wait_for_function("window.__panel && window.__panel.state().online", timeout=10000)
+            page.evaluate("window.__panel.setTab('perform')")
+            page.wait_for_timeout(300)
+            if not page.evaluate("matchMedia('(pointer:coarse)').matches"):
+                pytest.skip("this browser does not emulate a coarse pointer")
+            small = page.evaluate("""[...document.querySelectorAll('#pg-perform .seg button, #pg-perform .pfh > button, #pg-perform .ey, #pg-perform .fm, #pg-perform .sc, #pg-perform .pfdk button, #pg-perform .pfair button, #pg-perform .txmini button')]
+                .filter(b => b.offsetParent).map(b => { const r = b.getBoundingClientRect(); return [b.textContent.trim(), Math.round(r.width), Math.round(r.height)]; })
+                .filter(x => x[1] < 44 || x[2] < 44)""")
+            assert small == [], (w, h, small)
+            assert page.evaluate("document.documentElement.scrollWidth - window.innerWidth") <= 2, (w, h)
+            ctx.close()
+        page = br.new_page(viewport=dict(width=1920, height=1080))
+        page.goto(url)
+        page.wait_for_function("window.__panel && window.__panel.state().online", timeout=10000)
+        page.evaluate("window.__panel.setTab('scenes'); window.__d = window.__panel.mkDrawer('probe'); window.__d.open()")
+        page.wait_for_timeout(900)
+        assert page.locator(".pfdw.on").count() == 1, "a drawer used outside PERFORM must stay open"
+        br.close()

@@ -23,3 +23,9 @@ online_keys.tmp
 fonts/*
 !fonts/.gitkeep
 tests/golden/*.tmp
+models/
+calibration/
+shows/
+presets/
+research/kene_reference/images/
+*.entheo

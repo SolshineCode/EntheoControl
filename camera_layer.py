@@ -44,7 +44,9 @@ PORTS = [p for p in range(8767, 8776)]            # 8765 panel, 8766 AI worker
 SIGNALS = ("crowd_motion", "crowd_left", "crowd_centre", "crowd_right", "crowd_presence",
            "hand_height", "hands_spread", "hip_sway", "hand_speed")
 RIPPLE_HZ = 2.0
-ATTACK_S, RELEASE_S = 0.10, 0.35
+ATTACK_S, RELEASE_S = 0.18, 0.35
+SLEW_MAX = 1.5                                    # signal units per second at most (a 6 Hz crowd flicker -> < 0.13 p-p)
+MASK_TAU_MIN = 0.16                               # s: silhouettes can never step faster than this (photosensitive)
 STALE_S = 1.5                                     # no new camera data for this long -> silhouettes fade, signals -> 0
 RES_LABELS = ["480x270", "320x180", "240x135"]
 QUALITY = [dict(fps=None, res=None, pose_every=None), dict(fps=15, res=None, pose_every=3),
@@ -81,8 +83,11 @@ def clean_settings(raw):
     c = raw.get("crop")
     if isinstance(c, (list, tuple)) and len(c) == 4:
         x0, y0, x1, y1 = (_f(v, 0.0, 1.0, d) for v, d in zip(c, DEFAULTS["crop"]))
-        if x1 - x0 >= 0.1 and y1 - y0 >= 0.1:
-            s["crop"] = [x0, y0, x1, y1]
+        if x1 - x0 < 0.1:                               # keep a 10 % window: move the far edge, never reset all four
+            x1 = min(1.0, x0 + 0.1); x0 = x1 - 0.1
+        if y1 - y0 < 0.1:
+            y1 = min(1.0, y0 + 0.1); y0 = y1 - 0.1
+        s["crop"] = [x0, y0, x1, y1]
     return s
 
 
@@ -204,7 +209,8 @@ class Signals:
         b = primary(bodies)
         t, sh, hp = torso(b) if b else (None, None, None)
         if t is not None:
-            wr = [b[n] for n in ("l_wrist", "r_wrist") if n in b]
+            wd = {n: b[n] for n in ("l_wrist", "r_wrist") if n in b}
+            wr = list(wd.values())
             if wr:
                 tg["hand_height"] = max(min(max(0.5 + (w[1] - sh[1]) / (2.0 * t), 0.0), 1.0) for w in wr)
             if len(wr) == 2:
@@ -212,11 +218,12 @@ class Signals:
             a = 1.0 - math.exp(-max(dt, 0.0) / 1.5)
             self._hip_c = hp[0] if self._hip_c is None else self._hip_c + (hp[0] - self._hip_c) * a
             tg["hip_sway"] = min(max((hp[0] - self._hip_c) / (0.5 * t), -1.0), 1.0)
-            if self._wrists is not None and dt > 0:
-                sp = [math.hypot(w[0] - p[0], w[1] - p[1]) / dt / t for w, p in zip(wr, self._wrists)]
+            if self._wrists is not None and dt > 0:            # same wrist to same wrist only (never left -> right)
+                sp = [math.hypot(w[0] - self._wrists[n][0], w[1] - self._wrists[n][1]) / dt / t
+                      for n, w in wd.items() if n in self._wrists]
                 if sp:
                     tg["hand_speed"] = 1.0 - math.exp(-max(sp) / 4.0)
-            self._wrists = wr if len(wr) == 2 or self._wrists is None or len(self._wrists) == len(wr) else None
+            self._wrists = wd
         else:
             self._wrists, self._hip_c = None, None
         self.target = tg
@@ -230,7 +237,9 @@ class Signals:
         for k, tv in self.target.items():
             v = self.v[k]
             tau = ATTACK_S if abs(tv) > abs(v) else RELEASE_S
-            self.v[k] = v + (tv - v) * (1.0 - math.exp(-dt / tau))
+            step = (tv - v) * (1.0 - math.exp(-dt / tau))
+            lim = SLEW_MAX * dt
+            self.v[k] = v + min(max(step, -lim), lim)
             if abs(self.v[k]) < 1e-4 and tv == 0.0:
                 self.v[k] = 0.0
         return self.v
@@ -371,7 +380,7 @@ class WorkerLink:
 
     def configure(self, cfg):
         with self._lock:
-            self._cfg = dict(cfg)
+            self._cfg = dict(self._cfg or {}, **cfg)   # merge: a quality step never drops a queued key
 
     def quit(self):
         self._stop.set()
@@ -441,7 +450,32 @@ class WorkerLink:
             pass
 
 
-def spawn_worker(port, s, here=HERE, log_dir=None):
+def kill_tree(proc):
+    """Hard stop of OUR worker: on Windows the venv launcher's real python child too (taskkill /T on our own pid)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=5,
+                           creationflags=0x08000000, stdin=subprocess.DEVNULL)
+        else:
+            proc.kill()
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
+
+def last_log_line(here=HERE):
+    """The newest camera log's last [camera] line (the real reason a worker died early)."""
+    try:
+        logs = sorted((Path(here) / "logs").glob("camera_*.log"))
+        if not logs:
+            return ""
+        lines = [x for x in logs[-1].read_text(encoding="utf-8", errors="replace").splitlines() if x.startswith("[camera]")]
+        return lines[-1][9:].strip()[:200] if lines else ""
+    except OSError:
+        return ""
+
+
+def spawn_worker(port, s, here=HERE, token=None, log_dir=None):
     """Start camera_worker.py hidden, BELOW_NORMAL, its output into logs/camera_<time>.log (no frames, ever)."""
     log_dir = Path(log_dir) if log_dir is not None else here / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -451,8 +485,9 @@ def spawn_worker(port, s, here=HERE, log_dir=None):
             "--max-poses", str(s["max_poses"] if s["pose"] else 0), "--parent", str(os.getpid())]
     flags = (0x08000000 | 0x00004000) if os.name == "nt" else 0     # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
     try:
+        env = dict(os.environ, CAMERA_WORKER_TOKEN=token or "")    # never on the command line
         return subprocess.Popen(args, cwd=str(here), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                creationflags=flags)
+                                creationflags=flags, env=env)
     finally:
         log.close()
 
@@ -468,7 +503,12 @@ def read_token(here=HERE):
 
 class CameraLayer:
     def __init__(self, ctx=None, controller=None, here=HERE, spawn=spawn_worker, link_factory=WorkerLink,
-                 clock=time.monotonic, aspect=1.6, devices_fn=None):
+                 clock=time.monotonic, aspect=1.6, devices_fn=None, sync=False):
+        self.sync = bool(sync)                         # tests: start / stop inline; the engine: on their own threads
+        self._gen = 0                                  # start/stop generation (a late starter never revives an OFF)
+        self._teardown = None
+        self.token = None                              # per-spawn secret shared only with our own worker (env, not argv)
+        self._mask_target = None
         self.ctx, self.ctl, self.here = ctx, controller, Path(here)
         self._spawn, self._link_factory, self.clock, self.aspect = spawn, link_factory, clock, aspect
         self._devices_fn = devices_fn
@@ -563,37 +603,50 @@ class CameraLayer:
         threading.Thread(target=work, name="camera-devices", daemon=True).start()
 
     # ---- process
-    def start(self):
+    def start(self, manual=True):
+        """CAMERA ON. Returns at once: the port probe + process spawn run on a thread (never stall the render loop),
+        after any previous worker has released the device."""
         if self.on:
             return
         if not self.ok:
             self.status = "unavailable"
             return
-        token = read_token(self.here)
-        if not token:
-            self.status, self.reason = "error", "no .remote_token next to the code"
-            return
+        if manual:
+            self.restarts = 0
+        self.on, self.status, self.reason, self._started, self.quality = True, "starting", "", self.clock(), 0
+        self._gen += 1
+        gen, prev = self._gen, self._teardown
+        if self.sync:
+            self._spawn_now(gen, prev)
+        else:
+            threading.Thread(target=self._spawn_now, args=(gen, prev), name="camera-start", daemon=True).start()
+
+    def _spawn_now(self, gen, prev):
+        import secrets
+        if prev is not None:
+            prev.join(timeout=8.0)                     # the old worker must have let go of the webcam first
         port = free_port()
         if port is None:
-            self.status, self.reason = "error", "no free local port in 8767-8775"
+            self.status, self.reason, self.on = "error", "no free local port in 8767-8775", False
             return
         from camera_worker import unpack
+        token = secrets.token_urlsafe(24)
         try:
-            self.proc = self._spawn(port, self.s, self.here)
+            proc = self._spawn(port, self.s, self.here, token)
+        except TypeError:                              # an older spawn signature (tests)
+            proc = self._spawn(port, self.s, self.here)
         except Exception as ex:
-            self.status, self.reason = "error", f"could not start camera_worker.py: {ex}"[:200]
+            self.status, self.reason, self.on = "error", f"could not start camera_worker.py: {ex}"[:200], False
             return
-        self.port, self.on = port, True
-        self.link = self._link_factory(port, token, unpack)
-        self.status, self.reason, self._started = "starting", "", self.clock()
-        self.quality = 0
-        print(f"[camera] ON (worker pid {getattr(self.proc, 'pid', '?')}, port {port})")
+        link = self._link_factory(port, token, unpack)
+        if gen != self._gen or not self.on:            # switched OFF meanwhile: undo
+            self._stop_worker(link, proc)
+            return
+        self.token, self.port, self.proc, self.link = token, port, proc, link
+        print(f"[camera] ON (worker pid {getattr(proc, 'pid', '?')}, port {port})")
 
-    def stop(self):
-        """CAMERA OFF: ask the worker to quit (it releases the device), then make sure it is gone."""
-        was = self.on
-        self.on = False
-        link, proc, self.link, self.proc = self.link, self.proc, None, None
+    @staticmethod
+    def _stop_worker(link, proc):
         if link is not None:
             try:
                 link.quit()
@@ -603,14 +656,26 @@ class CameraLayer:
             try:
                 proc.wait(timeout=2.0)
             except Exception:
-                try:
-                    proc.terminate()                   # only ever our own child process
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    pass
+                kill_tree(proc)                        # only ever our own child (and the real python behind the launcher)
+
+    def stop(self):
+        """CAMERA OFF: returns at once; the worker is asked to quit (it releases the device) and, failing that, its
+        process tree is killed, on a teardown thread. A following ON waits for that teardown."""
+        was = self.on
+        self.on = False
+        self._gen += 1
+        link, proc, self.link, self.proc = self.link, self.proc, None, None
+        if link is not None or proc is not None:
+            if self.sync:
+                self._stop_worker(link, proc)
+            else:
+                self._teardown = threading.Thread(target=self._stop_worker, args=(link, proc), name="camera-stop",
+                                                  daemon=True)
+                self._teardown.start()
         self.status = "off" if self.ok else "unavailable"
         self.reason = "" if self.ok else self.reason
         self.t_data, self.mask, self.flow, self.bodies, self.hands = None, None, None, [], {}
+        self._mask_target, self.live, self._data_t, self.port, self.token = None, 0.0, None, None, None
         self.signals.lost()
         if was:
             print("[camera] OFF (device released)")
@@ -628,11 +693,15 @@ class CameraLayer:
         """Process health + governor steps (strain: 0 ok, 1 strained, 2 critical, from governor.level)."""
         if self.proc is not None and self.proc.poll() is not None:
             code = self.proc.returncode
-            err = (self.link.status.get("error") if self.link is not None else "") or f"worker exited ({code})"
+            err = (self.link.status.get("error") if self.link is not None else "") or last_log_line(self.here) \
+                or f"worker exited ({code})"
+            healthy = now - self._started > 300.0
             self.stop()
+            if healthy:
+                self.restarts = 0                      # a long healthy run earns its restarts back
             if self.restarts < 2 and now - self._started > 10.0 and code not in (3, 4):
                 self.restarts += 1
-                self.start()
+                self.start(manual=False)
                 self.reason = f"restarted after: {err}"
             else:
                 self.status, self.reason = "error", err
@@ -659,7 +728,7 @@ class CameraLayer:
 
     # ---- per frame (GL thread). Everything below returns at once while the camera is off and the signals are 0.
     def pre_update(self, dt, strain=0):
-        if not self.on and self.signals.idle():
+        if not self.on and self.signals.idle() and self.live == 0.0:
             if getattr(self.ctl, "signals", None):
                 self.ctl.signals.clear()
             return
@@ -675,6 +744,12 @@ class CameraLayer:
             self.live = max(0.0, self.live - dt / 0.5)
         else:
             self.live = min(1.0, self.live + dt / 0.5)
+        if self._mask_target is not None:              # silhouettes glide every frame (time constant >= MASK_TAU_MIN)
+            tau = MASK_TAU_MIN + 0.45 * float(self._vals.get("crowd_soft", 0.4))
+            a = 1.0 - math.exp(-max(dt, 0.0) / tau)
+            self.mask = self._mask_target.copy() if self.mask is None or self.mask.shape != self._mask_target.shape \
+                else self.mask + (self._mask_target - self.mask) * a
+            self._dirty = True
         sig = self.signals.step(dt)
         if getattr(self.ctl, "signals", None) is not None:
             self.ctl.signals.update(sig)
@@ -700,10 +775,7 @@ class CameraLayer:
             except Exception:
                 pass
         # silhouettes: temporal smoothing (time constant >= 0.07 s: nothing it draws can flicker above ~2 Hz)
-        m = res["mask"].astype(np.float32) * (1.0 / 255.0)
-        tau = 0.07 + 0.45 * float(self._vals.get("crowd_soft", 0.4))
-        a = 1.0 - math.exp(-max(ddt, 1.0 / 30.0) / tau)
-        self.mask = m if self.mask is None or self.mask.shape != m.shape else self.mask + (m - self.mask) * a
+        self._mask_target = res["mask"].astype(np.float32) * (1.0 / 255.0)   # pre_update glides toward it
         fl = res["flow"]
         af = 1.0 - math.exp(-max(ddt, 1.0 / 30.0) / 0.25)
         self.flow = fl if self.flow is None or self.flow.shape != fl.shape else self.flow + (fl - self.flow) * af
@@ -754,7 +826,10 @@ class CameraLayer:
 
     # ---- dancer -> serpent 1 (overrides uni["serpA"][0] while an arm is seen)
     def _serpent(self, vals, uni):
-        k = float(vals.get("crowd_serpent", 0.0))
+        k = float(vals.get("crowd_serpent", 0.0)) * min(float(vals.get("l_camera", 0.0)) * 4.0, 1.0)
+        now = self.clock()
+        dt = min(max(now - getattr(self, "_serp_t", now), 0.0), 0.1)
+        self._serp_t = now
         if (k <= 0.0 and self._serp_w <= 0.0) or vals.get("serpent", 0.0) <= 0.0 or "serpA" not in uni:
             return
         b = primary(self.bodies)
@@ -764,10 +839,11 @@ class CameraLayer:
                 self._serp = list(tr)
             else:
                 d = (tr[0] - self._serp[0] + math.pi) % (2 * math.pi) - math.pi
-                self._serp = [self._serp[0] + d * 0.35, self._serp[1] + (tr[1] - self._serp[1]) * 0.35,
-                              self._serp[2] + (tr[2] - self._serp[2]) * 0.35]
+                f = 1.0 - math.exp(-dt / 0.04)
+                self._serp = [self._serp[0] + d * f, self._serp[1] + (tr[1] - self._serp[1]) * f,
+                              self._serp[2] + (tr[2] - self._serp[2]) * f]
         want = k if tr is not None else 0.0
-        self._serp_w += (want - self._serp_w) * 0.06   # ~0.3 s glide on and off the arm
+        self._serp_w += (want - self._serp_w) * (1.0 - math.exp(-dt / 0.3))   # 0.3 s glide on and off the arm
         if self._serp_w < 0.01:
             if want == 0.0:
                 self._serp_w = 0.0
@@ -839,12 +915,13 @@ class CameraLayer:
     # ---- panel
     def state(self):
         st = dict(on=self.on, status=self.status, reason=self.reason, notes=self.notes, available=self.ok,
-                  settings=self.s, devices=self.devices, quality=self.quality,
+                  settings=dict(self.s, crop=list(self.s["crop"])),
+                  devices=[dict(d) for d in self.devices] if self.devices else self.devices, quality=self.quality,
                   signals={k: round(v, 3) for k, v in self.signals.v.items()},
                   bodies=len(self.bodies), cost_ms=round(self.cost_ms, 3), res_labels=RES_LABELS)
         if self.link is not None:
             ws = self.link.status or {}
-            st.update(fps=ws.get("fps"), grab_fps=ws.get("grab_fps"), ms=ws.get("ms"), backend=ws.get("backend"))
+            st.update(fps=ws.get("fps"), grab_fps=ws.get("grab_fps"), ms=dict(ws.get("ms") or {}), backend=ws.get("backend"))
         return st
 
     def cost(self):
@@ -852,6 +929,50 @@ class CameraLayer:
         ws = (self.link.status if self.link is not None else {}) or {}
         return dict(active=self.on, engine_ms=round(self.cost_ms, 3), fps=ws.get("fps"), ms=ws.get("ms"),
                     quality=self.quality)
+
+    def still(self, skip=2, timeout=6.0):
+        """AUTO MAP (its own thread, never the GL thread): a fresh grey camera still, 640x360 uint8, taken `skip`
+        frames after the request. Memory only. Raises RuntimeError with a reason the wizard shows."""
+        if not self.on or self.port is None:
+            raise RuntimeError("switch the CAMERA on (CAMERA tab) and point it at the projection")
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            c.request("GET", f"/still?skip={int(skip)}", headers={"X-Token": self.token or ""})
+            r = c.getresponse()
+            body = r.read()
+        finally:
+            c.close()
+        if r.status != 200:
+            raise RuntimeError("the camera did not deliver a frame (is it still on?)")
+        from camera_worker import unpack_still
+        return unpack_still(body)
+
+    def _post_config(self, cfg, timeout=3.0):
+        """Synchronous /config (wizard thread only): the change is in force when this returns."""
+        if not self.on or self.port is None:
+            raise RuntimeError("switch the CAMERA on (CAMERA tab) and point it at the projection")
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            c.request("POST", "/config", body=json.dumps(cfg).encode(),
+                      headers={"X-Token": self.token or "", "Content-Type": "application/json"})
+            r = c.getresponse()
+            r.read()
+        finally:
+            c.close()
+        return r.status == 200
+
+    def lock_exposure(self, on):
+        try:
+            self._post_config({"lock_exposure": bool(on)})
+        except Exception:
+            pass
+
+    def allow_stills(self, seconds):
+        """AUTO MAP only: the worker serves /still for `seconds` (0 = stop now). Otherwise /still refuses."""
+        try:
+            self._post_config({"allow_still_s": max(0.0, min(float(seconds), 600.0))})
+        except Exception:
+            pass
 
     def debug_jpeg(self):
         if self.link is None:
@@ -885,7 +1006,7 @@ uniform sampler2D camM, camF;       // crowd camera: silhouette mask (smoothed),
 uniform mat3 camH;                  // screen uv -> camera uv (alignment: mirror, crop, position, scale, keystone)
 uniform float camFlipX;
 uniform float p_l_camera, p_crowd_mode, p_crowd_glow, p_crowd_hue, p_crowd_push;
-vec2 camUV(vec2 ps, vec2 asp){ vec3 c = camH*vec3(ps/asp+0.5, 1.0); return c.xy/c.z; }
+vec2 camUV(vec2 ps, vec2 asp){ vec3 c = camH*vec3(ps/asp+0.5, 1.0); return c.z > 1e-4 ? c.xy/c.z : vec2(-1.0); }
 float camIn(vec2 cu){ vec2 e = smoothstep(vec2(0.0), vec2(0.02), cu)*smoothstep(vec2(0.0), vec2(0.02), 1.0-cu); return e.x*e.y; }
 float camMask(vec2 ps, vec2 asp){ vec2 cu = camUV(ps, asp); return texture(camM, cu).r*camIn(cu); }
 vec2 camWarp(vec2 ps, vec2 asp){                   // flow push (any mode, + mode 5) and the inner swirl of mode 2
@@ -914,12 +1035,13 @@ void camScene(inout vec3 col, inout float cov, vec2 ps, vec2 asp){   // before t
     col += g; cov = max(cov, max3(g));
   }
 }
-void camShow(inout vec3 o, inout float cov, vec2 ps, vec2 asp){     // after the echo, before the limiter
+void camShow(inout vec3 o, inout float cov, vec2 ps, vec2 asp, float edge){   // after the echo, before the limiter
   float cm = floor(p_crowd_mode+0.5), a = p_l_camera;
   if (cm == 0.0) { float m = camMask(ps, asp); o *= mix(1.0, m, a); cov *= mix(1.0, m, a); }
   else if (cm == 3.0) { float m = camMask(ps, asp); o *= 1.0 - a*m; }
-  else if (cm == 1.0) { vec3 g = camTint(ps)*camEdge(ps, asp)*(0.35+1.1*p_crowd_glow)*a; o += g; cov = max(cov, max3(g)); }
+  else if (cm == 1.0) { vec3 g = camTint(ps)*camEdge(ps, asp)*(0.35+1.1*p_crowd_glow)*a*edge; o += g; cov = max(cov, max3(g));
+                        o /= max(1.0, max3(o)); }
 }
 """
 NULL_GLSL = ("uniform float p_l_camera; vec2 camWarp(vec2 a, vec2 b){ return vec2(0.0); } "
-             "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b){}")
+             "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b, float e){}")

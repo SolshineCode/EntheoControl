@@ -209,7 +209,7 @@ def test_suggest_mode_shows_a_diff_and_changes_nothing_until_apply(tmp_path):
     p = last_prop(st)
     assert p["status"] == "pending"
     assert any("zoom" in d and "0.60" in d for d in p["diff"])
-    assert any("Emerald Shipibo" in d for d in p["diff"])  # option names, not numbers
+    assert any("Emerald Jungle" in d for d in p["diff"])  # option names, not numbers
     m = st["msgs"][-1]
     assert m["role"] == "assistant" and m["text"] == "Deeper, greener." and m["backend"] == "claude" and "secs" in m
     do(c, op="apply", id=p["id"])

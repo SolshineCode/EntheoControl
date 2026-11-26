@@ -39,7 +39,7 @@ Play some music on the laptop. The visuals breathe with the bass, mids and highs
   - **MOD** makes the fader follow the bass, mids, highs, a beat-synced LFO or a random walk
 
 ## 3. Shape the pattern (10 min)
-1. **PERFORM:** move **Zoom**, **Rotate speed**, **Symmetry** (flat vs mandala) and **Speed**. Try the palettes.
+1. **PERFORM** (everything on one screen): in **Macros** move **Zoom**, **Spin**, **Symmetry** (flat vs mandala) and **Speed**, tap the palette swatches, tap the **ripple pad**. **MORE CONTROLS…** has Rotate speed, Swim, Hue and the rest.
 2. **SHAPE:** **Twirl**, **Bulge**, **Wave**. Click the XY pad to drop **ripples**.
 3. **COLOR:** turn up the **light chase**, the TAS-style sweep of a hue window across the pattern.
 4. **MOTION:**
@@ -62,7 +62,7 @@ Play some music on the laptop. The visuals breathe with the bass, mids and highs
 4. **AI DREAM:** type a prompt such as *"glowing jade buddha, sacred geometry, black background"*. About 2.5 s later the new image appears in Sources.
 
 ## 5. Layer it up (5 min)
-- **Layers card** (top of PERFORM): **EYE** shows or hides a layer on the wall, and the fader sets its strength. With PREVIEW on, **SOLO** previews a layer in the panel only, without the audience seeing it.
+- **Live layers** (PERFORM): only the layers that are showing; **EYE** shows or hides a layer on the wall, the fader sets its strength, "+ N OFF" brings another one in. The full **Layers card** is on LAYERS, the next tab: with PREVIEW on, **SOLO** previews a layer in the panel only, without the audience seeing it.
 - **3D DECKS:** two raymarched worlds (corridor, torus wormhole, stained-glass vortex, honeycomb domes) with a crossfader and blend modes, plus a particle **swarm**.
 - **TEXT:** type words and pick a font. Then choose movement (drift, orbit, wave, spiral into the tunnel) and how they weave in (on top, engraved into the pattern, mask, knockout, warp, melt with the scene).
 
@@ -78,6 +78,13 @@ Play some music on the laptop. The visuals breathe with the bass, mids and highs
 - **Autopilot** steps through your saved scenes on its own. It runs locally and calls no AI.
 - **MIDI:** click **MIDI LEARN**, click any control, then move a knob or hit a pad. Default maps exist for the APC mini mk2 and Launch Control XL.
 - **Record:** press **REC**. Choose clean program or the mapped wall, with or without laptop audio. Files go to `recordings\`.
+
+## 7b. Save your show, keep presets, build a timeline (10 min)
+- **Save everything:** top bar **SHOW** > type a name > **SAVE AS**. From then on **Ctrl+S**. If the laptop crashes, open SHOW and press **RECOVER**.
+- **Keep a look for later:** top bar **PRESETS** > name it > **SAVE PRESET**. Click its card any time to bring it back, or tick only COLOR first to take just its colours.
+- **Make a timeline:** open **TIMELINE**. Double-click the *Sections* row to mark "intro", "build", "drop". Double-click *Cues* and type a scene number. Add a lane with **+ AUTOMATION LANE** (try Zoom) and double-click it to set points; drag them.
+- **Or record it live:** press **REC**, then **PLAY**, and perform: fader moves, scene pads, triggers and layer switches are written in. Press PLAY again to stop; **UNDO** removes the whole take.
+- **Play it back:** **PLAY**. Grab a fader at any moment and it is yours; let go and the timeline takes it back (or press **RELEASE**). **PANIC** always stops it.
 
 ## 8. Optional: the online assistant
 Turn **ONLINE** on and open **ASSISTANT**, then describe what you want, for example *"slower and deeper, emerald palette, bring in the jaguar"*.

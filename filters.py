@@ -21,6 +21,8 @@ kaleido (mirror / quad / kaleidoscope with spin).
 Standalone: python filters.py --gallery [IN.png ...] [--out DIR]   -> stills per filter + contact sheet + ms table
 """
 import math
+import os
+import time
 
 from params import FILTER_TYPES, PARAMS
 
@@ -34,6 +36,8 @@ T_WRAP = 1600.0                            # shader time wraps here (all its use
 KAL_RATE = 1.2                             # rad/s of kaleido spin at flt_kal_spin = 1
 GLITCH_MIN_HZ, GLITCH_MAX_HZ = 0.2, 2.5    # event rate range; 2.5 Hz < the 3 flashes/s limit (WCAG 2.3.1)
 GLITCH_RAMP_S = 0.06                       # every glitch fades in / out over at least this long (no hard cuts)
+DREAM_RESEED_S = 0.5                       # dream unused for longer than this (wall clock) -> re-seed from the picture
+NOISE_P = 64.0                             # period of the dream's noise lattice; its drift phases wrap here
 
 
 def _f(x, default=0.0):
@@ -89,7 +93,7 @@ class GlitchClock:
         return self._r / 4294967296.0
 
     def step(self, dt, rate, amount):
-        dt = max(0.0, _f(dt))
+        dt = min(max(0.0, _f(dt)), 0.5 * GLITCH_RAMP_S)   # a frame stall can never turn a ramp into a cut
         if dt == 0.0:
             return self.env, self.seed
         hz = GLITCH_MIN_HZ + (GLITCH_MAX_HZ - GLITCH_MIN_HZ) * min(max(_f(rate), 0.0), 1.0)
@@ -118,22 +122,47 @@ class GlitchClock:
 
 
 class ChainState:
-    """CPU side of the pass: wrapped time, kaleido spin phase, glitch clock. Freeze stops all of it."""
+    """CPU side of the pass: wrapped time, kaleido spin phase, glitch clock, dream drift phases. Freeze stops all of it.
+    Every phase the shaders see wraps at its own period, where its use repeats exactly (no pop at any wrap)."""
 
     def __init__(self):
         self.t = 0.0
         self.kal_phase = 0.0
         self.glitch = GlitchClock(seed=11)
         self.glitch_env, self.glitch_seed = 0.0, 0
+        self.glitch_amt, self.glitch_blk = 0.0, 0.4     # latched at each onset: a MOD on them cannot pop blocks
+        self.drift = [0.0, 0.0, 0.0, 0.0]               # dream noise drift (lattice units), wrapped at NOISE_P
+        self.wob = 0.0                                  # dream eye wobble phase, wrapped at TAU
 
     def advance(self, dt, vals):
         fz = min(max(_f(vals.get("freeze", 0.0)), 0.0), 1.0)
         d = max(0.0, _f(dt)) * (1.0 - fz)
         self.t = (self.t + d) % T_WRAP
         self.kal_phase = (self.kal_phase + d * _f(vals.get("flt_kal_spin", 0.0)) * KAL_RATE) % TAU
+        for i, rate in enumerate((0.031, -0.023, 0.05, -0.04)):
+            self.drift[i] = (self.drift[i] + d * rate) % NOISE_P
+        self.wob = (self.wob + d * 0.4) % TAU
+        prev_seed = self.glitch_seed
         self.glitch_env, self.glitch_seed = self.glitch.step(d, vals.get("flt_glitch_rate", 0.3),
                                                              vals.get("flt_glitch", 0.0))
+        if self.glitch_seed != prev_seed:               # new event (it starts invisible): take the knobs now
+            self.glitch_amt = min(max(_f(vals.get("flt_glitch", 0.0)), 0.0), 1.0)
+            self.glitch_blk = min(max(_f(vals.get("flt_glitch_block", 0.4), 0.4), 0.0), 1.0)
         return d
+
+
+def run(fp, disp, vals, clock, dt, limiter, master, blackout, pal=None, log=print):
+    """Engine entry: True when the chain (incl. its limiter / master / blackout stage) wrote `disp`. False on ANY
+    failure: the caller must then redraw the scene with the real limiter / master / blackout (never show an unlimited
+    frame). FILTERS_TEST_FAULT=1 in the environment makes it fail on purpose (regression test of that fallback)."""
+    try:
+        if os.environ.get("FILTERS_TEST_FAULT") == "1":
+            raise RuntimeError("FILTERS_TEST_FAULT")
+        fp.apply(disp, vals, clock, dt, limiter=limiter, master=master, blackout=blackout, pal=pal)
+        return True
+    except Exception as ex:
+        log(f"[filters] failed: {type(ex).__name__}: {ex}")
+        return False
 
 
 # =====================================================================================================================
@@ -150,7 +179,8 @@ in vec2 v_uv;
 const float TAU = 6.28318530718, PI = 3.14159265359;
 float luma(vec3 c){ return dot(c, vec3(0.299, 0.587, 0.114)); }
 float max3(vec3 c){ return max(c.r, max(c.g, c.b)); }
-vec3 safe(vec3 c){ return (c.r >= 0.0 && c.g >= 0.0 && c.b >= 0.0 && c.r < 64.0 && c.g < 64.0 && c.b < 64.0) ? c : vec3(0.0); }
+// NaN / Inf / absurd -> black; a slightly negative channel (hueRot of a saturated colour) is clamped, not blanked
+vec3 safe(vec3 c){ vec3 a = abs(c); return (a.r < 64.0 && a.g < 64.0 && a.b < 64.0) ? max(c, 0.0) : vec3(0.0); }
 vec3 tap(sampler2D s, vec2 uv){ return safe(texture(s, uv).rgb); }
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
 vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33);
@@ -159,6 +189,9 @@ vec3 hueRot(vec3 c, float a){ const vec3 k = vec3(0.57735); float ca = cos(a);
   return c*ca + cross(k, c)*sin(a) + k*dot(k, c)*(1.0 - ca); }
 float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0 - 2.0*f);
   return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+float hashP(vec2 i){ return hash12(mod(i, 64.0)); }          // lattice periodic at 64 (NOISE_P): drift wraps seamlessly
+float pnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0 - 2.0*f);
+  return mix(mix(hashP(i), hashP(i + vec2(1, 0)), u.x), mix(hashP(i + vec2(0, 1)), hashP(i + vec2(1, 1)), u.x), u.y); }
 mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
 """
 
@@ -183,7 +216,8 @@ void main(){
 # the picture has light. Everything is gated by the input's light, so black stays black.
 DREAM_FS = COMMON + """
 uniform sampler2D src, prev;
-uniform vec2 res; uniform float asp, scl, swirl, motif, t, fr, amt;
+uniform vec2 res; uniform float asp, scl, swirl, motif, fr, amt, wob;
+uniform vec4 drift;                 // noise drift phases, each wrapped at 64 (the noise lattice period)
 out vec4 f;
 vec2 PX;
 vec3 S(vec2 uv){ return tap(src, uv); }
@@ -202,7 +236,7 @@ vec4 eyeAt(vec2 q, float rnd, vec3 tint, float aa){
   float stri = 0.6 + 0.4*sin(atan(q.y, q.x)*19.0 + rnd*40.0);
   float line = (1.0 - smoothstep(0.0, 2.5*aa, abs(lid)))*(1.0 - smoothstep(w - aa, w + 2.0*aa, abs(q.x)));
   float glint = 1.0 - smoothstep(0.0, ir*0.25, length(q - vec2(-ir*0.38, ir*0.36)));
-  vec3 irisC = normalize(hueRot(tint, 2.2 + 1.6*rnd) + 0.05)*1.25;
+  vec3 irisC = normalize(max(hueRot(tint, 2.2 + 1.6*rnd), 0.0) + 0.05)*1.25;
   vec3 sclera = mix(vec3(0.9, 0.85, 0.75), tint, 0.45)*0.75;
   vec3 col = sclera*(1.0 - 0.55*smoothstep(0.0, 1.0, abs(q.x)/w));
   col = mix(col, irisC*stri*(0.45 + 0.9*r/ir), iris);
@@ -212,28 +246,30 @@ vec4 eyeAt(vec2 q, float rnd, vec3 tint, float aa){
   return vec4(col, clamp(max(inside, line), 0.0, 1.0));
 }
 
-// eyes on a jittered lattice of `cells` per frame height; returns colour + coverage of the nearest eye
+// eyes on a jittered lattice of `cells` per frame height. Every eye of the 3x3 neighbourhood is drawn (an eye may
+// overhang its cell), the one with the most coverage wins; presence fades with density (no pop when motif moves).
 vec4 eyes(vec2 p, float cells, float dens, vec3 tint, float seed){
   vec2 g = p*cells, gi = floor(g), gf = fract(g);
-  vec4 best = vec4(0.0); float bd = 9.0;
+  vec4 best = vec4(0.0);
+  float aa = 1.2*cells/res.y;
   for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
     vec2 o = vec2(i, j), id = gi + o;
-    vec2 h = hash22(id + seed);
-    vec2 c = o + 0.5 + (h - 0.5)*0.5 - gf;               // offset from this pixel to the cell's point (cell units)
-    float d = dot(c, c);
-    if (d < bd) { bd = d; best = vec4(-c, id); }
+    vec2 c = o + 0.5 + (hash22(id + seed) - 0.5)*0.5 - gf;   // offset from this pixel to the cell's point (cell units)
+    if (dot(c, c) > 0.81) continue;                          // too far for any eye to reach (max half-width 0.45)
+    float rnd = hash12(id*1.37 + seed + 3.1);
+    float pres = smoothstep(dens, dens - 0.08, rnd);
+    if (pres <= 0.0) continue;
+    vec2 cuv = (id + 0.5)/cells; cuv.x /= asp; cuv += 0.5;  // the cell's point in uv: is there light to grow from?
+    vec2 rr = vec2(0.3/(cells*asp), 0.3/cells);
+    float e = smoothstep(0.03, 0.2, max(max(energyAt(cuv), energyAt(cuv + rr)), max(energyAt(cuv - rr),
+              max(energyAt(cuv + vec2(rr.x, -rr.y)), energyAt(cuv + vec2(-rr.x, rr.y))))));
+    if (e <= 0.0) continue;
+    float ang = (hash12(id + seed + 9.7) - 0.5)*0.9 + 0.25*sin(wob + rnd*TAU);
+    vec4 ey = eyeAt(rot(ang)*(-c), rnd, tint, aa);
+    ey.a *= e*pres;
+    if (ey.a > best.a) best = ey;
   }
-  vec2 id = best.zw, q = best.xy;
-  float rnd = hash12(id*1.37 + seed + 3.1);
-  if (rnd > dens) return vec4(0.0);
-  vec2 cuv = (id + 0.5)/cells; cuv.x /= asp;              // the cell's point in uv: is there light to grow from?
-  float e = smoothstep(0.06, 0.32, energyAt(cuv));
-  if (e <= 0.0) return vec4(0.0);
-  float ang = (hash12(id + seed + 9.7) - 0.5)*0.9 + 0.25*sin(t*0.4 + rnd*TAU);
-  q = rot(ang)*q;
-  float aa = 1.2*cells/res.y;
-  vec4 ey = eyeAt(q, rnd, tint, aa);
-  return vec4(ey.rgb, ey.a*e);
+  return best;
 }
 
 void main(){
@@ -251,8 +287,8 @@ void main(){
 
   // advection: along the contours (fur / swirls) + curl noise, plus a slow zoom in (the recursive dive)
   vec2 pa = (uv - 0.5)*vec2(asp, 1.0);
-  vec2 np = pa*2.3 + vec2(t*0.031, -t*0.023);
-  float e1 = 0.05, n0 = vnoise(np), nx = vnoise(np + vec2(e1, 0.0)), ny = vnoise(np + vec2(0.0, e1));
+  vec2 np = pa*2.3 + drift.xy;
+  float e1 = 0.05, n0 = pnoise(np), nx = pnoise(np + vec2(e1, 0.0)), ny = pnoise(np + vec2(0.0, e1));
   vec2 curl = vec2(ny - n0, -(nx - n0))/e1;
   vec2 flow = (tg*smoothstep(0.0, 0.12, gm)*1.4 + curl*0.18)*swirl*fr*PX*1.6;
   float zoom = 1.0 - 0.0016*swirl*fr;
@@ -261,30 +297,29 @@ void main(){
   float r = 1.6 + 2.2*scl;                                  // band-pass radius (half-res px): feature size
   vec3 bl = (tap(prev, q + vec2(r*PX.x, 0.0)) + tap(prev, q - vec2(r*PX.x, 0.0)) +
              tap(prev, q + vec2(0.0, r*PX.y)) + tap(prev, q - vec2(0.0, r*PX.y)))*0.25;
-  vec3 det = fb - bl;
-  float lumd = luma(det);
-  vec3 amp = fb + det*1.35 + hueRot(det, 2.1)*0.45*abs(lumd)*6.0;   // amplified features + complementary fringes
+  vec3 det = clamp(fb - bl, -0.3, 0.3);
+  vec3 amp = max(fb + det*0.45 + hueRot(det, 2.1)*0.25, 0.0); // amplified features + complementary fringes (bounded)
 
   // pull back toward the live picture (persistence per 60 Hz frame)
   float keep = pow(mix(0.62, 0.955, swirl), fr);
-  vec3 base = mix(c0*1.05, amp, keep);
-  base = max(mix(vec3(luma(base)), base, 1.28), 0.0);       // DeepDream's oversaturated look
+  vec3 base = mix(c0, amp, keep);
+  base = max(mix(vec3(luma(base)), base, 1.2), 0.0);        // DeepDream's oversaturated look
 
   // motifs: m 0 = eyes, 0.5 = fur / dog-slug segments, 1 = scales / arches; eyes never fully vanish
   float wE = clamp(1.0 - 2.0*motif, 0.0, 1.0)*0.75 + 0.25;
   float wF = 1.0 - abs(2.0*motif - 1.0);
   float wS = clamp(2.0*motif - 1.0, 0.0, 1.0);
   vec3 tint = max3(c0) > 0.02 ? c0/max3(c0) : vec3(0.7, 0.5, 0.9);
-  float cells = mix(16.0, 5.0, scl);
+  float cells = mix(11.0, 3.5, scl);
   vec2 pf = pa;
   float el = smoothstep(0.03, 0.3, max3(c0) + gm*2.0);
   vec3 add = vec3(0.0);
   if (wF > 0.01) {                                           // fur / dog-slug: ridges along the contours, beaded
-    vec2 pw = pf*cells*2.2 + vec2(vnoise(pf*3.0 + t*0.05), vnoise(pf*3.0 + 7.0 - t*0.04))*2.0;
+    vec2 pw = pf*cells*2.2 + vec2(pnoise(pf*3.0 + drift.z), pnoise(pf*3.0 + 7.0 + drift.w))*2.0;
     float ph = dot(pw, n)*3.2 + 2.5*vnoise(pw*0.35);
     float rid = pow(0.5 + 0.5*sin(ph), 3.0);
     float seg = 0.55 + 0.45*sin(dot(pw, tg)*1.6 + 1.7*vnoise(pw*0.5 + 3.0));
-    add += hueRot(tint, 0.9*sin(ph*0.5))*rid*seg*wF*0.55*el;
+    add += max(hueRot(tint, 0.9*sin(ph*0.5)), 0.0)*rid*seg*wF*0.35*el*max3(c0 + 0.15);
   }
   if (wS > 0.01) {                                           // scales / arches: voronoi rims lit from above
     vec2 g = pf*cells*1.7, gi = floor(g), gf = fract(g);
@@ -297,11 +332,11 @@ void main(){
     float edge = sqrt(d2) - sqrt(d1);
     float rim = 1.0 - smoothstep(0.02, 0.14, edge);
     float arch = smoothstep(-0.5, 0.45, cq.y)*smoothstep(0.0, 0.25, edge);
-    add += (hueRot(tint, 1.3)*rim*0.7 + tint*arch*0.35)*wS*el;
+    add += (max(hueRot(tint, 1.3), 0.0)*rim*0.5 + tint*arch*0.25)*wS*el*max3(c0 + 0.2);
   }
   vec3 o = base + add;
-  vec4 ey = eyes(pf, cells, 0.18 + 0.45*wE, tint, 0.0);      // two scales of eyes: self-similar
-  vec4 ey2 = eyes(pf, cells*2.35, 0.10 + 0.30*wE, tint, 41.0);
+  vec4 ey = eyes(pf, cells, 0.25 + 0.5*wE, tint, 0.0);      // two scales of eyes: self-similar
+  vec4 ey2 = eyes(pf, cells*2.35, 0.15 + 0.4*wE, tint, 41.0);
   o = mix(o, ey2.rgb, ey2.a*0.85);
   o = mix(o, ey.rgb, ey.a);
   o *= gate;
@@ -356,13 +391,16 @@ void main(){
       m[k2] += c*0.35; s[k2] += c*c*0.35; w[k2] += 0.35;
     }
   }
-  vec3 acc = vec3(0.0); float wsum = 0.0;
+  vec3 acc = vec3(0.0); float wsum = 0.0, vk[8], vmin = 1e9;
   for (int k = 0; k < 8; k++) {
-    vec3 mu = m[k]/w[k];
-    vec3 v = abs(s[k]/w[k] - mu*mu);
-    float sg = sqrt(v.r + v.g + v.b)*9.0;
-    float wk = 1.0/(1.0 + sg*sg*sg*sg*sg*sg);
-    acc += mu*wk; wsum += wk;
+    vec3 mu = m[k]/w[k], v = abs(s[k]/w[k] - mu*mu);
+    vk[k] = (v.r + v.g + v.b + 1e-3)/pow(0.05 + max3(mu), 1.5);   // variance per unit of light: lit strokes count calmer
+    vmin = min(vmin, vk[k]);
+  }
+  for (int k = 0; k < 8; k++) {
+    float q = vmin/vk[k], q2 = q*q, q4 = q2*q2;
+    float wk = q4*q4;                                          // decisive: the calmest sector(s) paint the pixel
+    acc += m[k]/w[k]*wk; wsum += wk;
   }
   f = vec4(safe(acc/max(wsum, 1e-6)), 1.0);
 }
@@ -395,7 +433,7 @@ float dotCover(vec2 pp, float a, float v){                    // AA dot of area 
   vec2 q = (R*pp)/cell, ci = floor(q) + 0.5;
   float r = cell*sqrt(clamp(v, 0.0, 0.785)/PI);
   float d = length(q - ci)*cell;
-  return clamp(r - d + 0.5, 0.0, 1.0);
+  return clamp(r - d + 0.5, 0.0, 1.0)*smoothstep(0.001, 0.008, v);   // no light where the picture has none
 }
 vec2 cellCentre(vec2 pp, float a){ mat2 R = rot(a); vec2 ci = floor((R*pp)/cell) + 0.5; return transpose(R)*(ci*cell); }
 void main(){
@@ -430,7 +468,7 @@ NEON_EDGE_FS = COMMON + """
 uniform sampler2D src; uniform vec2 res; uniform float colormode, t;
 uniform vec3 pal[5];
 out vec4 f;
-vec3 palette(float x){ x = fract(x)*5.0; int i = int(x); float fr = smoothstep(0.0, 1.0, fract(x));
+vec3 palette(float x){ x = fract(x)*5.0; int i = min(int(x), 4); float fr = smoothstep(0.0, 1.0, fract(x));
   return mix(pal[i], pal[(i + 1)%5], fr); }
 void main(){
   vec2 px = 1.0/res, uv = v_uv;
@@ -439,14 +477,14 @@ void main(){
   vec3 g = tap(src, uv - px), h = tap(src, uv - vec2(0.0, px.y)), k = tap(src, uv + vec2(px.x, -px.y));
   vec3 gx = (cc + 2.0*e + k) - (a + 2.0*d + g), gy = (a + 2.0*b + cc) - (g + 2.0*h + k);
   float gm = sqrt(max3(gx*gx + gy*gy));
-  float edge = smoothstep(0.08, 0.55, gm);
+  float edge = smoothstep(0.15, 0.75, gm);
   vec3 hi = max(max(max(a, b), max(cc, d)), max(max(e, g), max(h, k)));   // colour of the lit side
   vec3 own = max3(hi) > 0.01 ? hi/max3(hi) : vec3(0.0);
-  float dir = atan(luma(gy), luma(gx))/TAU;
+  float dir = atan(luma(gy), luma(gx) + 1e-6)/TAU;
   vec3 pc = palette(dir + t*0.05);
   vec3 col = mix(own, pc, colormode);
   col = max(mix(vec3(luma(col)), col, 1.35), 0.0);
-  f = vec4(col*edge*step(0.01, max3(hi)), 1.0);
+  f = vec4(safe(col*edge*clamp(max3(hi)*1.3, 0.0, 1.0)), 1.0);           // edge light follows the picture's own level
 }
 """
 
@@ -455,7 +493,8 @@ uniform sampler2D src, edges, glow; uniform float amt, keep, gl;
 out vec4 f;
 void main(){
   vec3 c = tap(src, v_uv), e = tap(edges, v_uv), g = max(tap(glow, v_uv) - 0.012, 0.0);
-  vec3 o = c*keep*0.85 + e + g*gl*2.2;
+  vec3 o = c*keep*0.85 + e*0.7 + g*gl*1.0;
+  o /= 1.0 + max(max3(o) - 1.0, 0.0);                        // soft shoulder: no surge for the limiter to chase
   f = vec4(mix(c, o, amt), 1.0);
 }
 """
@@ -498,7 +537,8 @@ uniform sampler2D src, bloom; uniform float amt, norm;
 out vec4 f;
 void main(){
   vec3 c = tap(src, v_uv), b = max(tap(bloom, v_uv)*norm - 0.01, 0.0);   // knee: far halo tails end in true black
-  f = vec4(c + b*amt*1.6, 1.0);
+  vec3 o = c + b*amt*2.2;
+  f = vec4(o/(1.0 + max(max3(o) - 1.0, 0.0)), 1.0);          // soft shoulder
 }
 """
 
@@ -558,15 +598,23 @@ void main(){
   vec3 c0 = tap(src, uv);
   float k0 = luma(c0);
   float m0 = smoothstep(thr - 0.03, thr + 0.03, k0);
-  if (m0 <= 0.0) { f = vec4(c0, 0.0); return; }
-  vec2 dir = vec2(cos(ang*PI), -sin(ang*PI))*px*mix(1.0, 3.0, len);
+  vec2 dir = vec2(cos(ang*PI), -sin(ang*PI))*px*mix(0.75, 1.5, len);   // <= 1.5 half-res px per tap: no skipping
+  // streaks: bright pixels are dragged along the sort direction, fading out (sorted bright-to-dark runs)
+  float bestv = 0.0; vec3 bestc = vec3(0.0);
+  for (int i = 1; i <= 40; i++) {
+    vec3 c = tap(src, uv - dir*float(i)); float k = luma(c);
+    float wv = 1.0 - float(i)/41.0;
+    if (k > thr && k*wv > bestv) { bestv = k*wv; bestc = c*wv*wv*wv*0.75; }
+  }
+  float sa = smoothstep(0.0, 0.04, max3(bestc) - max3(c0));
+  if (m0 <= 0.0) { f = vec4(max(c0, bestc)*sa, sa); return; }      // premultiplied: no fringes when upsampled
   vec3 lo = c0, hi = c0; float klo = k0, khi = k0, nb = 0.0, nf = 0.0;
-  for (int i = 1; i <= 32; i++) {
+  for (int i = 1; i <= 40; i++) {
     vec3 c = tap(src, uv - dir*float(i)); float k = luma(c);
     if (k < thr) break;
     nb += 1.0; if (k < klo) { klo = k; lo = c; } if (k > khi) { khi = k; hi = c; }
   }
-  for (int i = 1; i <= 32; i++) {
+  for (int i = 1; i <= 40; i++) {
     vec3 c = tap(src, uv + dir*float(i)); float k = luma(c);
     if (k < thr) break;
     nf += 1.0; if (k < klo) { klo = k; lo = c; } if (k > khi) { khi = k; hi = c; }
@@ -574,7 +622,8 @@ void main(){
   float fpos = (nb + 0.5)/(nb + nf + 1.0);
   vec3 o = mix(lo, hi, smoothstep(0.0, 1.0, fpos));
   float span = smoothstep(1.0, 6.0, nb + nf);
-  f = vec4(o, m0*span);
+  float a = max(m0*span, sa);
+  f = vec4(max(o, bestc)*a, a);
 }
 """
 
@@ -584,12 +633,12 @@ out vec4 f;
 void main(){
   vec3 c = tap(src, v_uv); vec4 s = texture(srt, v_uv);
   float a = (s.a >= 0.0 && s.a <= 1.0) ? s.a : 0.0;
-  f = vec4(mix(c, safe(s.rgb), a*amt), 1.0);
+  f = vec4(c*(1.0 - a*amt) + safe(s.rgb)*amt, 1.0);          // premultiplied "over"
 }
 """
 
 GLITCH_FS = COMMON + """
-uniform sampler2D src; uniform vec2 res; uniform float amt, env, seed, blk;
+uniform sampler2D src; uniform vec2 res; uniform float amt, env, seed, blk;   // amt + blk latched at the onset
 out vec4 f;
 void main(){
   vec2 pp = gl_FragCoord.xy;
@@ -616,7 +665,7 @@ void main(){
   vec2 p = (v_uv - 0.5)*vec2(asp, 1.0), q;
   int md = int(mode + 0.5);
   if (md == 2) {
-    float n = floor(folds + 0.5), seg = TAU/n;
+    float n = max(2.0, floor(folds + 0.5)), seg = TAU/n;
     float a = atan(p.y, p.x) + ph, r = length(p);
     a = mod(a, seg); a = abs(a - 0.5*seg);
     q = r*vec2(cos(a), sin(a));
@@ -667,6 +716,9 @@ class FilterPass:
             except Exception as ex:                 # one bad shader disables only the filters that need it
                 self.broken[name] = str(ex)
                 print(f"[filters] shader {name} failed: {ex}")
+        if "final" in self.broken or "final" not in self.progs:  # no final stage = no limiter / blackout: refuse
+            self.release()
+            raise RuntimeError(f"final stage failed to compile: {self.broken.get('final', '?')}")
         self.T = None                               # targets, allocated lazily
         self.level = None
         self._final = {}
@@ -702,20 +754,26 @@ class FilterPass:
         self.level = self._tex((w, h), 4, "f1")
 
     def release(self):
-        for d in (getattr(self, "fbo", {}), self._final):
+        """Free every GL object. Safe to call twice."""
+        for d in (getattr(self, "fbo", None) or {}, getattr(self, "_final", None) or {}):
             for f in d.values():
                 f.release()
-        if self.T:
-            for t in self.T.values():
-                t.release()
-        if self.level is not None:
+        for t in (getattr(self, "T", None) or {}).values():
+            t.release()
+        if getattr(self, "level", None) is not None:
             self.level.release()
-        for v in self.vaos.values():
-            v.release()
-        for p in self.progs.values():
-            p.release()
-        self.vbo.release()
-        self.T, self.level, self._final = None, None, {}
+        for d in (self.vaos, self.progs):
+            for o in d.values():
+                o.release()
+        if self.vbo is not None:
+            self.vbo.release()
+        self.fbo, self._final, self.T, self.level = {}, {}, None, None
+        self.vaos, self.progs, self.vbo = {}, {}, None
+
+    def reset(self):
+        """Forget all running state (batch / gallery jobs start clean): phases, glitch clock, dream feedback."""
+        self.state = ChainState()
+        self._dream_last = -1e9
 
     close = release
 
@@ -776,7 +834,7 @@ class FilterPass:
             self._final[key] = self.ctx.framebuffer([disp, self.level])
         src = cur
         if src is disp:                              # nothing ran (all broken): copy so FINAL never reads its target
-            self.ctx.copy_framebuffer(self.fbo["A"], self._final[key])
+            self.ctx.copy_framebuffer(self.fbo["A"], self._final_src_fbo(disp))
             src = T["A"]
         self._draw("final", self._final[key], (w, h), (("src", src),), lim=float(limiter), master=float(master),
                    blackout=float(blackout))
@@ -786,10 +844,11 @@ class FilterPass:
     # one method per filter: (src texture, destination fbo, amount, values, frozen-aware dt, aspect, palette)
     def _run_dream(self, src, dst, amt, v, d, asp, pal):
         T = self.T
-        now = self.state.t
-        if abs(now - self._dream_last) > 0.5:          # first use, or back after a pause: start from the picture
-            for k in ("D0", "D1"):
-                self.ctx.copy_framebuffer(self.fbo[k], self._final_src_fbo(src))
+        now = time.monotonic()                         # wall clock: filters off / dream out of the chain = a pause
+        if now - self._dream_last > DREAM_RESEED_S:    # first use, or back after a pause: start from the picture
+            for k in ("D0", "D1"):                      # half-res box copy of the picture
+                self._draw("down", self.fbo[k], T[k].size, (("src", src),),
+                           spx=(0.5 / self.size[0], 0.5 / self.size[1]), first=0.0, thr=-1.0)
         self._dream_last = now
         a, b = ("D0", "D1") if self._dream_i % 2 == 0 else ("D1", "D0")
         if d > 0.0:                                    # frozen: the dream holds
@@ -797,7 +856,7 @@ class FilterPass:
             self._draw("dream", self.fbo[b], T[b].size, (("src", src), ("prev", T[a])),
                        res=(float(T[b].size[0]), float(T[b].size[1])), asp=asp, scl=_f(v.get("flt_dream_scale"), 0.5),
                        swirl=_f(v.get("flt_dream_swirl"), 0.5), motif=_f(v.get("flt_dream_motif"), 0.3),
-                       t=self.state.t, fr=min(max(d * 60.0, 0.0), 3.0), amt=amt)
+                       drift=tuple(self.state.drift), wob=self.state.wob, fr=min(max(d * 60.0, 0.0), 3.0), amt=amt)
         else:
             b = a
         self._draw("dream_out", dst, self.size, (("src", src), ("dream", T[b])), res=(float(self.size[0]),
@@ -810,11 +869,19 @@ class FilterPass:
             self._final[key] = self.ctx.framebuffer([tex])
         return self._final[key]
 
+    def _half(self, src):
+        """Box-filtered half-res copy of src (T['d1']): the half-res filters sample this, not the raw full-res frame
+        (1-2 px lines would alias / flicker between taps)."""
+        d1 = self.T["d1"]
+        self._draw("down", self.fbo["d1"], d1.size, (("src", src),),
+                   spx=(0.5 / self.size[0], 0.5 / self.size[1]), first=0.0, thr=-1.0)
+        return d1
+
     def _run_oil(self, src, dst, amt, v, d, asp, pal):
         T = self.T
         hs = T["H"].size
-        self._draw("oil", self.fbo["H"], hs, (("src", src),), res=(float(hs[0]), float(hs[1])),
-                   rad=2.0 + 5.0 * _f(v.get("flt_oil_size"), 0.5))
+        self._draw("oil", self.fbo["H"], hs, (("src", self._half(src)),), res=(float(hs[0]), float(hs[1])),
+                   rad=1.5 + 4.5 * _f(v.get("flt_oil_size"), 0.5))
         self._draw("oil_out", dst, self.size, (("src", src), ("oil", T["H"])), res=tuple(map(float, self.size)),
                    hres=(float(hs[0]), float(hs[1])), amt=amt, relief=_f(v.get("flt_oil_relief"), 0.4))
 
@@ -833,7 +900,7 @@ class FilterPass:
                    keep=_f(v.get("flt_neon_keep"), 0.25), gl=g * norm * 2.0)
 
     def _run_bloom(self, src, dst, amt, v, d, asp, pal):
-        thr = 0.2 + 0.7 * _f(v.get("flt_bloom_thresh"), 0.55)
+        thr = 0.1 + 0.7 * _f(v.get("flt_bloom_thresh"), 0.55)
         glow, norm = self._pyramid(src, thr, _f(v.get("flt_bloom_radius"), 0.5))
         self._draw("bloom_out", dst, self.size, (("src", src), ("bloom", glow)), amt=amt, norm=norm * 2.0)
 
@@ -848,15 +915,16 @@ class FilterPass:
     def _run_sort(self, src, dst, amt, v, d, asp, pal):
         T = self.T
         hs = T["H"].size
-        self._draw("sort", self.fbo["H"], hs, (("src", src),), res=(float(hs[0]), float(hs[1])),
-                   thr=0.05 + 0.75 * _f(v.get("flt_sort_thresh"), 0.35), len=_f(v.get("flt_sort_len"), 0.5),
+        self._draw("sort", self.fbo["H"], hs, (("src", self._half(src)),), res=(float(hs[0]), float(hs[1])),
+                   thr=0.03 + 0.5 * _f(v.get("flt_sort_thresh"), 0.35), len=_f(v.get("flt_sort_len"), 0.5),
                    ang=_f(v.get("flt_sort_angle"), 0.25))
         self._draw("sort_out", dst, self.size, (("src", src), ("srt", T["H"])), amt=amt)
 
     def _run_glitch(self, src, dst, amt, v, d, asp, pal):
-        self._draw("glitch", dst, self.size, (("src", src),), res=tuple(map(float, self.size)), amt=amt,
-                   env=float(self.state.glitch_env), seed=float(self.state.glitch_seed % 4096),
-                   blk=float(round(6.0 + 42.0 * _f(v.get("flt_glitch_block"), 0.4))))
+        st = self.state                                # the amount still scales the whole effect smoothly
+        self._draw("glitch", dst, self.size, (("src", src),), res=tuple(map(float, self.size)),
+                   amt=min(st.glitch_amt, amt), env=float(st.glitch_env), seed=float(st.glitch_seed % 4096),
+                   blk=float(round(6.0 + 42.0 * st.glitch_blk)))
 
     def _run_kaleido(self, src, dst, amt, v, d, asp, pal):
         self._draw("kaleido", dst, self.size, (("src", src),), amt=amt, asp=asp,
@@ -894,8 +962,7 @@ def _gallery(inputs, out_dir, frames=50):
         for li, (ft, extra) in enumerate(looks):
             v = P.defaults()
             v.update({"flt_slot1": P.FILTER_TYPES.index(ft) + 1, f"flt_{ft}": 1.0}, **extra)
-            fp.state = ChainState()
-            fp._dream_last = -1e9
+            fp.reset()
             times = []
             for k in range(frames):
                 disp.write(arr)

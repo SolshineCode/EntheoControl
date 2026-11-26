@@ -155,7 +155,8 @@ def test_dream_job_writes_atomically_with_metadata_and_reports_done(dirs):
         with Image.open(art / d["name"]) as im:
             assert im.text["dream_preset"] == "eyes" and im.text["dream_source"] == "My piece.png"
             assert "googlenet" in im.text["dream_model"].lower()
-        assert not list(art.glob("*.tmp")) and w.status()["dream"] is None
+        assert _wait(w, lambda: w.status()["dream"] is None and not w.status()["busy"])
+        assert not list(art.glob("*.tmp"))
         assert FakeDreamer.calls[0]["device"] == "cuda" and FakeDreamer.calls[0]["max_side"] == 768
     finally:
         w.stop()
@@ -195,9 +196,6 @@ def test_low_vram_offloads_sd_turbo_then_restores(dirs):
     art, tex = dirs
     pipes = FakePipes()
     free = {"mb": 500}
-
-    class W(ai_worker.Worker):
-        pass
 
     w = ai_worker.Worker(tex, tex / "s.png", "tok", port=0, pipes_factory=lambda: pipes, art_dir=art,
                          dream_factory=FakeDreamer, vram_free=lambda: free["mb"])
@@ -300,3 +298,140 @@ def test_real_dream_small(tmp_path):
         d.release()
     assert out.size[0] == 384
     out.save(tmp_path / "real.png")
+
+
+# ------------------------------------------------------------------ review round (Gemini Neon H2 / H3 / M8 / L3)
+def test_queued_dream_is_cancelled_before_it_starts(dirs):
+    """H2: /dream-cancel must also drop dreams that are still waiting in the queue (nothing runs, nothing is written)."""
+    art, tex = dirs
+    w = _worker(dirs, 3000)
+    w.start()
+    try:
+        for _ in range(3):
+            w.submit(dreamify.validate({"name": "My piece.png", "source": "art", "octaves": 8}, art, tex))
+        assert _wait(w, lambda: w.status()["dream"] is not None)
+        w.cancel_dream()
+        assert _wait(w, lambda: not w.status()["busy"] and not w.status()["queue"])
+        time.sleep(0.3)
+        assert len(FakeDreamer.calls) == 1 and not list(art.glob("*dream*"))
+        w.submit(dreamify.validate({"name": "My piece.png", "source": "art"}, art, tex))   # later dreams still run
+        assert _wait(w, lambda: list(art.glob("*dream*")))
+    finally:
+        w.stop()
+
+
+def test_restore_failure_is_reported_and_leaves_pipes_usable(dirs):
+    """H3: SD-Turbo that cannot go back to the GPU is reported; the worker keeps going."""
+    art, tex = dirs
+
+    class BadRestore(FakePipes):
+        def restore(self):
+            self.restores += 1
+            raise RuntimeError("CUDA out of memory")
+    pipes = BadRestore()
+    w = ai_worker.Worker(tex, tex / "s.png", "tok", port=0, pipes_factory=lambda: pipes, art_dir=art,
+                         dream_factory=FakeDreamer, vram_free=lambda: 500)
+    w.start()
+    try:
+        w.q.put(("warmup", None, -1))
+        w.submit(dreamify.validate({"name": "My piece.png", "source": "art"}, art, tex))
+        assert _wait(w, lambda: pipes.restores == 1 and not w.status()["busy"])
+        assert "stays in RAM" in w.status()["error"]
+    finally:
+        w.stop()
+
+
+def test_realpipes_restore_oom_moves_everything_back_to_cpu_and_retries():
+    class FakeCuda:
+        def empty_cache(self):
+            pass
+
+        def is_available(self):
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    class Pipe:
+        def __init__(self):
+            self.where, self.fail = "cuda", True
+
+        def to(self, dev):
+            if dev == "cuda" and self.fail:
+                self.where = "half"                         # diffusers moved some modules, then OOM
+                raise RuntimeError("CUDA out of memory")
+            self.where = dev
+    rp = ai_worker.RealPipes.__new__(ai_worker.RealPipes)
+    rp.pipe, rp.torch = Pipe(), FakeTorch()
+    rp.offload()
+    assert rp.pipe.where == "cpu" and rp.on_gpu is False
+    with pytest.raises(RuntimeError):
+        rp.restore()
+    assert rp.pipe.where == "cpu" and rp.on_gpu is False   # never stranded half on each device
+    rp.pipe.fail = False
+    rp._ready()                                            # the next image retries
+    assert rp.pipe.where == "cuda" and rp.on_gpu is True
+
+
+def test_remote_routes_proxy_to_the_worker_with_auth(dirs, tmp_path):
+    import socket
+    import remote_control
+    art, tex = dirs
+    w = _worker(dirs, 3000)
+    w.start()
+    (tmp_path / "tok").write_text("tok", encoding="utf-8")
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    rc = remote_control.RemoteControl(port=port, token="panel", quiet=True, host="127.0.0.1", art_dir=art, tex_dir=tex,
+                                      ai_url=f"http://127.0.0.1:{w.port}", token_paths=[tmp_path / "tok"])
+    rc.start()
+
+    def call(path, body=None, tok="panel"):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=None if body is None else json.dumps(body).encode(),
+                                     headers={"X-Token": tok, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as ex:
+            return ex.code, json.loads(ex.read() or b"{}")
+    try:
+        assert call("/dreamify", {"name": "My piece.png", "source": "art"}, tok="bad")[0] == 403
+        assert call("/dream-status", tok="bad")[0] == 403
+        assert call("/dreamify", {"name": "../x.png", "source": "art"})[0] == 400
+        assert call("/dreamify", {"name": "nope.png", "source": "art"})[0] == 400        # the worker's own check
+        code, out = call("/dreamify", {"name": "My piece.png", "source": "art", "preset": "eyes", "octaves": 8})
+        assert code == 200 and out["id"]
+        assert _wait(w, lambda: call("/dream-status")[1].get("dream") is not None)
+        st = call("/dream-status")[1]
+        assert st["available"] and st["dream"]["preset"] == "eyes"
+        assert call("/dream-cancel", {})[0] == 200
+        assert _wait(w, lambda: call("/dream-status")[1].get("dream") is None)
+        assert not list(art.glob("*dream*"))
+    finally:
+        rc.stop()
+        w.stop()
+
+
+def test_names_slugs_collisions_and_tmp_cleanup(tmp_path):
+    assert not dreamify._plain_name("a\0b.png")
+    assert dreamify.out_name("art", "-foo.png", "eyes", "1")[0].isalnum()
+    (tmp_path / "x_dream_eyes_1.png").write_bytes(b"")
+    assert dreamify.out_name("art", "x.png", "eyes", "1", tmp_path) == "x_dream_eyes_1_1.png"
+
+    class Bad:
+        def save(self, f, **k):
+            Path(f).write_bytes(b"partial")
+            raise OSError("disk full")
+    with pytest.raises(OSError):
+        dreamify.save_png(Bad(), tmp_path / "y.png", {})
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_real_dream_releases_activations():
+    """H3: no activation tensor (and its autograd graph) outlives a gradient step."""
+    import inspect
+    src = inspect.getsource(dreamify.RealDream._grad)
+    assert "finally" in src and "self.acts = {}" in src
+    assert "self.acts = {}" in inspect.getsource(dreamify.RealDream.release)

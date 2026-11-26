@@ -75,7 +75,7 @@ def test_params_contract():
 
 
 def test_settings_and_commands_validate():
-    s = cl.clean_settings({"scale": 99, "crop": [0.5, 0.5, 0.55, 0.9], "mirror": "yes", "device": 3})
+    s = cl.clean_settings({"scale": 99, "crop": "junk", "mirror": "yes", "device": 3})
     assert s["scale"] == 4.0 and s["crop"] == [0, 0, 1, 1] and s["mirror"] is True and s["device"] == 3
     assert cl.validate_command({"op": "on"})["op"] == "on"
     c = cl.validate_command({"op": "set", "pos_x": 5, "mirror": False, "evil": 1})
@@ -145,7 +145,7 @@ def test_signal_cannot_follow_a_fast_flicker():
             sg.target = dict.fromkeys(cl.SIGNALS, 1.0 if on else 0.0)
         vals.append(sg.step(1 / 60)["crowd_motion"])
     tail = vals[300:]
-    assert max(tail) - min(tail) < 0.45
+    assert max(tail) - min(tail) < 0.15
 
 
 def test_ripple_gate_rate_limit():
@@ -238,7 +238,7 @@ def _layer(tmp_path, clock):
     ctl = FakeCtl()
     procs = []
     lay = cl.CameraLayer(None, ctl, here=tmp_path, spawn=lambda p, s, h: procs.append(FakeProc()) or procs[-1],
-                         link_factory=FakeLink, clock=clock)
+                         link_factory=FakeLink, clock=clock, sync=True)
     return lay, ctl, procs
 
 
@@ -350,3 +350,137 @@ def test_controller_reads_crowd_mod_sources():
 def test_glsl_snippet_declares_what_the_engine_calls():
     for name in ("camWarp", "camScene", "camShow", "camM", "camF", "camH", "p_l_camera"):
         assert name in cl.SCENE_GLSL and (name in cl.NULL_GLSL or name in ("camM", "camF", "camH"))
+
+
+def test_governor_status_shows_the_camera_cost_only_while_on():
+    import governor
+    g = governor.Governor(sensors=None) if "sensors" in governor.Governor.__init__.__code__.co_varnames else None
+    if g is None:
+        pytest.skip("governor signature changed")
+    assert g.status()["camera"] is None
+    g.camera_source = lambda: dict(active=True, engine_ms=0.1, fps=10)
+    assert g.status()["camera"]["fps"] == 10
+    g.camera_source = lambda: dict(active=False)
+    assert g.status()["camera"] is None
+
+
+# ---------------------------------------------------------------- regression tests for the Neon review (camera side)
+
+def test_crop_edge_moves_clamp_instead_of_resetting():
+    s = cl.clean_settings({"crop": [0.5, 0.5, 0.55, 0.9]})
+    assert s["crop"] == pytest.approx([0.5, 0.5, 0.6, 0.9])
+
+
+def test_signal_6hz_flicker_is_tiny_and_slew_limited():
+    sg = cl.Signals()
+    vals = []
+    for i in range(600):
+        if i % 5 == 0:
+            sg.target = dict.fromkeys(cl.SIGNALS, 1.0 if (i // 5) % 2 == 0 else 0.0)
+        vals.append(sg.step(1 / 60)["crowd_motion"])
+    tail = vals[300:]
+    assert max(tail) - min(tail) < 0.15
+    assert max(abs(b - a) for a, b in zip(vals, vals[1:])) <= cl.SLEW_MAX / 60 + 1e-9
+
+
+def test_hand_speed_never_pairs_left_with_right():
+    sg = cl.Signals()
+    b = {"l_shoulder": (0.45, 0.6), "r_shoulder": (0.55, 0.6), "l_hip": (0.46, 0.4), "r_hip": (0.54, 0.4),
+         "l_wrist": (0.2, 0.5), "r_wrist": (0.8, 0.5)}
+    sg.on_data({}, [b], 1 / 15)
+    b2 = dict(b)
+    del b2["l_wrist"]                                     # left wrist lost: only the (still) right one remains
+    sg.on_data({}, [b2], 1 / 15)
+    assert sg.target["hand_speed"] < 0.01
+
+
+class SlowLink(FakeLink):
+    def quit(self):
+        time.sleep(1.0)
+        self.quitted = True
+
+
+def test_camera_off_never_blocks_the_render_thread(tmp_path):
+    (tmp_path / ".remote_token").write_text("tok")
+    (tmp_path / "camera_worker.py").write_text("#")
+    if not cl.available()[0]:
+        pytest.skip("cv2 missing")
+    procs = []
+    lay = cl.CameraLayer(None, FakeCtl(), here=tmp_path, spawn=lambda p, s, h, t=None: procs.append(FakeProc()) or procs[-1],
+                         link_factory=SlowLink)
+    lay.command({"op": "on"})
+    t0 = time.monotonic()
+    while lay.link is None and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    a = time.perf_counter()
+    lay.command({"op": "off"})
+    assert time.perf_counter() - a < 0.05 and not lay.on
+    lay.command({"op": "on"})                             # waits for the teardown on its own thread, not here
+    assert time.perf_counter() - a < 0.1
+    lay._teardown.join(3)
+    t0 = time.monotonic()
+    while lay.link is None and time.monotonic() - t0 < 5:
+        time.sleep(0.01)
+    assert lay.link is not None and lay.token and len(procs) == 2
+    lay.close()
+
+
+def test_silhouettes_glide_every_frame(tmp_path):
+    if not cl.available()[0]:
+        pytest.skip("cv2 missing")
+    now = [0.0]
+    lay, ctl, _ = _layer(tmp_path, lambda: now[0])
+    lay.command({"op": "on"})
+    link = FakeLink.instances[-1]
+    lay._vals = {"crowd_soft": 0.0}
+    now[0] += 0.1
+    link.q.append(_result(1, now[0]))
+    lay.pre_update(1 / 60)
+    assert lay._mask_target is not None and lay.mask is not None
+    lay.mask = np.zeros_like(lay._mask_target)
+    lay.pre_update(1 / 60)
+    assert float(lay.mask.max()) <= 1.0 - math.exp(-(1 / 60) / cl.MASK_TAU_MIN) + 1e-6
+
+
+def test_worker_http_auth_still_gating_and_quit():
+    pytest.importorskip("cv2")
+    import http.client
+    import json as _j
+    import socket
+
+    class Cap:
+        def read(self):
+            time.sleep(0.02)
+            return True, np.zeros((360, 640, 3), np.uint8)
+
+        def release(self):
+            pass
+
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    w = cw.Worker("secret", port=port, capture_factory=lambda d: Cap(),
+                  models=(lambda rgb, ts: np.zeros(rgb.shape[:2], np.float32), lambda rgb, ts, n: []))
+    th = threading.Thread(target=w.run, daemon=True)
+    th.start()
+    time.sleep(0.6)
+
+    def req(method, path, token="secret", body=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request(method, path, body=body, headers={"X-Token": token, "Content-Type": "application/json"})
+        r = c.getresponse(); data = r.read(); c.close()
+        return r.status, data
+    assert req("GET", "/status", token="wrong")[0] == 403
+    assert req("GET", "/still?skip=1")[0] == 403                      # stills are off unless AUTO MAP asks
+    assert req("POST", "/config", body=_j.dumps({"allow_still_s": 30}).encode())[0] == 200
+    st, data = req("GET", "/still?skip=1")
+    assert st == 200 and cw.unpack_still(data).shape == (360, 640)
+    assert req("POST", "/config", body=_j.dumps({"allow_still_s": 0}).encode())[0] == 200
+    assert req("GET", "/still?skip=1")[0] == 403
+    st, data = req("GET", "/frame?after=0")
+    assert st in (200, 204)
+    assert req("POST", "/quit")[0] == 200
+    th.join(5)
+    assert not th.is_alive()
+
+
+def test_shader_guards_the_vanishing_line_and_respects_the_edge():
+    assert "c.z > 1e-4" in cl.SCENE_GLSL and "float edge" in cl.SCENE_GLSL

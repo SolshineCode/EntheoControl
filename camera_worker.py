@@ -15,7 +15,9 @@ HTTP (127.0.0.1 only, header X-Token = contents of .remote_token, the same token
   GET  /frame?after=N   newest result with seq > N (waits up to 0.5 s), binary, see pack(); 204 if none yet
   GET  /status          JSON: fps, per-stage ms, device, backend, error
   GET  /debug.jpg       320x180 JPEG of mask + skeleton (rendered only while it is being asked for, <= 3 fps)
-  POST /config          {fps 5..30, res 0..2, pose_every 1..6, max_poses 0..3}   (the engine's governor step)
+  POST /config          {fps 5..30, res 0..2, pose_every 1..6, max_poses 0..3, lock_exposure bool}
+  GET  /still?skip=N    AUTO MAP only: the N-th camera frame grabbed after the request, grey 640x360 (header STL1 + w, h),
+                        so a calibration pattern is captured after it is on the wall. Kept in the engine's memory only.
   POST /quit
 """
 import argparse
@@ -49,6 +51,7 @@ IDLE_EXIT_S = 15.0
 MOTION_GAIN = 6.0                 # energy = 1 - exp(-gain * mean |flow| in frame widths per second)
 MAGIC = b"CAM1"
 HDR = struct.Struct("<4sIdHHHHI")  # magic, seq, t, mask w, mask h, flow w, flow h, json length
+STILL = struct.Struct("<4sHH")     # b"STL1", width, height, then w*h grey bytes
 # kept body points (MediaPipe pose landmark index); x, y in camera uv (0..1, y DOWN, not mirrored), visibility 0..1
 KEEP = {"nose": 0, "l_shoulder": 11, "r_shoulder": 12, "l_elbow": 13, "r_elbow": 14, "l_wrist": 15, "r_wrist": 16,
         "l_hip": 23, "r_hip": 24, "l_ankle": 27, "r_ankle": 28}
@@ -126,6 +129,20 @@ def pose_points(landmarks):
     return out
 
 
+def pack_still(gray):
+    g = np.ascontiguousarray(gray, np.uint8)
+    return STILL.pack(b"STL1", g.shape[1], g.shape[0]) + g.tobytes()
+
+
+def unpack_still(buf):
+    if len(buf) < STILL.size:
+        raise ValueError("short still")
+    m, w, h = STILL.unpack_from(buf, 0)
+    if m != b"STL1" or len(buf) != STILL.size + w * h:
+        raise ValueError("bad still")
+    return np.frombuffer(buf, np.uint8, w * h, STILL.size).reshape(h, w)
+
+
 def debug_picture(mask, poses, size=(320, 180)):
     """Mask (grey) + skeleton (colour) as a BGR uint8 image. Never contains camera pixels."""
     import cv2
@@ -185,6 +202,9 @@ class Worker:
         self.debug_jpg = None
         self.stats = dict(fps=0.0, grab_fps=0.0, ms={}, backend="", error="", frames=0, device=self.device)
         self.server = None
+        self.cap = None
+        self.still_until = 0.0                                    # /still is refused unless AUTO MAP opened it
+        self._exposure = None                                     # pending lock_exposure request (bool)
 
     # ---- capture (its own thread: cap.read() blocks at the camera's rate, which drops in a dark room)
     def _open(self):
@@ -205,6 +225,15 @@ class Worker:
         n, t0 = 0, self.clock()
         fails = 0
         while not self._stop.is_set():
+            with self._lock:
+                lock, self._exposure = self._exposure, None
+            if lock is not None:                                 # AUTO MAP: freeze exposure / white balance if the driver can
+                try:
+                    import cv2
+                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if lock else 0.75)
+                    cap.set(cv2.CAP_PROP_AUTO_WB, 0 if lock else 1)
+                except Exception:
+                    pass
             ok, fr = cap.read()
             if not ok or fr is None:
                 fails += 1
@@ -324,8 +353,12 @@ class Worker:
                 pe = max(1, self.cfg["pose_every"])
                 do_pose = self.cfg["max_poses"] > 0 and k % pe == 0
                 k += 1
-                mask8, flow, info, prev_gray, tm = self.analyse(bgr, ts_ms, dt, segment, poses_fn, do_pose, poses,
-                                                                prev_gray)
+                try:
+                    mask8, flow, info, prev_gray, tm = self.analyse(bgr, ts_ms, dt, segment, poses_fn, do_pose, poses,
+                                                                    prev_gray)
+                except Exception as ex:                          # one bad frame / model hiccup: skip it, keep running
+                    self.stats["error_last"] = f"{type(ex).__name__}: {ex}"[:160]
+                    continue
                 if do_pose:
                     poses = info["poses"]
                 if self.cfg["max_poses"] <= 0:
@@ -368,11 +401,34 @@ class Worker:
                 return self._latest[1]
             return None
 
+    def still(self, skip=2, timeout=4.0):
+        """Grey 640x360 of the skip-th frame grabbed after now (packed), or None on timeout."""
+        import cv2
+        with self._lock:
+            want = self._frame_seq + skip
+        t0 = self.clock()
+        while self.clock() - t0 < timeout and not self._stop.is_set():
+            with self._lock:
+                item, fs = self._frame_in, self._frame_seq
+            if item is not None and fs >= want:
+                g = cv2.cvtColor(item[1], cv2.COLOR_BGR2GRAY)
+                if g.shape != (360, 640):
+                    g = cv2.resize(g, (640, 360), interpolation=cv2.INTER_AREA)
+                return pack_still(g)
+            time.sleep(0.01)
+        return None
+
     def configure(self, body):
         if not isinstance(body, dict):
             raise ValueError("config must be an object")
         lim = dict(fps=(5, 30), res=(0, len(RES_STEPS) - 1), pose_every=(1, 6), max_poses=(0, MAX_POSES))
         new = dict(self.cfg)
+        if isinstance(body.get("lock_exposure"), bool):
+            with self._lock:
+                self._exposure = body["lock_exposure"]
+        a = body.get("allow_still_s")
+        if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a):
+            self.still_until = self.clock() + min(max(float(a), 0.0), 600.0) if a > 0 else 0.0
         for k, (lo, hi) in lim.items():
             if k in body:
                 v = body[k]
@@ -387,6 +443,7 @@ class Worker:
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            timeout = 10
 
             def log_message(self, *a):
                 pass
@@ -421,6 +478,16 @@ class Worker:
                     self._send(200, data, "application/octet-stream") if data else self._send(204)
                 elif parts.path == "/status":
                     self._send(200, dict(worker.stats, ok=not worker.stats["error"], cfg=worker.cfg))
+                elif parts.path == "/still":
+                    if worker.clock() > worker.still_until:          # only while AUTO MAP is capturing
+                        self._send(403, {"ok": False, "error": "stills are off"})
+                        return
+                    try:
+                        skip = min(max(int(parse_qs(parts.query).get("skip", ["2"])[0]), 1), 30)
+                    except ValueError:
+                        skip = 2
+                    data = worker.still(skip)
+                    self._send(200, data, "application/octet-stream") if data else self._send(504)
                 elif parts.path == "/debug.jpg":
                     worker.debug_want = worker.clock()
                     d = worker.debug_jpg
@@ -431,8 +498,11 @@ class Worker:
             def do_POST(self):
                 if not self._auth():
                     return
-                n = int(self.headers.get("Content-Length") or 0)
-                if n > 4096:
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = -1
+                if not 0 <= n <= 4096:
                     self._send(413, {"ok": False})
                     return
                 raw = self.rfile.read(n) if n else b"{}"
@@ -447,7 +517,7 @@ class Worker:
                 else:
                     self._send(404, {"ok": False})
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", self.port), H)
+        self.server = ExclusiveServer(("127.0.0.1", self.port), H)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, name="cam-http", daemon=True).start()
 
@@ -480,6 +550,18 @@ class Worker:
                 self.server.shutdown()
                 self.server.server_close()
         return 1 if self.stats["error"] else 0
+
+
+class ExclusiveServer(ThreadingHTTPServer):
+    """No port sharing: on Windows SO_REUSEADDR lets a second server bind the same port, so it is off and the port is
+    claimed exclusively (a stale worker on the port makes this one fail loudly instead of splitting traffic)."""
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self):
+        import socket
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def lower_priority():
@@ -524,9 +606,9 @@ def main():
     except ImportError:
         print("[camera] opencv-python is not installed in this venv", flush=True)
         return 3
-    token = read_token(HERE / ".remote_token")
+    token = os.environ.pop("CAMERA_WORKER_TOKEN", "") or read_token(HERE / ".remote_token")   # per-spawn secret first
     if not token:
-        print("[camera] no .remote_token next to the code", flush=True)
+        print("[camera] no token (CAMERA_WORKER_TOKEN / .remote_token)", flush=True)
         return 4
     w = Worker(token, a.port, a.device, a.fps, a.res, a.pose_every, a.max_poses, a.parent or None)
     return w.run()

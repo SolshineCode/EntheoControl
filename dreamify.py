@@ -40,7 +40,7 @@ MEAN, STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 # ------------------------------------------------------------------ pure helpers (tested without torch)
 def iterations(strength):
-    return int(round(4 + 16 * min(max(float(strength), 0.0), 1.0)))
+    return int(round(6 + 18 * min(max(float(strength), 0.0), 1.0)))
 
 
 def fit_size(w, h, max_side):
@@ -69,7 +69,8 @@ def tile_boxes(w, h, tile):
 
 
 def _plain_name(name):
-    return (isinstance(name, str) and 0 < len(name) <= 160 and Path(name).name == name and "/" not in name
+    return (isinstance(name, str) and 0 < len(name) <= 160 and "\0" not in name and Path(name).name == name
+            and "/" not in name
             and "\\" not in name and ":" not in name and not name.startswith(".") and ".." not in name
             and name.lower().endswith(EXTS) and not name.lower().endswith(".depth.png"))
 
@@ -94,7 +95,8 @@ def validate(body, art_dir, tex_dir):
     if not _plain_name(name) or (src == "ai" and not TEX_NAME.match(name)):
         raise ValueError("bad image name")
     folder = Path(art_dir if src == "art" else tex_dir)
-    if not (folder / name).is_file():
+    f = folder / name
+    if not f.is_file() or f.resolve().parent != folder.resolve():
         raise ValueError("image not found in the library")
     preset = body.get("preset") or "dogslugs"
     if preset not in PRESETS:
@@ -106,13 +108,20 @@ def validate(body, art_dir, tex_dir):
 
 
 def _slug(s, n=48):
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_")[:n] or "image"
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_-")[:n].strip("_-") or "image"
 
 
-def out_name(source, name, preset, stamp):
-    if source == "ai":
-        return f"gen_dream_{stamp}_{_slug(preset, 20)}.png"          # gen_ prefix: the picker lists it as AI
-    return f"{_slug(Path(name).stem)}_dream_{_slug(preset, 20)}_{stamp}.png"
+def out_name(source, name, preset, stamp, folder=None):
+    """New file name; with `folder`, a short suffix is added while the name is taken (two dreams in one second)."""
+    for k in range(100):
+        sfx = "" if k == 0 else f"_{k}"
+        if source == "ai":
+            n = f"gen_dream_{stamp}_{_slug(preset, 20)}{sfx}.png"        # gen_ prefix: the picker lists it as AI
+        else:
+            n = f"{_slug(Path(name).stem)}_dream_{_slug(preset, 20)}_{stamp}{sfx}.png"
+        if folder is None or not (Path(folder) / n).exists():
+            return n
+    return n
 
 
 def save_png(img, path, meta):
@@ -124,8 +133,15 @@ def save_png(img, path, meta):
         info.add_text(str(k), str(v))
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
-    img.save(tmp, format="PNG", pnginfo=info)
-    os.replace(tmp, path)
+    try:
+        img.save(tmp, format="PNG", pnginfo=info)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():                        # failed half-way: never leave a .tmp behind
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def free_vram_mb():
@@ -138,6 +154,18 @@ def free_vram_mb():
         return free / 2 ** 20
     except Exception:
         return None
+
+
+def light_mask(img, grow=None):
+    """0..1 float mask (H, W): 1 where the picture has light, spread a little (dream detail may overhang its edges),
+    0 in true black. DeepDream otherwise grows texture out of black, which would light up the wall."""
+    import numpy as np
+    from PIL import ImageFilter
+    g = grow or max(3, (max(img.size) // 96) | 1)
+    m = img.convert("RGB").point(lambda v: min(255, v * 4)).convert("L")
+    m = m.filter(ImageFilter.MaxFilter(g)).filter(ImageFilter.GaussianBlur(g * 0.6))
+    a = np.asarray(m, "float32") / 255.0
+    return np.clip((a - 0.04) / 0.5, 0.0, 1.0)
 
 
 # ------------------------------------------------------------------ the real thing
@@ -174,8 +202,10 @@ class RealDream:
     want = ()
 
     def release(self):
+        self.acts = {}
         try:
-            self.model.to("cpu")
+            if self.model is not None:
+                self.model.to("cpu")
         except Exception:
             pass
         self.model = None
@@ -187,13 +217,16 @@ class RealDream:
         x = x.detach().requires_grad_(True)
         self.acts = {}
         try:
-            with torch.autocast("cuda", dtype=torch.float16, enabled=self.fp16):
-                self.model(x)
-        except _Stop:
-            pass
-        loss = sum(w * self.acts[n].float().pow(2).mean() for n, w in layers.items())
-        loss.backward()
-        return x.grad.detach()
+            try:
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self.fp16):
+                    self.model(x)
+            except _Stop:
+                pass
+            loss = sum(w * self.acts[n].float().pow(2).mean() for n, w in layers.items())
+            loss.backward()
+            return x.grad.detach()
+        finally:
+            self.acts = {}                          # no activation / autograd graph outlives the step
 
     def dream(self, img, preset, strength, octaves, max_side, progress, cancelled):
         """PIL image -> dreamed PIL image (long side max_side), or None when cancelled."""
@@ -213,7 +246,7 @@ class RealDream:
         lo, hi = (0 - mean) / std, (1 - mean) / std
         sizes = octave_sizes(w, h, octaves, p["scale"])
         iters = iterations(strength)
-        step = 0.018 * (0.5 + strength) * p["step"]
+        step = 0.045 * (0.5 + strength) * p["step"]
         tile = GPU_TILE if self.device == "cuda" else CPU_TILE
         total, done = len(sizes) * iters, 0
         detail = torch.zeros_like(F.interpolate(base, size=sizes[0][::-1], mode="bilinear", align_corners=False))
@@ -246,5 +279,7 @@ class RealDream:
                     torch.cuda.synchronize()
                     time.sleep(min(0.25, (time.perf_counter() - t0) * self.duty))   # give the show its GPU time
             detail = x - src
-        out = ((x * std + mean).clamp(0, 1)[0].permute(1, 2, 0).float().cpu().numpy() * 255.0 + 0.5).astype("uint8")
-        return Image.fromarray(out)
+        import numpy as np
+        out = (x * std + mean).clamp(0, 1)[0].permute(1, 2, 0).float().cpu().numpy()
+        out *= light_mask(img)[..., None]          # projection rule: where the picture was black, it stays black
+        return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8))

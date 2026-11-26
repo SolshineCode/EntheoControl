@@ -103,8 +103,8 @@ def test_stripes_are_antialiased_not_stair_stepped(sp):
 
 
 def test_blend_modes_and_alpha(sp):
-    base = dict(gen=0, freq=3, soft=0.0, duty=0.5, stops=[[0, 1, 0, 0], [0.5, 1, 0, 0]])
-    top = dict(gen=0, freq=3, soft=0.0, duty=0.5, angle=0.25, stops=[[0, 0, 0, 1], [0.5, 0, 0, 1]])
+    base = dict(gen=0, freq=3, soft=0.0, duty=0.5, stops=[[0, 1, 0.5, 0.2], [0.5, 1, 0.5, 0.2]])
+    top = dict(gen=0, freq=3, soft=0.0, duty=0.5, angle=0.25, stops=[[0, 0.3, 0.6, 1], [0.5, 0.3, 0.6, 1]])
     out = {}
     for b, name in enumerate(stack.BLENDS):
         out[name] = shot(sp, state([base, dict(top, blend=b)]))
@@ -113,7 +113,7 @@ def test_blend_modes_and_alpha(sp):
     assert out["Replace"][..., 3].min() >= 250                                           # opaque everywhere
     a = out["Mask below"][..., 3]
     assert a.max() >= 250 and a.min() == 0                                               # hides only where it is dark
-    assert out["Mask below"][..., 2].max() < 8                                           # a mask adds no light of its own
+    assert out["Mask below"][..., 2].max() <= 55                                          # a mask adds no light of its own
     assert out["Over"][..., 3].max() >= 250 and out["Over"][..., 3].min() == 0
 
 
