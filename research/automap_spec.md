@@ -1,5 +1,5 @@
 # AUTO-MAP spec (camera-assisted projection mapping), from Gemini's suggestion, adapted to ONE system
-Source idea: Gemini 4 Neon suggestion (ArUco/Gray-code calibration → scene understanding → warped rendering → verify & auto-correct). Adaptation rules: NO separate pygame/projector app or second window (one engine, one panel: memory rule). Everything runs inside live_visuals.py (patterns drawn by the engine on the projector output), camera_worker.py (capture + CV), surfaces.py (results become normal editable surfaces), and the MAPPING tab (wizard UI).
+Source idea: Gemini 4 Neon suggestion (ArUco/Gray-code calibration → scene understanding → warped rendering → verify & auto-correct). Adaptation rules: NO separate pygame/projector app or second window (one engine, one panel: project rule). Everything runs inside live_visuals.py (patterns drawn by the engine on the projector output), camera_worker.py (capture + CV), surfaces.py (results become normal editable surfaces), and the MAPPING tab (wizard UI).
 
 Physical prerequisite: the camera must SEE the projected area. The laptop's built-in webcam faces the user, so either turn the laptop / lid toward the wall or use a USB webcam on a fixed mount. If camera or projector moves, re-run calibration (wizard detects large drift and offers re-calibration).
 

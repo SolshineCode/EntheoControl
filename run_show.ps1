@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Continue'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
 $py = Join-Path $here '.venv\Scripts\python.exe'
-$showArgs = if ($args.Count -gt 0) { $args } else { @('--monitor', '1', '--panel', '--governor', 'suggest') }
+$showArgs = if ($args.Count -gt 0) { $args } else { @('--monitor', '1', '--panel') }
 $logDir = Join-Path $here 'logs'
 New-Item -ItemType Directory -Force $logDir | Out-Null
 # AI worker (prompt -> textures) runs as its own low-priority process for the whole show.

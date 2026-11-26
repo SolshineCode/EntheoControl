@@ -92,9 +92,21 @@ try:                                                 # ONLINE plugin hooks (pure
     from plugins.online import protocol as _online   # imported when the performer switches ONLINE on)
 except Exception:
     _online = None
+try:                                                 # clips / macros / lanes / decks (clips.py, pure python)
+    import clips as _clips
+except ImportError:
+    _clips = None
+try:                                                 # [themes] THEMES + SOUND TAGS (themes.py / soundtags.py)
+    import themes as _themes
+except ImportError:
+    _themes = None
+HISTORY_MAX = 50             # engine-side undo steps (Controller.history)
+HIST_GAP = 0.6               # s: moves of one control without a gesture id closer than this are one undo step
+HIST_G_GAP = 5.0             # s: a gesture id older than this starts a new step (a reloaded panel reuses ids)
 OPTIONS = merge_options(OPTIONS, getattr(_params, "OPTIONS", None), PARAMS)
 # stepped params: no slew, snap at the morph midpoint (palette is fractional by contract, so it glides)
 DISCRETE = [n for n in OPTIONS if n != "palette"] + [n for n in ("art_index",) if n in PARAMS]
+_DISCRETE_SET = frozenset(DISCRETE)
 MAX_PROMPT = 500
 DRIFT_DEFAULT = ["zoom", "pan_x", "pan_y", "rotate", "twirl", "swim", "hue", "flow_dir", "tunnel_curve"]
 
@@ -177,20 +189,100 @@ def valid_target(t):
             return _skins is not None and _skins.parse_target(t) is not None
         if p[0] == "ripple" and len(p) == 3:
             return 0 <= float(p[1]) <= 1 and 0 <= float(p[2]) <= 1
+        if p[0] == "macro" and len(p) == 3:          # macro:<lane>:<1-8>: plays whatever clip is on air in that lane
+            return _clips is not None and p[1] in _clips.CLIP_LANES and p[2].isdigit() and 1 <= int(p[2]) <= 8
+        if p[0] == "clip" and len(p) == 2:           # clip:<id>: a pad launches it (quantized)
+            return _clips is not None and bool(_clips.ID.match(p[1]))
+        if p[0] == "theme" and len(p) == 2:          # [themes] theme:<slot>: a pad restores a tray theme
+            return _themes is not None and p[1].isdigit() and 1 <= int(p[1]) <= _themes.MAX_TRAY
     except ValueError:
         pass
     return False
 
 
+def _gesture(c, out):
+    """Optional gesture id `g` (int or short text): every command of one drag carries the same g = one undo step."""
+    g = c.get("g")
+    if g is not None:
+        if isinstance(g, bool) or not ((isinstance(g, int) and 0 <= g < 2 ** 31) or (
+                isinstance(g, str) and 0 < len(g) <= 24 and g.isprintable())):
+            raise ValueError("'g' must be a gesture id (a whole number or short text)")
+        out["g"] = g
+    return out
+
+
 def _v_set(c):
     name = _name(c, PARAMS)
-    return {"cmd": "set", "name": name, "v": _num(c, "v", PARAMS[name][0], PARAMS[name][1])}
+    return _gesture(c, {"cmd": "set", "name": name, "v": _num(c, "v", PARAMS[name][0], PARAMS[name][1])})
 
 
 def _v_inc(c):
     name = _name(c, PARAMS)
     span = PARAMS[name][1] - PARAMS[name][0]
-    return {"cmd": "inc", "name": name, "d": _num(c, "d", -span, span)}
+    return _gesture(c, {"cmd": "inc", "name": name, "d": _num(c, "d", -span, span)})
+
+
+def _macro_arg(c):
+    """Launch-time macro positions: a list (index 0 = macro 1) or {"1".."8": v} -> {"1".."8": v}."""
+    m = c.get("macros")
+    if m is None:
+        return None
+    if isinstance(m, list) and len(m) <= 8:
+        m = {str(i + 1): v for i, v in enumerate(m) if v is not None}
+    if not isinstance(m, dict) or any(str(k) not in [str(i) for i in range(1, 9)] for k in m):
+        raise ValueError("'macros' must be a list of up to 8 values or {\"1\".. \"8\": value}")
+    return {str(k): _num(m, k, 0.0, 1.0) for k in m}
+
+
+def _v_clip(c):
+    """{"cmd": "clip", "op": launch {id, macros?, bars?, now?, lane?} | stop {lane, bars?, now?} | save {clip} |
+    delete {id} | lock {lane, palette}}."""
+    op = _name(c, ("launch", "stop", "save", "delete", "lock"), "op")
+    out = {"cmd": "clip", "op": op}
+    if op in ("launch", "delete"):
+        out["id"] = _clips.check_id(c.get("id"))
+    if op in ("stop", "lock") or (op == "launch" and c.get("lane") is not None):
+        out["lane"] = _name(c, _clips.CLIP_LANES, "lane")
+    if op in ("launch", "stop"):
+        if c.get("bars") is not None:
+            out["bars"] = _num(c, "bars", 0.0, 64.0)
+        if "now" in c:
+            out["now"] = _bool(c, "now")
+    if op == "launch":
+        m = _macro_arg(c)
+        if m:
+            out["macros"] = m
+    if op == "save":
+        out["clip"] = _clips.validate_clip(c.get("clip"))
+        if out["clip"]["id"] in _clips.FACTORY_IDS:
+            raise ValueError("that id belongs to a factory clip: save under a new id")
+    if op == "delete" and out["id"] in _clips.FACTORY_IDS:
+        raise ValueError("factory clips cannot be deleted")
+    if op == "lock":
+        out["palette"] = _bool(c, "palette")
+    return out
+
+
+def _v_deck(c):
+    op = _name(c, ("save", "delete"), "op")
+    if op == "save":
+        return {"cmd": "deck", "op": op, "deck": _clips.validate_deck(c.get("deck"))}
+    return {"cmd": "deck", "op": op, "id": _clips.check_id(c.get("id"))}
+
+
+def _v_macro(c):
+    out = {"cmd": "macro", "lane": _name(c, _clips.CLIP_LANES, "lane"), "n": _int(c, "n", 1, 8),
+           "v": _num(c, "v", 0.0, 1.0)}
+    return _gesture(c, out)
+
+
+def _v_scene_go(c):
+    out = {"cmd": "scene_go", "id": _clips.check_id(c.get("id"))}
+    if "now" in c:
+        out["now"] = _bool(c, "now")
+    if c.get("bars") is not None:
+        out["bars"] = _num(c, "bars", 0.0, 64.0)
+    return out
 
 
 def _v_mod(c):
@@ -406,10 +498,17 @@ if _skins is not None:                               # {"cmd": "skin", "op": ...
     _VALIDATORS["skin"] = _skins.validate
 if _textlayer is not None:                           # text, text_phrases, text_add, text_del, text_go, text_cycle
     _VALIDATORS.update(_textlayer.VALIDATORS)
+if _clips is not None:                               # clips.py: clip launch / macros / decks / scene columns
+    _VALIDATORS.update(clip=_v_clip, deck=_v_deck, macro=_v_macro, scene_go=_v_scene_go)
+_VALIDATORS["history"] = lambda c: {"cmd": "history", "op": _name(c, ("undo", "redo"), "op")}   # engine-side undo
+if _themes is not None:                              # [themes] {"cmd": "theme", "op": ...}: themes.validate
+    _VALIDATORS["theme"] = _themes.validate
 if _online is not None:                              # {"cmd": "online", "op": ...}: plugins/online/protocol.py
     _VALIDATORS["online"] = _online.validate
 # ---- TIMELINE (timeline.py) + SHOWS / PRESETS (shows.py)
-TL_EVENTS = ("bypass", "text", "text_go", "art_step", "ripple", "seq_rand", "next_video", "show_texture", "art_pick")
+TL_EVENTS = ("bypass", "text", "text_go", "art_step", "ripple", "seq_rand", "next_video", "show_texture", "art_pick",
+             "clip", "scene_go", "macro", "theme")     # clip: launch / stop only (by id, never a list index);
+# theme: restore only (a tray theme by id; starred themes are also preset cues "theme/<slug>")
 _TEX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.(png|jpg|jpeg|webp)$", re.I)
 TL_FLASH_GAP = 0.4          # s between two timeline flash-type triggers (<= 2.5 Hz)
 TL_SAFE_HZ = 2.5            # timeline strobe only when the strobe rate is at or under this
@@ -431,6 +530,12 @@ def _v_tl_event(c):
         out = _VALIDATORS[k](c)
         if k == "bypass" and "on" not in out:
             raise ValueError("a timeline bypass event needs 'on' (true = switch off)")
+        if k == "clip" and out["op"] not in ("launch", "stop"):
+            raise ValueError("a timeline clip event can only launch or stop")
+        if k == "theme" and out["op"] != "restore":
+            raise ValueError("a timeline theme event can only restore")
+        if k == "clip" and out["op"] == "launch" and "lane" not in out and _clips.get(out["id"]):
+            out["lane"] = _clips.get(out["id"])["lane"]          # chase keeps the latest launch per lane
         return out
     if k == "next_video":
         return passthrough(k)
@@ -535,13 +640,9 @@ def blob(name):
 
 
 _NOT_EDITS = frozenset(("tap", "trigger", "ripple", "panic", "show", "preset", "midi_learn", "gen", "gen_cancel",
-                        "online", "resync", "latch"))     # commands that do not change what a show file holds
+                        "online", "resync", "latch", "theme"))     # commands that do not change what a show file holds
+                                                  # (theme: themes.py calls _changed() itself when the tray changes)
 _TL_TRANSPORT = frozenset(("play", "stop", "seek", "home", "rec", "rec_mode", "ovr_mode", "reenable", "release", "hold"))
-
-
-def mark_local(c):
-    """remote_control: this validated command came from the laptop itself (127.0.0.1). Only the ONLINE plugin cares."""
-    return _online.mark_local(c) if _online is not None else c
 
 
 def validate(c):
@@ -635,7 +736,10 @@ def meta():
         bypass=dict(keys=list(BYPASS_COVER), cover={k: list(v) for k, v in BYPASS_COVER.items()},
                     group_key=dict(_params.BYPASS_GROUP_KEY)),
         stack=_stack.meta() if _stack is not None else None, canvas_keys=list(CANVAS_KEYS),
-        skins=_skins.meta() if _skins is not None else None)
+        skins=_skins.meta() if _skins is not None else None,
+        clips=dict(lanes={ln: list(v) for ln, v in _clips.LANE_PARAMS.items()}, clip_lanes=list(_clips.CLIP_LANES),
+                   lane_names=dict(_clips.LANE_NAMES), curves=list(_clips.CURVES), widgets=list(_clips.WIDGETS))
+        if _clips is not None else None)
 
 
 # ------------------------------------------------------------------ factory scenes
@@ -856,8 +960,10 @@ class Controller:
         self._byp_once = None                          # s: fade time for the transition in progress (NEW CANVAS)
         self.stack = _stack.StackState() if _stack is not None else None      # math stack: hand-built layers
         self._stack_morph = False
-        self.skins = _skins.SkinState() if _skins is not None else None       # environment skins (materials.py)
+        # environment skins (materials.py): INACTIVE until switched on in the panel (settings.skins_on)
+        self.skins = _skins.SkinState(on=False) if _skins is not None else None
         self.gov_level = 0                             # the engine copies the governor's level here (0 ok .. 2 critical)
+        self.gov_vram_free_mb = None                   # and the free VRAM it measured (None = unknown)
         self.canvas_prev = None                        # the look before NEW CANVAS (base, mods, bypass, stack)
         self.fresh = 0                                 # start time of a --fresh launch (the panel opens in SIMPLE)
 
@@ -890,6 +996,21 @@ class Controller:
         self._morph = None
         self._scenes_ok = True                         # False after a read error: saving is off until a good load
         self.scenes_loaded = self._load_scenes()
+
+        # clips (clips.py): one clip per lane on air, its macro positions; user clips + decks; engine-side undo
+        lanes = _clips.CLIP_LANES if _clips is not None else ()
+        self.clips = {}                                # user clips {id: clip} (factory clips live in clips.FACTORY)
+        self.decks = []                                # pages of scene columns (clips.validate_deck)
+        self.comp = {ln: dict(clip=None, macros=[], over=[]) for ln in lanes}
+        self.locks = {ln: False for ln in lanes}       # PALETTE LOCK per lane (False = the palette follows the clip)
+        self._lane_morph = {}                          # lane -> per-lane MORPH of a launch (src, to, names, start, dur)
+        self._clip_pending = []                        # quantized launches / stops waiting for their beat
+        self._macro_map = {}                           # param -> (lane, macro index) of the clips on air
+        self._macro_writing = False                    # True while a macro writes its targets (not an override)
+        self._clips_rev, self._clips_blob = 1, (0, b"{}")
+        self.history = deque(maxlen=HISTORY_MAX)       # undo steps {key, t, old {param: v}, comp?, mods?, stack?}
+        self._redo = []
+        self._hist_mute, self._hist_n = False, 0
 
         # autopilot
         self.auto = dict(on=False, bars=8.0, mode="random", drift=False, drift_amt=0.3,
@@ -958,6 +1079,14 @@ class Controller:
         # thumbnails: a scene / preset save asks the engine for one snapshot frame. Only for the real show (state in
         # the code folder); tests and the panel demo (temp folders, no engine) do not get the extra command.
         self.thumbs = bool(restore and threads and self.dir.resolve() == Path(__file__).resolve().parent)
+        self.soundtags = None                          # [themes] the engine attaches soundtags.SoundTags (audio tap) here
+        self.fg_hold = False                           # [themes] the engine copies "flash guard is holding" here
+        self.themes = None
+        if _themes is not None:
+            try:
+                self.themes = _themes.ThemeManager(self)
+            except Exception:
+                self.themes = None
         self.restored = self._restore() if restore else False
         if restore and self.shows is not None:
             self.shows.submit("session")               # the open show's timeline comes back (transport stopped)
@@ -981,6 +1110,13 @@ class Controller:
         self.edits[name] = self.edits.get(name, 0) + 1  # direct moves only (governor.py: the user wins)
         if self._morph:
             self._morph["names"].discard(name)         # a hand on the fader overrides the morph
+        if self._lane_morph:
+            for lm in self._lane_morph.values():       # ... and a clip launch's lane morph
+                lm["names"].discard(name)
+        if not self._macro_writing:
+            hit = self._macro_map.get(name)
+            if hit is not None:                        # a fader on a macro's target: that macro is "overridden"
+                self.comp[hit[0]]["over"][hit[1]] = True
         self._changed()
         if self.tl is not None and not self._tl_firing and name not in TRIGGERS:
             self._tl_touch(name)                       # performer wins over automation; RECORD writes the move
@@ -1056,6 +1192,15 @@ class Controller:
         if n > 0:
             self.set("art_index", (int(round(self.base["art_index"])) + int(d)) % n)
 
+    def _skin_ai_cancel(self):
+        """A generate-a-skin job that was already sent to the worker was cancelled: stop the worker's queue too."""
+        if self.skins is not None and self.skins.cancel_ai:
+            self.skins.cancel_ai = False
+            try:
+                self.ai.cancel()
+            except Exception:
+                pass
+
     def panic(self):
         """Failover: clear every trigger, cancel pending recalls / morphs, snap to the safe scene."""
         self.panics += 1                               # governor.py drops a pending suggestion / countdown
@@ -1064,6 +1209,7 @@ class Controller:
             self.base[n] = PARAMS[n][2]
         self.env = {k: 0.0 for k in self.env}
         self.pending = self._morph = None
+        self._comp_clear()                             # no queued launch / lane morph survives PANIC
         self.learn = None
         self.auto["on"] = False                        # nothing may move the look away from the safe scene
         self._auto_next = None
@@ -1076,16 +1222,13 @@ class Controller:
             self._tl_fade.clear()
             self._tl_trig.clear()
             self._tl_span_ids.clear()
+        if self.skins is not None:                     # an image on a wall is not part of the safe look either: every slot
+            self.skins.panic()                         # procedural NOW (a cut, settings kept; whatever stack.py does)
+            self._skin_ai_cancel()                     # and a skin being generated stops using the GPU
         if self.stack is not None:                     # the math stack is not part of the safe look: off, at once,
             self._stack_morph = False                  # and no half-finished stack morph left running
             self.stack.morph_cancel()
             self.stack.load(dict(layers=[]), fade=False)
-            if self.skins is not None and self.skins.any():      # an image on a wall is not part of the safe look either:
-                j = self.skins.to_json()                         # every slot back to procedural (its settings are kept)
-                for d in j["slots"].values():
-                    d.pop("src", None)
-                self.skins.load(j)
-                self.skins.gen = None
             if self.canvas_prev is not None:           # on a clean canvas every engine layer is bypassed: with the stack
                 keep = set(self.canvas_prev["bypass"])  # gone that would be a black wall. PANIC leaves the canvas: the
                 for k in CANVAS_KEYS:                   # switches go back to what they were before NEW CANVAS.
@@ -1273,6 +1416,318 @@ class Controller:
         self.cur = -1
         self._byp_once = CANVAS_FADE
 
+    # ---------------------------------------------------------------- clips (clips.py): lanes, launch, macros, decks
+    # A clip writes Controller.base for its own lane only (every owned param: the clip's value, a macro's or the
+    # registry default). Nothing downstream changes: mods, bypass (never touched by a launch), the governor and
+    # scenes work as before. A launch MORPHS per lane (stepped params flip at the middle), quantized like a scene.
+
+    def _comp_clear(self):
+        """Nothing is 'on air' as a clip any more (a snapshot recall, the crossfader, PANIC, init)."""
+        self._lane_morph.clear()
+        self._clip_pending = []
+        self._macro_map = {}
+        for ln in self.comp:
+            self.comp[ln] = dict(clip=None, macros=[], over=[])
+
+    def _macro_map_build(self):
+        self._macro_map = {}
+        for ln, on in self.comp.items():
+            cl = _clips.get(on["clip"], self.clips) if on["clip"] else None
+            for i, m in enumerate(cl["macros"] if cl else ()):
+                for t in m["targets"]:
+                    self._macro_map[t["p"]] = (ln, i)
+
+    def _comp_json(self):
+        out = {ln: dict(clip=on["clip"], macros=list(on["macros"])) for ln, on in self.comp.items()}
+        out["locks"] = dict(self.locks)
+        return out
+
+    def _comp_restore(self, raw):
+        """comp from live_state / a show: which clip is on air per lane + its macro positions (values are in base)."""
+        raw = raw if isinstance(raw, dict) else {}
+        for ln in self.comp:
+            d = raw.get(ln) if isinstance(raw.get(ln), dict) else {}
+            cid = d.get("clip")
+            cl = _clips.get(cid, self.clips) if isinstance(cid, str) else None
+            if cl is None or cl["lane"] != ln:
+                self.comp[ln] = dict(clip=None, macros=[], over=[])
+                continue
+            ms = d.get("macros") if isinstance(d.get("macros"), list) else []
+            pos = []
+            for i, m in enumerate(cl["macros"]):
+                x = ms[i] if i < len(ms) else None
+                ok = isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+                pos.append(_clips.snap(m, x if ok else m["default"]))
+            self.comp[ln] = dict(clip=cl["id"], macros=pos, over=[False] * len(pos))
+        lk = raw.get("locks") if isinstance(raw.get("locks"), dict) else {}
+        for ln in self.locks:
+            if isinstance(lk.get(ln), bool):
+                self.locks[ln] = lk[ln]
+        self._macro_map_build()
+
+    def _comp_state(self):
+        r = lambda x: round(x, 3)
+        out = {ln: dict(clip=on["clip"], macros=[r(x) for x in on["macros"]], over=[int(o) for o in on["over"]])
+               for ln, on in self.comp.items()}
+        out["locks"] = [ln for ln, v in self.locks.items() if v]
+        out["pending"] = sorted({q["lane"] for q in self._clip_pending})
+        out["undo"] = [len(self.history), len(self._redo)]
+        out["rev"] = self._clips_rev
+        return out
+
+    def _clip_do(self, c):
+        op = c["op"]
+        if op == "launch":
+            self.clip_launch(c["id"], macros=c.get("macros"), bars=c.get("bars"),
+                             now=c.get("now", False) or self._tl_firing, lane=c.get("lane"))
+        elif op == "stop":
+            self.clip_stop(c["lane"], bars=c.get("bars"), now=c.get("now", False) or self._tl_firing)
+        elif op == "save":
+            self.clips[c["clip"]["id"]] = c["clip"]
+            self._clips_rev += 1
+            if any(on["clip"] == c["clip"]["id"] for on in self.comp.values()):
+                self._macro_map_build()
+        elif op == "delete":
+            if self.clips.pop(c["id"], None) is not None:
+                self._clips_rev += 1
+        elif op == "lock":
+            self.locks[c["lane"]] = c["palette"]
+        self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)
+
+    def _deck_do(self, c):
+        if c["op"] == "save":
+            d = c["deck"]
+            others = [x for x in self.decks if x["id"] != d["id"]]
+            taken = {col["id"] for x in others for col in x["columns"]}
+            if any(col["id"] in taken for col in d["columns"]):
+                return                                 # column ids are unique across decks (scene_go addresses them)
+            i = next((k for k, x in enumerate(self.decks) if x["id"] == d["id"]), None)
+            if i is None:
+                if len(self.decks) >= _clips.MAX_DECKS:
+                    return
+                self.decks.append(d)
+            else:
+                self.decks[i] = d
+        else:
+            self.decks = [x for x in self.decks if x["id"] != c["id"]]
+        self._clips_rev += 1
+        self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)
+
+    def _queue_clip(self, now, **job):
+        q = QUANT.get(self.quantize, 0)
+        if now or q == 0:
+            self._clip_fire(**job)
+        else:                                          # one waiting job per lane: the newest press wins
+            self._clip_pending = [x for x in self._clip_pending if x["lane"] != job["lane"]]
+            self._clip_pending.append(dict(job, fire=(math.floor(self.beat / q + 1e-6) + 1) * q))
+
+    def clip_launch(self, cid, macros=None, bars=None, now=False, lane=None, hkey=None):
+        """Launch clip `cid` on its lane (quantized unless now). macros = {"1".."8": v} positions (others: default)."""
+        cl = _clips.get(cid, self.clips) if _clips is not None else None
+        if cl is None or (lane is not None and lane != cl["lane"]):
+            return False
+        self._queue_clip(now, op="launch", lane=cl["lane"], id=cid, macros=macros, bars=bars, hkey=hkey)
+        return True
+
+    def clip_stop(self, lane, bars=None, now=False, hkey=None):
+        """Take a lane off the wall: its layer amounts to 0 (params.NEUTRAL), its other params to defaults."""
+        if lane not in self.comp:
+            return False
+        self._queue_clip(now, op="stop", lane=lane, id=None, macros=None, bars=bars, hkey=hkey)
+        return True
+
+    def _clip_fire(self, op, lane, id=None, macros=None, bars=None, hkey=None):
+        cl = _clips.get(id, self.clips) if id else None
+        if op == "launch" and cl is None:
+            return                                     # deleted while it waited for its beat
+        ref = cl or dict(lane=lane, sets={}, macros=[], mods={}, stack=None, palette=None, bars=None)
+        pos = [None] * len(ref["macros"])
+        for k, v in (macros or {}).items():
+            if int(k) - 1 < len(pos):
+                pos[int(k) - 1] = v
+        r = _clips.resolve(ref, pos, stop=op == "stop")
+        to = r["updates"]
+        if r["palette"] is not None and not self.locks.get(lane, False):
+            to["palette"] = r["palette"]
+        names = list(to)
+        if bars is None:
+            bars = cl["bars"] if cl is not None and cl.get("bars") is not None else self.morph_bars
+        owned = set(_clips.LANE_PARAMS[lane])
+        self._hist_push(hkey or self._hkey_once(), names + (["palette"] if "palette" not in to else []), comp=True,
+                        mods=owned, stack=r["stack"] is not None)
+        old_mods = {n: pair for n, pair in self.mods.items() if n in owned}
+        for n in old_mods:
+            self.mods.pop(n)
+        self.mods.update(_copy_mods(r["mods"]))
+        use_stack = r["stack"] is not None and self.stack is not None
+        if use_stack:
+            self._stack_morph = False
+            self.stack.morph_cancel()
+            if bars > 0:
+                self.stack.morph_start(r["stack"])
+            else:
+                self.stack.load(r["stack"])
+        if self._morph:
+            self._morph["names"] -= set(names)         # a running snapshot morph lets go of this lane
+        if bars <= 0:
+            self.base.update(to)
+            self._lane_morph.pop(lane, None)
+        else:
+            self._lane_morph[lane] = dict(src={n: self.base[n] for n in names}, to=to, names=set(names),
+                                          start=self.beat, dur=bars * 4.0, old=old_mods, stack=use_stack, t=0.0)
+        self.comp[lane] = dict(clip=id if op == "launch" else None, macros=list(r["macros"]),
+                               over=[False] * len(r["macros"]))
+        self._macro_map_build()
+        self.cur = -1                                  # the faders no longer match a saved snapshot
+        if self.tl is not None and not self._tl_firing and self.tl.recording():
+            cmd = {"cmd": "clip", "op": op, "lane": lane}
+            if op == "launch":
+                cmd["id"] = id
+            it = self.tl.add_item("event", {"t": self.tl.pos, "cmd": cmd})
+            if it:
+                self._rec_ids.add(it["id"])
+        self._changed()
+
+    def _step_lanes(self):
+        disc = _DISCRETE_SET
+        for lane, lm in list(self._lane_morph.items()):
+            t = (self.beat - lm["start"]) / lm["dur"]
+            if t < 0:
+                lm["start"], t = self.beat, 0.0
+            t = min(1.0, t)
+            lm["t"] = t
+            src, to = lm["src"], lm["to"]
+            for n in lm["names"]:
+                a, b = src[n], to[n]
+                if n in disc:
+                    self.base[n] = b if t >= 0.5 else a
+                else:
+                    self.base[n] = b if t >= 1.0 else a + (b - a) * t
+            if lm["stack"] and self.stack is not None:
+                self.stack.morph_to(t)
+            if t >= 1.0:
+                del self._lane_morph[lane]
+
+    def macro(self, lane, n, v, key=None):
+        """Move macro n (1-based) of the clip on air in `lane` to v (0..1, snapped to its steps). The targets are
+        written with set(): counted in Controller.edits (the user wins over the governor), recorded by the timeline."""
+        on = self.comp.get(lane)
+        cl = _clips.get(on["clip"], self.clips) if on and on["clip"] else None
+        if cl is None or not 1 <= n <= len(cl["macros"]):
+            return False
+        i = n - 1
+        x = _clips.snap(cl["macros"][i], v)
+        vals = _clips.macro_values(cl, i, x)
+        self._hist_push(key, list(vals), comp=True)
+        self._macro_writing = True
+        try:
+            for p, val in vals.items():
+                self.set(p, val)
+        finally:
+            self._macro_writing = False
+        on["macros"][i] = x
+        on["over"][i] = False
+        return True
+
+    def scene_go(self, cid, now=False, bars=None):
+        """Fire a scene column (by id, any deck): per lane launch its clip, STOP or KEEP. One undo step."""
+        col = _clips.find_column(self.decks, cid) if _clips is not None else None
+        if col is None:
+            return False
+        bars = col.get("bars", bars)
+        key = self._hkey_once()
+        for lane in self.comp:
+            cell = col["lanes"].get(lane, "keep")
+            if cell == "stop":
+                self.clip_stop(lane, bars=bars, now=now, hkey=key)
+            elif isinstance(cell, dict):
+                self.clip_launch(cell["clip"], macros=cell.get("macros"), bars=bars, now=now, lane=lane, hkey=key)
+        return True
+
+    # ---------------------------------------------------------------- engine-side undo (gesture-coalesced)
+
+    def _hkey(self, c, *auto):
+        """Undo key of a panel command: its gesture id, else ("auto", what...) = coalesced by time."""
+        return ("g", c["g"]) if c.get("g") is not None else ("auto",) + auto
+
+    def _hkey_once(self):
+        self._hist_n += 1
+        return ("one", self._hist_n)
+
+    def _hist_push(self, key, names, comp=False, mods=None, stack=False):
+        """Before a change: remember what `names` (and optionally comp / mods / the stack) were. A step with the same
+        key as the last one merges into it (a drag = one step): gesture ids within HIST_G_GAP, "auto" keys within
+        HIST_GAP of the last move, "one" keys always (several lanes of one scene_go)."""
+        if self._hist_mute or self._tl_firing:
+            return
+        now = self.now()
+        last = self.history[-1] if self.history else None
+        if last is not None and key is not None and last["key"] == key and (
+                key[0] == "one" or now - last["t"] <= (HIST_G_GAP if key[0] == "g" else HIST_GAP)):
+            for n in names:
+                last["old"].setdefault(n, self.base[n])
+            if comp and last["comp"] is None:
+                last["comp"] = copy.deepcopy(self.comp)
+            if mods:
+                last["mods"] = last["mods"] or {}
+                for n in mods:
+                    if n not in last["mods"]:
+                        last["mods"][n] = copy.deepcopy(self.mods.get(n))
+            if stack and last["stack"] is None and self.stack is not None:
+                last["stack"] = self.stack.to_json()
+            last["t"] = now
+            return
+        self.history.append(dict(key=key, t=now, old={n: self.base[n] for n in names},
+                                 comp=copy.deepcopy(self.comp) if comp else None,
+                                 mods={n: copy.deepcopy(self.mods.get(n)) for n in mods} if mods else None,
+                                 stack=self.stack.to_json() if stack and self.stack is not None else None))
+        self._redo = []
+
+    def _hist_apply(self, st):
+        """Put a step back; returns its inverse (for redo / undo of the redo)."""
+        inv = dict(key=None, t=self.now(), old={n: self.base[n] for n in st["old"]},
+                   comp=copy.deepcopy(self.comp) if st["comp"] is not None else None,
+                   mods={n: copy.deepcopy(self.mods.get(n)) for n in st["mods"]} if st["mods"] is not None else None,
+                   stack=self.stack.to_json() if st["stack"] is not None and self.stack is not None else None)
+        for lm in self._lane_morph.values():
+            lm["names"] -= set(st["old"])
+        if self._morph:
+            self._morph["names"] -= set(st["old"])
+        self._hist_mute, self._macro_writing = True, True
+        try:
+            for n, v in st["old"].items():
+                self.set(n, v)
+        finally:
+            self._hist_mute, self._macro_writing = False, False
+        if st["mods"] is not None:
+            for n, pair in st["mods"].items():
+                if pair:
+                    self.mods[n] = copy.deepcopy(pair)
+                else:
+                    self.mods.pop(n, None)
+        if st["stack"] is not None and self.stack is not None:
+            self._stack_morph = False
+            self.stack.morph_cancel()
+            self.stack.load(st["stack"])
+        if st["comp"] is not None:
+            self.comp = copy.deepcopy(st["comp"])
+            self._macro_map_build()
+        if st.get("theme") is not None and self.themes is not None:   # [themes] undo of a theme restore
+            inv["theme"] = self.themes.undo_apply(st["theme"])
+        return inv
+
+    def undo(self):
+        if self.history:
+            self._redo.append(self._hist_apply(self.history.pop()))
+            return True
+        return False
+
+    def redo(self):
+        if self._redo:
+            self.history.append(self._hist_apply(self._redo.pop()))
+            return True
+        return False
+
     # ---------------------------------------------------------------- scenes
 
     def set_xfade(self, a=None, b=None, x=None):
@@ -1293,6 +1748,7 @@ class Controller:
         if sa is None or sb is None:
             return
         self.pending = self._morph = None
+        self._comp_clear()
         for n in CONT:
             va, vb = sa["base"][n], sb["base"][n]
             self.base[n] = (vb if x >= 0.5 else va) if n in DISCRETE else va + (vb - va) * x
@@ -1371,6 +1827,7 @@ class Controller:
         sc = self.scenes[i]
         if sc is None:
             return
+        self._comp_clear()                             # a snapshot writes every fader: no clip is "on air" any more
         to = dict(sc["base"])
         if keep_palette:
             to["palette"] = self.base["palette"]
@@ -1473,7 +1930,10 @@ class Controller:
                     text=self.text.to_json() if self.text is not None else None,
                     bypass=sorted(self.bypass), bypass_fade=self.bypass_fade, ext=dict(self.ext),
                     stack=self.stack.to_json() if self.stack is not None else None, canvas=self.canvas_prev,
-                    skins=self.skins.to_json() if self.skins is not None else None)
+                    skins=self.skins.to_json() if self.skins is not None else None,
+                    skins_on=bool(self.skins.on) if self.skins is not None else False,
+                    clips=[copy.deepcopy(x) for x in self.clips.values()], decks=copy.deepcopy(self.decks),
+                    comp=self._comp_json(), themes=self.themes.to_json() if self.themes is not None else None)
 
     def _autosave(self):
         if not self.autosave:
@@ -1531,6 +1991,8 @@ class Controller:
                 self._byp = {k: 1.0 for k in self.bypass}
             if self.stack is not None and isinstance(s.get("stack"), dict):
                 self.stack.restore(s["stack"])         # comes back as it was: no fade-in on the projector
+            if self.skins is not None and isinstance(s.get("skins_on"), bool):
+                self.skins.on = s["skins_on"]          # the feature switch (a show file never carries it)
             if self.skins is not None and isinstance(s.get("skins"), dict):
                 self.skins.restore(s["skins"])
             cv = s.get("canvas")
@@ -1539,6 +2001,17 @@ class Controller:
                                         bypass=sorted(k for k in (cv.get("bypass") if isinstance(cv.get("bypass"), list) else [])
                                                       if isinstance(k, str) and k in BYPASS_COVER),
                                         stack=_stack.clean_stack(cv.get("stack")), auto=bool(cv.get("auto")))
+            if _clips is not None:                     # user clips + decks first: "comp" refers to them
+                if "clips" in s:
+                    self.clips = {x["id"]: x for x in _clips.clean_clips(s.get("clips"))}
+                    self._clips_rev += 1
+                if "decks" in s:
+                    self.decks = _clips.clean_decks(s.get("decks"))
+                    self._clips_rev += 1
+                if "comp" in s:
+                    self._comp_restore(s.get("comp"))
+            if self.themes is not None and isinstance(s.get("themes"), dict):
+                self.themes.restore(s["themes"])       # [themes] session tray (validated in themes.clean_tray)
             f = s.get("bypass_fade")
             if isinstance(f, (int, float)) and not isinstance(f, bool) and math.isfinite(f):
                 self.bypass_fade = min(BYPASS_FADE_MAX, max(0.0, float(f)))
@@ -1567,6 +2040,8 @@ class Controller:
                 try:
                     v = validate(c)
                     self._do(v)
+                    if self.themes is not None:
+                        self.themes.saw(v)             # [themes] a performer action holds sound-tag recall
                     if v["cmd"] not in _NOT_EDITS and not (v["cmd"] == "tl" and v["op"] in _TL_TRANSPORT):
                         self._changed()
                 except Exception:
@@ -1576,14 +2051,28 @@ class Controller:
         if self._out:
             rest += self._out
             self._out = []
+        if self.themes is not None and rest:
+            self.themes.note_media(rest)               # [themes] remember the AI texture the engine is sent
         return rest
 
     def _do(self, c):
         cmd = c["cmd"]
         if cmd == "set":
+            self._hist_push(self._hkey(c, "set", c["name"]), (c["name"],))
             self.set(c["name"], c["v"])
         elif cmd == "inc":
+            self._hist_push(self._hkey(c, "set", c["name"]), (c["name"],))
             self.nudge(c["name"], c["d"])
+        elif cmd == "clip":
+            self._clip_do(c)
+        elif cmd == "deck":
+            self._deck_do(c)
+        elif cmd == "macro":
+            self.macro(c["lane"], c["n"], c["v"], key=self._hkey(c, "macro", c["lane"], c["n"]))
+        elif cmd == "scene_go":
+            self.scene_go(c["id"], now=c.get("now", False) or self._tl_firing, bars=c.get("bars"))
+        elif cmd == "history":
+            (self.undo if c["op"] == "undo" else self.redo)()
         elif cmd == "mod":
             self.set_mod(c["name"], c["slot"], c["src"], c["amt"], c["rate"], c["phase"])
         elif cmd == "stack":                           # math stack edit (also what a "mod" on stack:<id>:<field> becomes)
@@ -1593,6 +2082,7 @@ class Controller:
         elif cmd == "skin":                            # environment skins (also what a "mod" on skin:<env>:<slot>:<f> becomes)
             if self.skins is not None:
                 self.skins.do(c)
+                self._skin_ai_cancel()
                 self._save_t = min(self._save_t, self.now() - AUTOSAVE_S + 0.5)
         elif cmd == "canvas":
             (self.new_canvas if c["op"] == "new" else self.restore_canvas)()
@@ -1603,6 +2093,8 @@ class Controller:
             self._show_do(c)
         elif cmd == "preset":
             self._preset_do(c)
+        elif cmd == "theme" and self.themes is not None:
+            self.themes.do(c)
         elif cmd == "trigger":
             self.trigger(c["name"], c["on"])
         elif cmd == "latch":
@@ -1656,6 +2148,7 @@ class Controller:
         elif cmd == "init":
             self.base.update({n: PARAMS[n][2] for n in CONT})
             self.mods, self._morph, self.cur = {}, None, -1
+            self._comp_clear()
             if self.stack is not None:
                 self._stack_morph = False
                 self.stack.load(dict(layers=[]))
@@ -1791,6 +2284,7 @@ class Controller:
         pos = tl.pos if pos is None else pos
         for name, g in list(self._rec_g.items()):
             self._tl_gesture_end(name, g, pos)
+            self._tl_ovr.pop(name, None)               # recorded = what the lane now holds: hand it to the lane
         for name, t0 in self._rec_trig.items():
             it = tl.add_item("trigger", {"t": t0, "len": max(pos - t0, _tl.REC_GAP[tl.units]), "name": name})
             if it:
@@ -2115,6 +2609,16 @@ class Controller:
             out["timelines"] = [x.get("name", "") if x is not None else d.get("name", "") for x in self.tl_docs]
         return out
 
+    def _show_state(self):
+        if self.shows is None:
+            return None
+        st = self.shows.state()
+        bc = getattr(self, "blob_cache", None) or {}
+        for k in ("shows", "presets"):                 # the rev the panel sees always matches what GET /<k> serves
+            if k in bc and isinstance(st.get("rev"), dict):
+                st["rev"][k] = bc[k][0]
+        return st
+
     def _blobs(self):
         """Big documents the panel fetches only when their rev changes: built here at most every 0.5 s while a
         record pass runs (json of the timeline), the listings on the shows worker."""
@@ -2130,6 +2634,17 @@ class Controller:
             out["timeline"] = self._tl_blob
         if self.shows is not None:
             out.update(self.shows.blobs)
+        if _clips is not None:                         # GET /clips: factory + user clips + decks (rev in state.comp)
+            if self._clips_blob[0] != self._clips_rev:
+                try:
+                    self._clips_blob = (self._clips_rev, json.dumps(dict(
+                        factory=_clips.FACTORY, user=list(self.clips.values()), decks=self.decks),
+                        allow_nan=False, separators=(",", ":")).encode())
+                except (TypeError, ValueError):
+                    pass
+            out["clips"] = self._clips_blob
+        if self.themes is not None:                    # [themes] GET /themes: the tray, log, suggestions
+            out["themes"] = self.themes.blob()
         return out
 
     # ================================================================ SHOWS + PRESETS (shows.py)
@@ -2180,6 +2695,10 @@ class Controller:
                 m.thumbs[payload] = m.rev["thumbs"]
             elif kind == "thumb_gone":
                 m.thumbs.pop(payload, None)
+            elif kind == "theme_thumb" and self.themes is not None:     # [themes]
+                self.themes.thumb_done(payload)
+            elif kind == "theme_starred" and self.themes is not None:
+                self.themes.starred(*payload)
         t = self._show_dirty_t
         if t is not None and (now - t >= SHOW_DEBOUNCE or now - self._show_first_t >= SHOW_MAX_WAIT):
             if not (self.tl is not None and self.tl.recording()) or now - self._show_first_t >= 2 * SHOW_MAX_WAIT:
@@ -2259,11 +2778,14 @@ class Controller:
         if "timeline" in parts and self.tl is not None and plan.get("timelines"):
             self._tl_load_docs(plan["timelines"], plan.get("timeline_active", 0))
         st = dict(plan.get("settings") or {})
-        look_keys = ("stack", "bypass", "canvas", "skins")
+        look_keys = ("stack", "bypass", "canvas", "skins", "comp")
+        scene_keys = ("clips", "decks", "themes")      # the clip library + decks (+ the theme tray) travel with the scenes
         if "look" not in parts:
             st = {k: v for k, v in st.items() if k not in look_keys}
+        if "scenes" not in parts:
+            st = {k: v for k, v in st.items() if k not in scene_keys}
         if "settings" not in parts:
-            st = {k: v for k, v in st.items() if k in look_keys}
+            st = {k: v for k, v in st.items() if k in look_keys + scene_keys}
         ext = st.pop("ext", None)
         if st:
             self._apply_state({"settings": st})
@@ -2331,7 +2853,7 @@ class Controller:
                 snap_t = time.time()
             m.submit("preset_save", preset=p, snap_t=snap_t)
         elif op == "recall":
-            opts = {"groups": c.get("groups"), "morph": c["morph"]}
+            opts = {"groups": c.get("groups"), "morph": c["morph"], "ref": c["ref"]}
             p = m.cache.get(c["ref"])
             if p is not None:
                 self._apply_preset(p, opts)
@@ -2430,6 +2952,8 @@ class Controller:
         elif kind == "midi":
             self.midi.bindings = [dict(b) for b in d.get("bindings", [])]
             self.midi.save()
+        elif kind == "theme" and self.themes is not None:   # [themes] a starred theme from the library / a cue
+            self.themes.restore_preset(p, opts)
         self._changed()
 
     # ---------------------------------------------------------------- MIDI (drained inside update)
@@ -2500,11 +3024,15 @@ class Controller:
     def _act(self, b, kind, val):
         target = b["target"]
         p = target.split(":")
+        if self.themes is not None:
+            self.themes.manual()                       # [themes] any bound MIDI control is a performer action
         press = kind == "note_on" or (kind == "cc" and val >= 64)
         edge = self._cc_rise(b, val) if kind == "cc" else press   # one-shot actions: a CC fires once per crossing of 64
         if p[0] == "param":
             name = p[1]
             lo, hi = PARAMS[name][0], PARAMS[name][1]
+            if kind in ("cc", "note_on"):
+                self._hist_push(("auto", "midi", name), (name,))
             if kind == "cc":
                 if b.get("mode") == "rel":             # relative encoder, two's complement: 1 = +1, 127 = -1
                     self.nudge(name, (val if val < 64 else val - 128) * (hi - lo) / 127.0)
@@ -2538,7 +3066,22 @@ class Controller:
                 rel = (val if val < 64 else val - 128) if b.get("mode") == "rel" else None
                 self.skins.midi(t[0], t[1], t[2], val / 127.0, rel=rel)
             elif t and kind == "note_on" and t[2] in _skins.INT:
-                self.skins.midi(t[0], t[1], t[2], 1.0, press=edge)
+                self.skins.midi(t[0], t[1], t[2], 1.0, pad=True, press=edge)
+        elif p[0] == "macro":                          # macro:<lane>:<n>: whatever clip is on air in that lane
+            lane, n = p[1], int(p[2])
+            on = self.comp.get(lane, {})
+            if kind == "cc":
+                x = val / 127.0
+                if b.get("mode") == "rel" and on.get("macros") and n <= len(on["macros"]):
+                    x = on["macros"][n - 1] + (val if val < 64 else val - 128) / 127.0
+                self.macro(lane, n, x, key=("auto", "macro", lane, n))
+            elif kind in ("note_on", "note_off") and on.get("clip"):
+                cl = _clips.get(on["clip"], self.clips)
+                m = cl["macros"][n - 1] if cl and n <= len(cl["macros"]) else None
+                if m is not None and m["widget"] == "bang":          # momentary: held = 1
+                    self.macro(lane, n, 1.0 if press else 0.0, key=("auto", "macro", lane, n))
+                elif m is not None and kind == "note_on":            # a pad toggles the macro min / max
+                    self.macro(lane, n, 0.0 if on["macros"][n - 1] > 0.5 else 1.0, key=None)
         elif target == "xfade":
             if kind == "cc":                           # soft takeover: a physical fader that is somewhere else does
                 v, last, cur = val / 127.0, self._xf_cc, self.xfade["x"]     # nothing until it reaches the position
@@ -2550,6 +3093,10 @@ class Controller:
             return                                     # everything below fires on press only (CC: rising edge)
         elif p[0] == "scene":
             (self.scene_save if self._shift else self.scene_recall)(int(p[1]))
+        elif p[0] == "clip":
+            self.clip_launch(p[1])
+        elif p[0] == "theme" and self.themes is not None:   # [themes] restore; Shift + pad = capture the look there
+            self.themes.midi(int(p[1]), shift=self._shift)
         elif p[0] == "palette":
             self.set("palette", float(p[1]))
         elif p[0] == "morph":
@@ -2669,8 +3216,21 @@ class Controller:
         if self.pending and beat >= self.pending[1] - 1e-9:
             i, self.pending = self.pending[0], None
             self._manual_recall(i)                     # before autopilot, which then stands down for a period
+        if self._clip_pending:                         # quantized clip launches / stops whose beat has come
+            due = [q for q in self._clip_pending if beat >= q["fire"] - 1e-9]
+            if due:
+                self._clip_pending = [q for q in self._clip_pending if q not in due]
+                for q in due:
+                    self._clip_fire(**{k: v for k, v in q.items() if k != "fire"})
+        if self.themes is not None:                    # [themes] quantized theme restores + SOUND TAGS decisions
+            try:
+                self.themes.step(now, beat)
+            except Exception:
+                pass
         self._step_autopilot(dt)
         self._step_morph()
+        if self._lane_morph:
+            self._step_lanes()
         if self.tl is not None:
             try:
                 self._step_timeline(dt)
@@ -2690,6 +3250,9 @@ class Controller:
         drift_amt = self.auto["drift_amt"] if self.auto["drift"] else 0.0
         vals = {}
         au = self._auto
+        lane_old = None                                # a clip launch's lane morph crossfades the lane's old mods
+        if self._lane_morph:
+            lane_old = {n: (pair, lm["t"]) for lm in self._lane_morph.values() for n, pair in lm["old"].items()}
         for n in CONT:
             lo, hi = PARAMS[n][0], PARAMS[n][1]
             target = au[n] if n in au else self.base[n]   # timeline automation (its own layer) wins over the fader
@@ -2709,6 +3272,9 @@ class Controller:
             m = self._mod_sum(self.mods, n, beat)
             if mo:                                     # crossfade the outgoing modulation (possibly itself a blend)
                 m = m * w_new + (1.0 - w_new) * sum(w * self._mod_sum(om, n, beat) for om, w in mo["old"])
+            if lane_old and n in lane_old:
+                pair, lt = lane_old[n]
+                m = m * lt + (1.0 - lt) * self._mod_sum({n: pair}, n, beat)
             if drift_amt and n in self._drift and n in self.auto["drift_params"]:
                 m += self._drift[n][1] * drift_amt * 0.5
             vals[n] = min(hi, max(lo, self._sm[n] + m * (hi - lo)))
@@ -2744,7 +3310,9 @@ class Controller:
             try:
                 self.skins.step(dt, None, source=lambda m, name, slot: self._source(m, name, slot, beat))
                 if self.skins.gen is not None:         # "generate a skin": sent only when calm + the worker is idle
-                    self.skins.gen_tick(now, self.ai.status(), self.ai.submit, strained=self.gov_level > 0)
+                    self.skins.gen_tick(now, self.ai.status(), self.ai.submit, strained=self.gov_level > 0,
+                                        result=getattr(self.ai, "tagged", None), vram_free_mb=self.gov_vram_free_mb)
+                    self._skin_ai_cancel()
             except Exception:
                 pass
 
@@ -2829,5 +3397,7 @@ class Controller:
             canvas=dict(active=self.canvas_prev is not None, fresh=self.fresh),
             online=_online.state(self) if _online is not None else dict(on=False, missing=True),
             tl=self._tl_state() if self.tl is not None else None,
-            show=self.shows.state() if self.shows is not None else None,
+            show=self._show_state(),
+            comp=self._comp_state() if _clips is not None else None,
+            themes=self.themes.state() if self.themes is not None else None,
         )

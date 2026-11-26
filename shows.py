@@ -34,10 +34,11 @@ import zipfile
 from pathlib import Path
 
 SHOW_FORMAT, PRESET_FORMAT = "entheo-show", "entheo-preset"
-SHOW_VERSION, PRESET_VERSION = 1, 1
+SHOW_VERSION, PRESET_VERSION = 2, 1      # show v2 (2026-11-26): settings carry clips, decks, comp (clips.py)
 APP = "EntheoControl"
-KINDS = ("look", "layer", "fx", "mod", "mapping", "midi")
-KIND_NAMES = {"look": "Look", "layer": "Layer", "fx": "Effects", "mod": "Mod routing", "mapping": "Mapping", "midi": "MIDI map"}
+KINDS = ("look", "layer", "fx", "mod", "mapping", "midi", "theme")      # theme: a starred THEME (themes.py)
+KIND_NAMES = {"look": "Look", "layer": "Layer", "fx": "Effects", "mod": "Mod routing", "mapping": "Mapping", "midi": "MIDI map",
+              "theme": "Theme"}
 PARTS = ("look", "scenes", "timeline", "settings", "midi", "mapping", "recorder")
 SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 MEDIA_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,119}$")
@@ -99,9 +100,39 @@ def inside(root, path):
         return False
 
 
+_GEN = {}                                    # resolved path -> writes by this process (cache keys include it)
+_GEN_LOCK = threading.Lock()
+
+
+def bump(path):
+    """Mark a path as changed by us (write, delete, rename): every cache keyed on it misses next time."""
+    try:
+        k = str(Path(path).resolve())
+    except OSError:
+        k = str(path)
+    with _GEN_LOCK:
+        _GEN[k] = _GEN.get(k, 0) + 1
+
+
+def stamp(path):
+    """Cache key for a file's identity: (mtime_ns, ctime_ns, size, inode, our write generation). mtime alone repeats on
+    NTFS for rewrites inside one ~15 ms clock tick; ino changes on every os.replace; the generation covers our own
+    writes even when the file system reports nothing new. None if the file is gone."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        k = str(path.resolve())
+    except OSError:
+        return None
+    with _GEN_LOCK:
+        g = _GEN.get(k, 0)
+    return (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino, g)
+
+
 def write_atomic(path, data):
     """bytes -> path via temp file + os.replace (a crash never leaves half a file). Returns True on success."""
     path = Path(path)
+    bump(path)
     tmp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +143,7 @@ def write_atomic(path, data):
         for i in range(5):
             try:
                 os.replace(tmp, path)
+                bump(path)
                 return True
             except PermissionError:
                 if i == 4:
@@ -135,6 +167,14 @@ def quarantine(path):
     return q(path)
 
 
+def parse_json(data):
+    """(obj, error) from bytes; bad UTF-8 / JSON = 'corrupt'."""
+    try:
+        return json.loads(data.decode("utf-8")), None
+    except (ValueError, RecursionError):
+        return None, "corrupt"
+
+
 def read_json(path, limit):
     """(obj, error). error: None | 'missing' | 'unreadable' | 'corrupt' | 'too big'. A corrupt file is NOT moved here."""
     path = Path(path)
@@ -143,11 +183,11 @@ def read_json(path, limit):
             return None, "missing"
         if path.stat().st_size > limit:
             return None, "too big"
-        text = path.read_text(encoding="utf-8")
+        data = path.read_bytes()
     except OSError:
         return None, "unreadable"
     try:
-        return json.loads(text), None
+        return json.loads(data.decode("utf-8")), None           # UnicodeDecodeError is a ValueError: corrupt
     except (ValueError, RecursionError):
         return None, "corrupt"
 
@@ -156,15 +196,18 @@ _HASHES = {}                                 # (path, size, mtime_ns) -> sha256
 _HASH_LOCK = threading.Lock()
 
 
+HASH_CACHE_MIN = 4 << 20                     # files under 4 MB are simply hashed again (cheap, never stale)
+
+
 def file_hash(path):
+    """sha256 of the file's CONTENT. Big media files are cached on stamp() (mtime, ctime, size, inode, our writes)."""
     path = Path(path)
-    try:
-        st = path.stat()
-    except OSError:
+    st = stamp(path)
+    if st is None:
         return None
-    key = (str(path), st.st_size, st.st_mtime_ns)
+    key = (str(path),) + st if st[2] >= HASH_CACHE_MIN else None
     with _HASH_LOCK:
-        if key in _HASHES:
+        if key is not None and key in _HASHES:
             return _HASHES[key]
     h = hashlib.sha256()
     try:
@@ -174,8 +217,11 @@ def file_hash(path):
     except OSError:
         return None
     d = h.hexdigest()
-    with _HASH_LOCK:
-        _HASHES[key] = d
+    if key is not None and stamp(path) == st:      # unchanged while we read it: safe to remember
+        with _HASH_LOCK:
+            if len(_HASHES) > 4096:
+                _HASHES.clear()
+            _HASHES[key] = d
     return d
 
 
@@ -203,8 +249,28 @@ def migrate_show(raw):
         raise ValueError("show file has no version")
     if v > SHOW_VERSION:
         raise ValueError(f"this show was saved by a newer version (format {v}); update the software to open it")
-    # (future: while v < SHOW_VERSION: raw = _STEPS[v](raw); v += 1)
+    while v < SHOW_VERSION:
+        raw = _STEPS[v](raw)
+        v += 1
     return raw
+
+
+def _v1_to_v2(raw):
+    """v1 -> v2: the clip model. The 16 snapshot slots, the cue channel, timelines (scene cues by slot number) are
+    untouched; the show gets an empty user clip library, no decks and nothing on air as a clip."""
+    raw = copy.deepcopy(raw)
+    ctl = raw.get("controller") if isinstance(raw.get("controller"), dict) else {}
+    st = ctl.get("settings") if isinstance(ctl.get("settings"), dict) else {}
+    st.setdefault("clips", [])
+    st.setdefault("decks", [])
+    st.setdefault("comp", {})
+    ctl["settings"] = st
+    raw["controller"] = ctl
+    raw["version"] = 2
+    return raw
+
+
+_STEPS = {1: _v1_to_v2}
 
 
 def migrate_preset(raw):
@@ -288,7 +354,8 @@ def clean_settings(raw):
     if not isinstance(raw, dict):
         return {}
     keep = ("bpm", "clock_src", "strobe_rate", "latch", "morph", "quantize", "glide", "safe", "cue_ch", "autopilot",
-            "seq", "text", "bypass", "bypass_fade", "stack", "canvas", "skins")
+            "seq", "text", "bypass", "bypass_fade", "stack", "canvas", "skins", "clips", "decks", "comp",
+            "themes")                                                 # themes: the THEMES tray (themes.clean_tray)
     out = {k: copy.deepcopy(raw[k]) for k in keep if k in raw}
     out["ext"] = clean_ext(raw.get("ext"))
     return out
@@ -384,6 +451,10 @@ def clean_preset(raw):
         data["surfaces"] = m["surfaces"]
     elif kind == "midi":
         data["bindings"] = clean_bindings(d.get("bindings"))
+    elif kind == "theme":                                    # [themes] a theme with its scope (+ sound tag)
+        import themes
+        th = themes.clean_theme(d.get("theme"))
+        data["theme"] = {k: th[k] for k in ("name", "scope", "pal", "data", "tag")}
     groups = sorted({c.PARAMS[n][3] for n in data.get("values", {})} | {c.PARAMS[n][3] for n in data.get("mods", {})})
     created = raw.get("created")
     return {"format": PRESET_FORMAT, "version": PRESET_VERSION, "kind": kind, "name": clean_name(raw.get("name")),
@@ -668,12 +739,15 @@ class ShowManager:
                     continue
                 seen.add(str(f))
                 try:
-                    mt = f.stat().st_mtime_ns
+                    if f.stat().st_size > MAX_PRESET_JSON:
+                        raise OSError("too big")
+                    body = f.read_bytes()
                 except OSError:
                     continue
+                mt = hashlib.sha1(body).digest()
                 hit = self._pcache.get(str(f))
                 if hit is None or hit[0] != mt:
-                    raw, err = read_json(f, MAX_PRESET_JSON)
+                    raw, err = parse_json(body)
                     try:
                         if err:
                             raise ValueError(err)
@@ -999,9 +1073,11 @@ class ShowManager:
                     trash = self.presets_dir / ".trash"
                     trash.mkdir(parents=True, exist_ok=True)
                     os.replace(f, trash / f"{kind}.{slug}.{int(time.time())}{ext}")
+                    bump(f)
             except OSError:
                 pass
         self.cache.pop(ref, None)
+        self._pcache.pop(str(self.preset_path(kind, slug)), None)
         self._list_presets()
 
     def _load_preset_ref(self, ref):
@@ -1076,6 +1152,43 @@ class ShowManager:
         except OSError:
             pass
         self._post("thumb_gone", int(slot))
+
+    # ---- [themes] session-tray thumbnails (shows/_current/themes/<id>.jpg) + starring into presets/theme/
+    def theme_thumb_path(self, tid):
+        if not isinstance(tid, str) or not re.match(r"^[a-z0-9]{1,16}$", tid):
+            raise ValueError("bad theme id")
+        return self.work_dir / "themes" / f"{tid}.jpg"
+
+    def _do_theme_thumb(self, tid, snap_t):
+        if self._thumb_from_snapshot(snap_t, self.theme_thumb_path(tid)):
+            self._post("theme_thumb", tid)
+
+    def _do_theme_thumb_clear(self, tid):
+        try:
+            self.theme_thumb_path(tid).unlink()
+        except OSError:
+            pass
+
+    def _do_theme_star(self, preset, tid, slug=None):
+        p = clean_preset(preset)
+        d = self.presets_dir / "theme"
+        if slug is None or not self.preset_path("theme", slug).is_file():
+            slug = free_preset_slug(d, slugify(p["name"]))
+        f = self.preset_path("theme", slug)
+        if not write_atomic(f, dumps(p)):
+            self.say("error", "could not write the theme")
+            return
+        ref = f"theme/{slug}"
+        self.cache[ref] = p
+        self._pcache.pop(str(f), None)
+        try:
+            src = self.theme_thumb_path(tid)
+            if src.is_file():
+                write_atomic(self.preset_path("theme", slug, ".jpg"), src.read_bytes())
+        except (OSError, ValueError):
+            pass
+        self._list_presets()
+        self._post("theme_starred", (tid, ref))
 
     def _do_media_upload(self, name, data):
         """Timeline audio into shows/_media/ (server thread calls this directly too)."""

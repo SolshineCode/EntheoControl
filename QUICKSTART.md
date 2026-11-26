@@ -1,252 +1,717 @@
-# Quickstart: getting hands-on
+# EntheoControl reference manual
+
+Everything you can set, press and launch, in one place. New here? Do the guided [WALKTHROUGH.md](WALKTHROUGH.md) first, then keep this open as a reference. Before a real gig, print [docs/SHOW_DAY_CHECKLIST.md](docs/SHOW_DAY_CHECKLIST.md).
 
 All commands run in PowerShell from the project folder:
-```
+```powershell
 cd C:\path\to\EntheoControl
 ```
+`python` below means the project's own venv: `.\.venv\Scripts\python.exe`.
 
-## 1. Hook up the projector (5 min)
-1. HDMI from the ThinkPad to the BenQ, power on, dark room, 3-6 ft from a wall.
-2. Press **Win + P** and choose **Extend** (not Duplicate). The projector becomes display #2.
-3. BenQ menu: turn **Auto Keystone OFF** and set keystone to 0. All warping happens in software, which keeps the image sharp.
-4. Settings > Display: set the projector to **1280 x 800** (its native resolution).
+**Contents**
+1. [Setup](#1-setup)
+2. [Launching](#2-launching)
+3. [The panel, tab by tab](#3-the-panel-tab-by-tab)
+4. [Keyboard](#4-keyboard)
+5. [Layers reference](#5-layers-reference)
+6. [Modulation, clock, scenes, autopilot](#6-modulation-clock-scenes-autopilot)
+7. [Controllers: MIDI, cue channel, gamepad](#7-controllers-midi-cue-channel-gamepad)
+8. [Mapping](#8-mapping)
+9. [Crowd camera](#9-crowd-camera)
+10. [Recording](#10-recording)
+11. [Shows, presets, timeline](#11-shows-presets-timeline)
+12. [AI: local and online](#12-ai-local-and-online)
+13. [Safety](#13-safety)
+14. [Troubleshooting](#14-troubleshooting)
+15. [File locations](#15-file-locations)
+16. [Other tools](#16-other-tools)
+17. [Coming next](#17-coming-next)
+18. [Glossary](#18-glossary)
 
-## 2. Start the show (one command)
-```
+---
+
+## 1. Setup
+
+### 1.1 The projector
+1. Connect HDMI from the laptop to the projector and power it on. Dark room, projector square to the wall. A short-throw projector needs about 1-2 m; a standard one needs more.
+2. Press **Win + P** and choose **Extend** (not Duplicate). The projector becomes display 2, which is monitor index **1** for the engine.
+3. In the projector's own menu, turn **Auto Keystone OFF** and set keystone to 0. All warping happens in software, which keeps the picture sharp.
+4. Windows **Settings > System > Display**: set the projector to its **native resolution** (1280 x 800 on the test projector) and scaling to 100 %.
+5. Focus and square it with the test pattern: `python test_pattern.py --monitor 1` (Esc or Q closes it). Circles should be round, the border rectangular, the 1-pixel line pairs in the corners sharp.
+
+If your projector's native resolution is not 1280 x 800, pass `--render WxH` with its native size (see [2.2](#22-engine-flags-live_visualspy)).
+
+### 1.2 Windows settings for shows (power and heat)
+A heavy show can draw more than a laptop's stock charger delivers, and a hot GPU throttles. These settings make the biggest difference. The panel lists them too: **CONTROLLERS > Health > Power > Windows power checklist**.
+
+| Setting | Where | Value | Why |
+|---|---|---|---|
+| Charger | the wall socket | The laptop's **stock charger** (or a higher-watt one), plugged in directly, **not** through a dock or USB-C hub | Docks and hubs often deliver less power |
+| Maximum processor state | Control Panel > Power Options > Change plan settings > Advanced > Processor power management | **99 %** on AC | Turns CPU turbo off: a large power and heat saving, no visible cost |
+| Max Frame Rate | NVIDIA Control Panel > Manage 3D settings > Program settings > `python.exe` | **60** (or the show's cap) | No wasted frames |
+| WhisperMode | NVIDIA Control Panel or GeForce app, for `python.exe` | **Off** | It fights the show's own frame pacing |
+| Threaded optimization | NVIDIA Control Panel > Program settings > `python.exe` | **Off** | Avoids a busy-spin on vsync |
+| Preferred graphics processor | NVIDIA Control Panel (or Windows Graphics settings) for `python.exe` | **High-performance NVIDIA** | The engine must not land on integrated graphics |
+
+Also: raise the back of the laptop so the vents breathe, close heavy apps, and turn off notifications (Focus / Do not disturb) so nothing pops up on the projector.
+
+### 1.3 Audio
+The engine listens to whatever the laptop is playing (WASAPI loopback) by default: Spotify, a browser, a DJ app. For a DJ's line-out, use a USB audio interface and play it through the laptop, or use `--audio mic` to listen to the room microphone. The three meters in the top bar (bass, mid, high) show what it hears.
+
+### 1.4 Phone or tablet as the panel (optional)
+The panel is a web page. The console prints a URL like `http://<laptop-ip>:8765/?k=<token>` (plus a QR code if `qrcode` is installed). Open it on a phone or tablet on the same Wi-Fi.
+- The first time, Windows asks whether to allow Python through the firewall: tick **Private networks**. Make sure the Wi-Fi connection itself is set to the Private profile.
+- Venue Wi-Fi often isolates devices from each other. Use your phone's hotspot instead and join the laptop to it (no internet needed). Press **Ctrl+W** twice in the projector window to reprint the URL with the new address.
+- The token is stored in `.remote_token` and survives restarts, so an open panel reconnects by itself.
+
+---
+
+## 2. Launching
+
+### 2.1 run_show.ps1 (the normal way)
+```powershell
 powershell -ExecutionPolicy Bypass -File run_show.ps1
 ```
-This starts everything: the visuals on the projector, the **control panel** in your laptop browser (one panel for everything), and the AI worker. A crash restarts automatically and resumes the same look. The panel link stays the same between restarts.
+With no arguments it runs `live_visuals.py --monitor 1 --panel`. Any arguments you add **replace** those defaults and are passed to the engine, so include `--monitor 1 --panel` yourself:
+```powershell
+.\run_show.ps1 --monitor 1 --panel --spout
+.\run_show.ps1 --monitor 1 --panel --fresh          # start on a clean canvas, panel in SIMPLE mode
+.\run_show.ps1 --monitor 1 --panel --audio mic
+```
+What it does:
+- Starts the **AI worker** (`ai_worker.py`) as a separate low-priority process. Skip it with `$env:NO_AI = '1'` before launching.
+- Starts the engine and writes its log to `logs\show_<time>.log` (AI worker: `logs\ai_<time>.log`).
+- **Watchdog**: a clean quit (Shift+Esc, exit code 0) ends the show. A crash restarts it within about 1 s, and the controller restores the last live state (`live_state.json`), so the look carries on. On a restart it drops `--panel` (the open panel reconnects by itself) and `--fresh` (so a restart resumes what you were building). Five crashes within 60 s stop the loop.
+- Stops the AI worker when the show ends.
 
-- **Quit:** **Shift+Esc**, or Esc twice within 1 s. A single Esc does nothing, so you can't end a show by accident.
-- **Unplugging the projector** pauses the visuals; plug it back in and they return. If you launch before plugging in, it waits for the projector.
-- Play music on the laptop (Spotify, YouTube, a DJ set) and the visuals react to it. Add `--audio mic` to use the room mic instead (e.g. `run_show.ps1 --monitor 1 --panel --audio mic`).
-- Add `--spout` to send the output into TouchDesigner or Resolume.
+### 2.2 Engine flags (live_visuals.py)
+`python live_visuals.py --help` prints these.
 
-**The panel tabs:** PERFORM (one screen: scene grid, macro faders, live layers, quick boxes) · MOTION (travel into the visual, serpents) · SHAPE (zoom, pan XY pad, twirl, bulge, ripples) · COLOR (palettes, TAS light chase) · LAYERS (kene, beads, lines, AI, video, fractals, art) · FRACTAL (pure-math modes) · ART (upload paintings, fly through them) · SCENES (16 slots, morph, autopilot) · AI DREAM (type a prompt) · CONTROLLERS (MIDI learn, gamepad, clock) · MAPPING (several surfaces: boxes, sculpture faces; corners, angles, masks, edge glow) · 3D DECKS (flown-through 3D landscapes on an A/B deck with blend modes, particle swarm) · MOD BUS (audio scope, 16-step sequencer, every active modulation). Press **?** in the panel for shortcuts.
+**Show**
+| Flag | Default | What it does |
+|---|---|---|
+| `--monitor N` | none (preview window) | Borderless full screen on monitor N (projector usually 1). Waits for it if it is unplugged. |
+| `--panel` | off | Open the control panel in a browser on this laptop (implies `--remote`) |
+| `--remote` | off | Start the panel web server (Ctrl+W toggles it at runtime) |
+| `--remote-port P` | 8765 | Panel port |
+| `--remote-token T` | stored in `.remote_token` | Panel token |
+| `--render WxH` | 1280x800 | Internal render size: set it to your projector's native resolution |
+| `--audio loopback\|mic\|none` | loopback | What the visuals listen to |
+| `--spout` | off | Also send the picture to TouchDesigner / Resolume over Spout (sender `PsyProjector`) |
+| `--fresh` | off | Start on a clean black canvas with one moving stripe layer and open the panel in SIMPLE mode. RESTORE PREVIOUS brings back the saved look. |
+| `--governor off\|suggest\|auto` | saved setting, else suggest | Resource governor mode |
+| `--skin-size 512\|1024` | 512 | Resolution of the skin texture array (11 MB or 43 MB of VRAM) |
+| `--limit-mean X` | built-in | Brightness ceiling: the mean level 0..1 the frame may reach |
+| `--record [SECONDS]` | off | Start recording at launch, optionally stop after SECONDS |
+| `--record-opts K=V,...` | panel settings | `source=program\|projector`, `fps=30\|60`, `res=native\|1080p`, `audio=off\|laptop\|mic`, `quality=draft\|standard\|high` |
+| `--record-dir DIR` | `recordings\` | Where recordings go |
 
-**PERFORM, one screen (no scrolling on a 1920x1080 laptop; stacked on a phone or tablet):** master, BLACKOUT, PANIC, TAP / BPM and AUTOPILOT are the top bar right above it. **Scenes** (top left): the 16 pads (tap = recall, SAVE TO… or Shift-click / long-press = save), with morph length, quantize, and the autopilot period (4 to 128 bars) and order. **Macros** (top right): Zoom, Speed, Spin, Travel, Symmetry, Light chase, Trails, each with its MOD button (lit = modulated, teal line = live value), plus travel mode, palette swatches and a ripple pad; MORE CONTROLS… opens a drawer with the rarer faders. **Live layers**: only the layers that are showing, each with EYE + fader (tap the name to open that layer's tab); "+ N OFF" lists the rest (tap one to bring it in), + ADD opens BUILD. **Quick boxes** (HIDE / SHOW): Sources thumbnails, a text box, an AI prompt box (and the assistant). Esc closes a drawer. SIMPLE mode hides the jumps to other tabs.
+**Content folders and starting look**
+| Flag | Default | What it does |
+|---|---|---|
+| `--textures DIR` | `textures\` | AI texture library |
+| `--videos DIR` | `videos\` | Video loops for the video layer |
+| `--art DIR` | `art\` | Uploaded art pieces |
+| `--cycle S` | 12 | Legacy: seconds per AI texture. The panel's **Image hold** fader (LAYERS) now sets this. |
+| `--mode PRESET` | | Starting layer preset: `kene` (Folding Blocks), `kene+beads`, `beads`, `ai`, `both`, `lines`, `all` |
+| `--palette P` | | Starting palette 0..4 (fractional = blend) |
+| `--folds N` | | Starting fold count: 3, 4, 5, 6, 8, 10, 12, 16 or 24 |
+| `--fb X` | | Starting trails amount 0..0.98 |
+| `--twist I` | | Starting twirl preset 0..3 |
+| `--set NAME=VALUE` | | Set any `params.py` value at start (repeatable) |
 
-**Layers card (top of LAYERS):** one row per layer with a live thumbnail. **EYE** shows / hides the layer on the projector, **SOLO** shows only the soloed layers in the panel's monitor without changing the projector, and the fader is the opacity. Uploaded art not showing? Its layer ("Art pieces") starts at 0: click a thumbnail in **Sources** and it fades in.
+**Headless checks (no window, for testing)**
+| Flag | What it does |
+|---|---|
+| `--test N` | Render N frames, save samples to `test_frames\`, print fps and frame health |
+| `--gallery` | Render every look, contortion, trigger and travel mode into `test_frames\gallery\contact_sheet.png` |
+| `--batch JOBS.json` | Render a list of jobs `[{name, sets, frames, script}]` in one process |
+| `--out DIR`, `--snapshot` | Output folder; also write `snapshots\current.png` at the end |
+| `--extreme min\|max\|randN` | Stress test: every param at its min, max or a seeded random mix |
+| `--test-audio beat\|silent`, `--test-fps N`, `--pace` | Synthetic audio; show-time frame rate; pace frames in real time (power tests) |
+| `--phase-offset K` | Add K whole wrap periods to every phase (the picture must not change) |
+| `--no-nan-guard` | Shader outputs raw values (tests) |
+| `--live-controller` | Use the real controller instead of the static one |
+| `--text TEXT` | Words for the text layer (`\|` = new line) |
+| `--stack FILE.json`, `--skins FILE.json`, `--surfaces FILE.json` | Load a math stack, skins or a surfaces file (read-only) |
+| `--flashguard` | Run the flash guard in a headless run too (a show always runs it) |
 
-**Power switches:** every tab that changes the picture has a power icon on its tab button and a big ON / OFF switch at its top; a layer's **EYE** does the same for one layer, **ALL FX** for every effect. Off and on again brings back exactly the same settings. **PREVIEW** (top bar) is OFF by default to save GPU: switch it on to see the output monitor, solo layers and layer thumbnails in the panel.
+### 2.3 Quitting and unplugging
+- **Quit:** **Shift+Esc**, or Esc twice within 1 s, in the projector window. A single Esc never ends a show. Closing the window needs the same confirmation. (In the preview window a single Esc quits.)
+- **Projector missing at launch:** with `--monitor N` the engine waits, retrying every 2 s, instead of opening a preview window.
+- **Projector unplugged mid-show:** the window is parked and rendering pauses until it is back.
+- **Mouse cursor:** hidden over the projection except while calibrating.
 
-**Also in the panel:** a small **output monitor** in the top bar (click it for a large one), a **Sources** picker on PERFORM / ART / AI DREAM (thumbnails of uploaded art and AI images: click one to use it), and a **scene crossfader** on SCENES and behind A / B FADER on PERFORM (click DECK A, click a scene, same for DECK B, then drag to blend the two looks by hand).
+### 2.4 The panel without a projector
+`python remote_control.py --port 8799` serves the real control system with fake audio and no engine, for learning the panel or testing a controller. Add `--midi` to open MIDI ports, or `--fresh` for a clean canvas.
 
-Every fader has a **MOD** button: make it follow the bass, mids, highs, a beat-synced LFO or random.
+---
 
-**Projector-window keys** (click the projector window first; the panel is easier): `1`-`9` folds · `M` layer preset · `P` palette · `TAB` flat/mandala · `N` travel mode · `E` serpents · `-`/`=` zoom · hold `X` flash, `Z` strobe, `I` invert, `Q` freeze, `K` blackout, `J` punch · `,` tap tempo · `Ctrl+C` calibrate (drag corners with the mouse) · `Ctrl+G` outlines + grid + names · while calibrating `Ctrl+Z` undo, `Ctrl+R` reset that surface · `S` save mapping · `Ctrl+Backspace` reset · `Ctrl+W` panel server.
+## 3. The panel, tab by tab
 
-**First exercise (one surface):** tape a big rectangle on the wall (or hold up a foam board). In the panel's MAPPING tab drag the 4 corners on the canvas onto its corners while you watch the wall. A magnifier shows the exact pixel; arrow keys nudge the selected corner 1 px (Shift = 0.1 px). The visuals now live exactly on that object. It saves by itself (`surfaces.json`); Ctrl+Z undoes.
+![PERFORM](docs/img/panel_perform.png)
 
-**Second exercise (a box, three faces):**
-1. Stack a cardboard box so the projector sees its front, one side and the top.
-2. MAPPING > **+ ADD** twice: you now have three surfaces. Click one in the list and type a name ("Box front").
-3. Set "Show on the projector" to **ALL** and switch **TEST GRID** on: every surface shows up on the wall in its own colour with its number and name, and a white dot marks its top-left corner.
-4. Drag each surface's corners onto its face. Corners snap onto each other, so neighbouring faces share an edge exactly. The numbers on the canvas are the angle at each corner and the length of each edge in pixels; **SQUARE IT UP** makes a wonky quad a true rectangle.
-5. Overlay **OFF**. Now try, per surface: **EDGE GLOW** (a neon frame on the box edges, dark face), **SPANNED** on all three (one continuous picture wrapping round the box) or **WHOLE FRAME** (the full visual on every face), **Soft edge**, **Brightness** (dim the face that catches the most light).
-6. A face that is not four-sided (a triangle, a sculpture facet): **MASK**, then **+ POINT** / drag the diamond points.
-Everything outside the surfaces stays black, so nothing spills onto the wall behind.
+### 3.1 Everywhere
+**Top bar**
+| Control | What it does |
+|---|---|
+| Status | LIVE / connecting, fps, the texture on show, pills for clock, MIDI and AI |
+| SIMPLE / FULL | SIMPLE shows only BUILD, PERFORM and SCENES (plus the top bar and trigger row). Remembered per browser. |
+| Master | Overall brightness |
+| BLACKOUT | Hold for black (about 100 ms fade) |
+| PANIC | Hold 0.5 s (or hold Esc): jump to the SAFE scene, clear every trigger, stop the timeline. See [13.1](#131-panic). |
+| REC | Start / stop recording; shows elapsed time and size |
+| BPM, −, ÷2, ×2, + | Tempo. Mouse wheel nudges it (Shift = fine). |
+| TAP | Tap tempo (last 4 taps; resets after 2 s) |
+| Beat and bar lights, DOWNBEAT | DOWNBEAT makes "now" beat 1 of the phrase |
+| Clock: INT / TAP, MIDI, LINK, AUTO | Clock source (see [6.2](#62-clock)) |
+| AUTOPILOT | Scene autopilot on / off |
+| Output monitor + PREVIEW | **PREVIEW is OFF by default** to save the GPU. ON shows a small live picture (click for a large one) and enables SOLO and layer thumbnails. Remembered per browser. |
+| Meters | Bass, mid, high |
+| Health meter | Resource governor state, fps, GPU, temperature, battery. Click it for the Health card. |
+| FLASH GUARD | Green while idle, amber "HOLDING" while it limits flashes, red "FLASH GUARD OFF" while overridden |
+| ONLINE | OFF by default. See [12.3](#123-online-assistant-and-gemini-images). |
+| CAMERA | Shows CAMERA OFF; turns into a red blinking CAMERA ON while the webcam is in use. Click to switch it off. |
 
-## Recording the show
-Hit the red **REC** button in the panel's top bar (or **Ctrl+R** on the projector window, when not calibrating). The dot blinks and the elapsed time and file size count up; press it again to stop. A few seconds later the MP4 is in `recordings\` (for example `show_20261125_213000.mp4`).
+**Tab strip**: the tabs (power icons on the ones that change the picture), **SHOW** and **PRESETS** (see [11](#11-shows-presets-timeline)), **ALL FX**, **MIDI LEARN** and **?** (keyboard sheet plus the AGPL source link).
 
-Settings live in **CONTROLLERS > RECORD**:
-- **Source:** PROGRAM = the clean visual (best for sharing), PROJECTOR = exactly what is on the wall, mapping included.
-- **Audio:** OFF, LAPTOP AUDIO (whatever the laptop is playing: Spotify, YouTube, a DJ set) or MIC.
-- **30 / 60 fps**, **native or 1920x1080** (letterboxed), **quality** draft / standard / high.
-- **Replay buffer:** switch it on and the last 10-120 s are always kept; **SAVE LAST N s** writes them out after something great happened.
-- **OPEN FOLDER** opens `recordings\` on the laptop; the list shows the latest files with length and size.
+**Trigger row (bottom)**: FLASH, STROBE, INVERT, FREEZE, PUNCH (hold = momentary, the small "latch" corner = stays on), RIPPLE, and the **Strobe rate** (1/8, 1/4, 1/2, 1).
+
+**Faders**: drag = set, Shift-drag = fine, wheel = nudge, double-click = default. **MOD** opens the modulation editor; a lit MOD means the fader is modulated and a teal line shows the live value.
+
+**Power buttons (bypass)**: every tab that changes the picture has a power icon on its tab button and a big ON / OFF switch at its top. A layer's **EYE** does the same for one layer. **ALL FX** switches every effect (not the layers) off. Off fades out (0.3 s by default) and on comes back to exactly the same settings, because faders, mods and scenes are never edited. Bypass survives a restart. Scenes neither store nor change it, and PANIC leaves it alone, except that PANIC clears a bypass of the whole LAYERS tab, which would mean a black wall. MAPPING, PERFORM, SCENES, AI DREAM, CONTROLLERS and MOD BUS have no power button.
+
+### 3.2 BUILD
+Start simple and build up. ![BUILD](docs/img/panel_build.png)
+- **NEW CANVAS**: crossfades to black with one moving stripe layer (every engine layer bypassed, autopilot off). **RESTORE PREVIOUS** brings back the look from before, exactly. Both survive a restart.
+- **UNDO** (40 steps, per browser) and the stack amount fader.
+- **+ ADD LAYER**: Stripes, Rings, Spiral, Rays, Checker, Waves, Polygons, Noise bands (up to 8). Further down, "bring in from the engine": Folding Blocks, Beadwork, Sacred lines, Beings, Math fractals, Art, 3D landscapes, Text, AI textures, Video, and the two study layers. Bringing one in switches its bypass off and sets its fader to 0.4.
+- **The pile** (top = drawn last): up / down, EYE, SOLO, DUP, delete (click twice). Below it, a fader and CONTROLS link for each engine layer that is showing.
+- **Layer details** (right): every number has a fader, a typed box, a reset and MOD, and is MIDI-learnable.
+  - Shape: how many bands, band width, edge softness, waveform (Sine, Square, Triangle, Saw).
+  - Space: Straight, Polar, Tunnel, Kaleidoscope, Mirror X / Y / XY, Floor; angle, zoom, centre.
+  - Motion: scroll speed (FREE = per second, BEAT = per beat), spin, pulse, wave amount / length / speed.
+  - Colour: a gradient of 2-6 stops (click a stop = colour picker, drag = move, **+ STOP** / **− STOP**, RESET, swatches, presets) or FOLLOW THE SHOW PALETTE; Colour blend, hue shift, hue cycle speed, saturation, brightness.
+  - Blend onto the layers below: Add, Screen, Multiply, Difference, Mask below, Replace, Over; Opacity.
+- A scene saved now stores the stack and morphs it on recall.
+- Safety: very wide bands cannot scroll faster than 2.5 per second, pulses never beat faster than 2.5 Hz, and brightness changes are slewed. The panel says "speed limited" when this holds a layer back.
+
+### 3.3 PERFORM (one screen)
+Fits a 1920 x 1080 screen without scrolling. On a phone or tablet it stacks.
+- **Scenes**: the 16 pads with thumbnails. RECALL / SAVE TO…; morph (CUT, 1-16 bars), quantize (OFF, BEAT, BAR, PHRASE), autopilot period (4-128 bars) and order (RANDOM, NEXT). **A / B FADER** opens the scene crossfader. A compact **timeline strip** (play, stop, rec, position, RE-ENABLE, TIMELINE >) sits in the header.
+- **Macros**: Zoom, Speed, Spin, Travel into, Symmetry, Light chase, Trails; travel mode tiles; palette swatches; a ripple pad. **MORE CONTROLS…** opens a drawer with rotate, swim, hue, saturation, folds, density, twirl, bulge, wave, ripple, chase width / rate / mode and serpent mode.
+- **Live layers**: one row (EYE + fader) per layer that is showing; tap a name to open its tab. **+ N OFF** lists the others (tap one to bring it in). **+ ADD** opens BUILD.
+- **Quick boxes** (HIDE / SHOW): Sources thumbnails with use modes and UPLOAD…, a text box (SHOW, TEXT ON), an AI image box (DREAM, FROM FRAME), and the assistant box.
+- Esc closes a drawer; holding Esc still reaches PANIC.
+
+### 3.4 LAYERS
+- **Layers card**: one row per layer with EYE (on the projector, settings kept), SOLO (the panel's monitor only, needs PREVIEW on), a live thumbnail (PREVIEW on, LAYERS tab only) and an opacity fader. **SOLO OFF** and **SHOW ALL HIDDEN** reset them. The card's monitor says LIVE OUTPUT or PREVIEW ONLY.
+- **Video loops**: video layer and luma key.
+- Image cycling: **Cycle images** (Hold by default, or Cycle) and **Image hold (s)** (default 60 s) for AI textures.
+- All layer faders. See [5](#5-layers-reference).
+
+### 3.5 MOTION
+Beings (first card), travel and serpents, the **Spin** card (roll the tunnel / fly-through), and the **SKINS** card for the travel tunnel.
+
+### 3.6 SHAPE
+Zoom, pan (an XY drag pad), rotate speed, symmetry, folds, speed, crawl / flow and crawl angle; swim, twirl, bulge / pinch, wave, density; ripple strength and decay with a **ripple pad** (tap or drag).
+
+### 3.7 COLOR
+Palette (fractional values blend two palettes), hue shift, saturation, light chase (amount, width, rate, mode: single, dual, counter) and trails. **Colour narrative**: palette glide (OFF, 1-32 bars), so every palette change slews that long.
+
+Palettes: Aya Jewel, Cosmic Gold/Violet, Gorge Twilight, Emerald Jungle, Spectral.
+
+### 3.8 FRACTAL
+Fractal mode (KIFS, Mandelbox, hyperbolic, Apollonian, Julia, 4D polytope), morph, detail, glow, iridescence, render scale. Raise **Math fractals** (`l_fractal`) to see it.
+
+### 3.9 ART
+- **Art library**: drop images (PNG / JPEG / WebP, up to 25 MB each) or click to choose. A depth map is made by the AI worker. ◀ PREV / NEXT ▶ step through pieces.
+- **Sources**: uploaded art and AI images; click = use it now. If the art layer was at 0 it fades in (a red line says "THE ART LAYER IS OFF" while it is). Each thumbnail has a small **DREAM** button (see [12.2](#122-dreamify)).
+- **Art use** (big buttons): Fly-through relief, Inside the lines (stencil), Kaleidoscope, Tunnel walls, Displace pattern, Full frame melt. **Image source**: uploaded art or the AI texture on show.
+- **Fly pad**: drag to fly yaw / pitch; HOLD POSITION. Faders: relief depth, yaw, pitch, roll, fly in / out, camera drift, melt, liquify, depth slices, breathe, kaleido fold, Droste, slit-scan smear, edge glow. Melt, liquify, slices and smear share a budget, so stacking several scales them down together.
+
+### 3.10 SCENES
+- **Scenes**: 16 slots. Mode buttons: RECALL, SAVE TO…, CLEAR…, SET SAFE… (the scene PANIC jumps to, marked SAFE; slot 1 by default), DECK A…, DECK B…. Click = recall at the next quantize boundary with a morph; Shift-click or long-press = save; Alt-click = recall now. Slots 1-8 start as factory looks (Home, Breathe, Tunnel, Crawl, Jewel pulse, Vortex, Serpent liquid, Peak).
+- **Transition**: morph length and quantize.
+- **Autopilot**: Scene change ON / OFF, every 4-128 bars, order, hold palette family (0-16 phrases), drift (a slow random walk) with amount and a chip list of drifting params.
+- **Scene crossfader**: pick DECK A and DECK B, then drag to blend two scenes by hand (continuous faders blend, stepped ones flip at the middle).
+
+### 3.11 AI DREAM
+Prompt (Enter = generate, Shift+Enter = new line), negative prompt, count (1, 2, 4, 8), seed, SHOW WHEN READY, **GENERATE**, CANCEL QUEUE, **DREAM FROM CURRENT FRAME** with a strength fader (low = stay close to the frame), prompt presets, Results, Prompt history. With ONLINE on, an **Image engine** selector and the Gemini key row appear above the prompt. See [12](#12-ai-local-and-online).
+
+### 3.12 CONTROLLERS
+- **Devices + clock**: MIDI input ports, last message, clock source, MIDI clock port, **cue channel** (OFF or 1-16) and its CC table.
+- **Bindings**: the MIDI map; RESTORE DEFAULT MAP, CLEAR ALL BINDINGS (tap twice), ✕ per binding.
+- **Gamepad**: assign sticks, triggers and buttons (saved in that browser).
+- **Record**: see [10](#10-recording).
+- **Health (resource governor)** and **Power**: see [13.4](#134-resource-governor) and [13.5](#135-power-balance).
+- **Flash guard**: see [13.2](#132-flash-guard).
+
+### 3.13 MAPPING
+Surfaces list, the projector canvas, the selected surface's controls, and the **AUTO MAP** card. See [8](#8-mapping).
+
+### 3.14 3D DECKS
+- **Deck mixer**: Deck A, Deck B (Sacred corridor, Torus wormhole, Prismatic vortex, Hex domes), A / B crossfade, A / B blend (eight modes), A warps B, twist, curvature, geo morph, field of view, camera, torus glass, fold invert, prism split, render scale. **WARP JUMP + SHOCKWAVE** fires a punch.
+- **Particle swarm**: vortex, turbulence, ribbon trails, gold tint.
+- **SKINS** card for the four worlds (see [5.4](#54-skins)).
+- Raise **3D landscapes** (`l_land`) and **Particle swarm** (`l_swarm`) to see them.
+
+### 3.15 MOD BUS
+- **Audio in**: a live scope of bass, mid and high.
+- **Step sequencer**: 16 steps feeding the mod sources SEQ (step value) and GATE (pulse on gated steps); RANDOMIZE.
+- **Active modulation**: every modulated fader in one list.
+- **Mod sources**: the crowd camera sources, live.
+
+### 3.16 ASSISTANT
+The online assistant (OFF unless ONLINE is on). See [12.3](#123-online-assistant-and-gemini-images).
+
+### 3.17 TIMELINE
+See [11.3](#113-timeline).
+
+### 3.18 KENÉ STUDY
+The two generative study layers (off by default) with their credit card and **NEW DESIGN**. See [5.5](#55-kené-and-bead-studies).
+
+### 3.19 TEXT
+- **Text**: the words on show, SHOW, TEXT ON.
+- **Words** and **Phrases (lyrics / mantras)**: a phrase list with ◀ PREV, NEXT ▶ and AUTO-CYCLE (every beat or bar).
+- **Font**: any font installed in Windows, the per-user font folder or `fonts\`.
+- Faders: size, position, letter and line spacing, tilt, colour mode (Show palette, Fixed colour, Rainbow letters, Light chase), hue, colour depth, fill, outline, glow, **Movement** (Static, Drift, Orbit ring, Marquee, Letter wave, Tunnel spiral, Beat bounce), movement speed and amount, audio pulse, **Integration** (Overlay, Woven, Stencil mask, Knockout, Displace, Rides the scene, Kaleidoscope, Echo trails), weave, dissolve.
+
+### 3.20 FILTERS
+- The chain: up to 6 filters, top runs first. ▲ / ▼ reorder, ✕ takes one out (its settings stay). **+ ADD FILTER**: Deep dream, Oil paint, Halftone, Neon edges, Prism split, Posterize, Pixel sort, Glitch, Bloom, Mirror / kaleido. **RESET CHAIN** (tap twice).
+- A filter whose amount is 0 does not run ("AMOUNT 0: NOT RUNNING"). Filters not in the chain are in "All filter params" at the bottom.
+- With no filter running the pass is skipped entirely: zero cost.
+- Glitch never fires more than 2.5 times a second and every glitch ramps in and out.
+
+### 3.21 CAMERA
+See [9](#9-crowd-camera).
+
+---
+
+## 4. Keyboard
+
+### 4.1 Panel keys (press `?` for the sheet)
+| Key | Does |
+|---|---|
+| Space | Tap tempo |
+| Enter | Downbeat (resync the phrase) |
+| `-` / `=` | BPM −1 / +1 |
+| `A` | Autopilot on / off |
+| `1`…`0` | Recall scene 1-10 (Ctrl = 11-16); Shift = save |
+| `B` (hold) | Blackout |
+| Esc (hold 0.5 s) | PANIC. A tap closes the drawer, editor or sheet that is open. |
+| `F` `S` `I` `Z` `P` (hold) | Flash, Strobe, Invert, Freeze, Punch |
+| `R` | Ripple from the centre |
+| F1…F10 | Tabs (the number is printed on each tab; BUILD has none) |
+| `L` | MIDI learn mode |
+| `N` / `V` / `[` `]` | Next texture / next video clip / previous, next art piece |
+| Ctrl+S | Save the show |
+| `?` | Keyboard sheet |
+
+In learn mode, right-click a control to forget its bindings.
+
+### 4.2 Projector-window keys
+Click the projector window first. The panel is usually easier.
+| Area | Keys |
+|---|---|
+| Looks | `M` layer preset · `P` next palette (4 s glide) · `1`-`9` fold count · TAB flat field / mandala · `T` twirl · `F` echo on / off · Up / Down trails · Space next AI texture · `V` next video clip |
+| Space | `-` / `=` zoom · `[` / `]` density · Left / Right crawl speed · `A` / `D` crawl angle · `O` / `L` bulge / pinch · `U` wave · `N` travel mode · `H` / `Y` travel slower / faster · `E` serpents on / off |
+| Hold | `X` flash · `Z` strobe · `I` invert · `Q` freeze · `K` blackout · `J` zoom punch |
+| Tempo | `,` or `.` tap |
+| Mouse | click = ripple at that point (when not calibrating) |
+| Mapping | Ctrl+C calibrate (drag the nearest corner of any surface) · `S` save mapping · Ctrl+G outlines + grid + names · while calibrating: Ctrl+Z undo, Ctrl+R reset the selected surface to full frame |
+| Recording | Ctrl+R start / stop (when **not** calibrating) |
+| Guarded | Ctrl+Backspace reset space, shape and motion to defaults · Ctrl+W panel server on / off |
+| Quit | Shift+Esc, or Esc twice within 1 s |
+
+Note the trigger keys differ between the panel (`F S I Z P`, `B`) and the projector window (`X Z I Q J`, `K`).
+
+---
+
+## 5. Layers reference
+
+Every layer has an opacity fader on LAYERS (and in PERFORM's live layers when it is up) and a power switch (EYE). A layer at 0 costs nothing: its pass is not rendered.
+
+### 5.1 Engine layers
+| Layer (fader) | Default | Main controls | Tab |
+|---|---|---|---|
+| Folding Blocks (`l_kene`) | on | symmetry, folds, density, flow, crawl angle | SHAPE |
+| Beadwork (`l_beads`) | on | folds, density | SHAPE |
+| Sacred lines (`l_lines`) | on | folds, density | SHAPE |
+| AI textures (`l_ai`) | on | Cycle images, Image hold, AI DREAM | LAYERS, AI DREAM |
+| Echo (`l_echo`) | on | trails, Echo fader | COLOR, LAYERS |
+| Video loops (`l_video`) | off | luma key, `V` next clip; loops go in `videos\` | LAYERS |
+| Math fractals (`l_fractal`) | off | fractal mode, morph, detail, glow, iridescence, render scale | FRACTAL |
+| Art pieces (`l_art`) | off | art use, image source, fly pad, distortions | ART |
+| 3D landscapes (`l_land`) | off | deck A / B, crossfade, blend, camera | 3D DECKS |
+| Particle swarm (`l_swarm`) | off | vortex, turbulence, trails, tint | 3D DECKS |
+| Beings (`l_beings`) | off | being, how many, size, speed, wiggle, glow, ornament, variety, colour mode | MOTION |
+| Serpents (`serpent`) | off | serpent mode (serpents, warp, both), count, segments, slither speed, wiggle, size, colours | MOTION |
+| Text (`l_text`) | off | see [3.19](#319-text) | TEXT |
+| Math stack (`l_stack`) | on (the stack is empty by default) | the BUILD tab | BUILD |
+| Crowd camera (`l_camera`) | off | see [9](#9-crowd-camera) | CAMERA |
+| Kené study (`l_kene_shipibo`), Bead study (`l_kene_hunikuin`) | off | see [5.5](#55-kené-and-bead-studies) | KENÉ STUDY |
+
+**Topology**: Symmetry 0 is a flat field tiling the whole frame and crawling along Crawl / flow; 1 is an N-fold mandala; in between cross-fades.
+
+**Travel modes** (Travel mode, then push Travel into): 0 Zoom tunnel, 1 Tube (mandala) or ground and sky planes (flat), 2 Depth layers, 3 Droste spiral. Tunnel bend and Depth fade shape it; **Spin** barrel-rolls and **Spin twist** makes the far end lead.
+
+### 5.2 Beings
+17 forms (`being`): Anaconda spirit, Feathered dragon, Jaguar spirit, Hummingbird, Butterflies & moths, Jellyfish, Manta rays, Koi, Firebird, All-seeing eyes, Light beings, Jester sprites, Octopus, Spirit vine, Fireflies, Whale, Kittens. **Variety** 0 = all the chosen form, 1 = every being a different form. **Colour mode** (beings and serpents separately): Show palette, Single hue, Two-tone, Rainbow, Each its own hue, Light chase. Bass pulses them, highs sparkle. All are generated archetypes, not copies of any artwork.
+
+### 5.3 3D decks
+Four raymarched worlds (Sacred corridor, Torus wormhole, Prismatic vortex, Hex domes) on an A / B deck. Blend modes and "A warps B" combine them. Their colours come from the show palette, and folds, hue, travel, punch and the fly camera act on them.
+
+### 5.4 Skins
+Put any library image (uploaded art, an AI texture, a dreamified picture) on the surfaces of a world. ![Skins](docs/img/skins_sheet.png)
+1. **Skins are OFF by default.** Press **SKINS: OFF** in a SKINS card to switch them on (remembered across restarts). While off nothing is loaded and nothing costs anything.
+2. **Slots**: 3D DECKS > SKINS: Sacred corridor (walls, floor), Torus wormhole (tube, chambers), Prismatic vortex (walls), Hex domes (domes). MOTION > SKINS: the travel tunnel (walls). A skin belongs to the world, whichever deck shows it.
+3. **Assign**: drag a thumbnail from any Sources picker (or the card's strip) onto a slot. On a touch screen: tap the slot, then an image. **PROCEDURAL** goes back to the built-in look (settings kept).
+4. **Shape it**: Mapping (Surface, Triplanar, Screen; the tunnel has Follow the travel mode, Log-polar, Tube, Screen), Mix (Replace, Multiply, Screen, Overlay, Lines reveal the skin), Tiling (Mirror = seamless with any picture, Repeat = for AI textures that already tile), Amount, Scale, Rotation, Scroll speed and direction (Free or On the beat), Follow the show palette, Brightness, Tint.
+5. **GENERATE A SKIN**: type a prompt; the local AI worker makes a seamless tile when it has nothing else to do and it lands on the selected slot.
+6. Every skin fader has MOD and is MIDI-learnable. Skins are saved with scenes, look presets and shows. PANIC puts every slot back to procedural.
+
+Cost: a world with no skin costs exactly what it did before; a skin is one texture fetch per pixel, Triplanar three. Memory: up to 8 skins (512 px, about 11 MB; `--skin-size 1024` about 43 MB). Under strain the governor drops to 512 px, and at its last step skins fade to procedural until it recovers. Images are squashed to a square, so a photo of a face looks stretched; patterns are fine.
+
+<!-- TODO(skins): Beings bodies and the Folding Blocks fill are not skinnable yet. Document here when the skins fixes land. -->
+
+### 5.5 Kené and bead studies
+Two generative study layers of the visual grammar documented in [research/kene_reference/README.md](research/kene_reference/README.md). They copy no artwork and must never be called authentic kené. Raise them on LAYERS, or via BUILD > + ADD LAYER.
+- **Kené study (Shipibo-Konibo inspired)**: Medium (Light on black, Mud-dyed cloth, Embroidery, Ceramic, Beadwork), Colours, **Field** (Single panel, Panels, Band, Medallion, Follow the show), Design 1-32 and **NEW DESIGN**, line density, straight / curving, line weight, fine fill, Drawn, **Pen** (draw the design in over 4-32 bars, optionally a new design each time), flowing light, breathing, glow, follow light chase.
+- **Bead study (Huni Kuin inspired)**: bead motif (study), bead medium (Glass beads, Woven, Painted), bead colours, motif morph, bead count, beads light in sequence, bead glow.
+- For a box face or a strip, use Field = Single panel or Band: they stay still and fill the surface cleanly.
+- Credit for public shows: "Generative study inspired by Shipibo-Konibo kené / Huni Kuin kenê kuin. For public shows, credit and collaborate with the originating communities. See research/kene_reference."
+
+---
+
+## 6. Modulation, clock, scenes, autopilot
+
+### 6.1 The MOD matrix
+Every fader has two modulation slots. Final value = fader + amount × range × source.
+- **Sources**: bass, mid, high; LFO sine, triangle, saw, square; random (sample and hold); seq and seq_gate (the step sequencer); crowd_motion, crowd_left / centre / right, crowd_presence, hand_height, hands_spread, hip_sway, hand_speed (crowd camera; 0 while it is off).
+- **Rate** (LFOs, random): beats per cycle, 1/4 to 32. **Phase** offsets it.
+- BUILD layer fields and skin fields have MOD buttons too.
+
+### 6.2 Clock
+- **INT / TAP**: internal clock with tap tempo.
+- **MIDI CLOCK**: 24 ppqn with start, stop, continue and song position. Pick the port under "MIDI clock from" (AUTO = whichever sends).
+- **ABLETON LINK**: needs the optional `aalink` package.
+- **AUTO**: follows MIDI clock while it is present, else internal.
+
+### 6.3 Scenes
+A scene stores every fader and its mods, the BUILD stack, skins, and a thumbnail. It does not store bypass switches. Recall waits for the quantize boundary and morphs over the chosen bars. Saved in `scenes.json`.
+
+### 6.4 Autopilot
+Steps through saved scenes every 4-128 bars, in random or next order, can hold a palette family, and can drift chosen params slowly. It runs locally and calls no AI.
+
+---
+
+## 7. Controllers: MIDI, cue channel, gamepad
+
+### 7.1 MIDI learn
+All MIDI input ports are opened and re-scanned every 3 s (hot-plug, loopMIDI virtual ports included). Press **MIDI LEARN** (or `L`), click a control, then move a knob or hit a pad. Right-click a control in learn mode to forget it. Bindings live in `midi_map.json`. Learnable: faders, triggers, scene pads, TAP, DOWNBEAT, AUTOPILOT, PANIC, REC, power buttons, the scene crossfader (soft takeover), BUILD layer fields and skin fields.
+
+### 7.2 Akai APC mini mk2 (default map)
+| Control | MIDI | Does |
+|---|---|---|
+| Faders 1-8 | CC 48-55 | zoom, rotate, symmetry, speed, swim, hue, chase, trails |
+| Fader 9 | CC 56 | master |
+| Pad rows 8 and 7 (top) | notes 56-63, 48-55 | scenes 1-8, 9-16 (Shift + pad = save) |
+| Pad rows 2-6 | notes 8-47 | 8 × 5 ripple pad |
+| Pad row 1 (bottom) | notes 0-7 | flash, punch, strobe, invert, freeze, blackout, tap, autopilot |
+| Track buttons | notes 100-107 | palettes 1-5, downbeat, next video clip, PANIC |
+| Scene launch buttons | notes 112-119 | morph 0 / 1 / 2 / 4 / 8 bars, quantize beat / bar / phrase |
+| Shift | note 122 | hold for scene save |
+
+Pad LEDs (best effort): blue = saved scene, green = live, yellow = queued. The numbers come from the published mk2 protocol and have not been checked on hardware yet.
+
+### 7.3 Novation Launch Control XL (factory template)
+| Row | MIDI | Does |
+|---|---|---|
+| Faders | CC 77-84 | master, Folding Blocks, Beadwork, Sacred lines, AI, Echo, Video, trails |
+| Send A knobs | CC 13-20 | zoom, pan X, pan Y, rotate, symmetry, folds, speed, flow |
+| Send B knobs | CC 29-36 | swim, ripple, twirl, bulge, wave, density, crawl angle, ripple decay |
+| Pan knobs | CC 49-54 | palette, hue, saturation, chase, luma key, BPM |
+| Track focus | notes 41-44, 57-60 | scenes 1-8 |
+| Track control | notes 73-76, 89-92 | flash, punch, strobe, invert, freeze, blackout, tap, autopilot |
+
+### 7.4 Cue channel (Ableton and other sequencers)
+Set it in CONTROLLERS (OFF or channel 1-16) and send a pre-arranged track through loopMIDI.
+- Notes 0-15 (or 36-51, a drum rack from C1) recall scenes 1-16, quantized and morphed per the panel settings.
+- Notes 60-65 held: flash, strobe, invert, freeze, blackout, punch. Note 127: PANIC.
+- CC = param, full range 0-127. The CC table is printed in CONTROLLERS ("Cue channel CC table"): 1 master, 2 zoom, 3 pan X, 4 pan Y, 5 rotate, 6 symmetry, 7 folds, 8 speed, 9 flow, 10 crawl angle, 11 swim, 12 ripple, 13 ripple decay, 14 twirl, 15 bulge, 16 wave, 17 density, 18 palette, 19 hue, 20 saturation, 21 chase, 22 trails, 23 Folding Blocks, 24 beads, 25 lines, 26 AI, 27 echo, 28 video, 29 luma key, 30 chase width, 31 chase rate, 32 chase mode, 33 travel, 34 travel mode, 35 tunnel bend, 36 depth fade, 37 serpents, 38 serpent mode, 39 serpent count, 40 segments, 41 slither speed, 42 wiggle, 43 serpent size, 44 fractal layer, 45 art layer, 46 fractal mode, 47 fractal morph, 48 detail, 49 glow, 50 iridescence, 51 fractal render scale, 52 art piece, 53 relief, 54 yaw, 55 pitch, 56 roll, 57 dolly, 58 camera drift, 59 melt, 60 liquify, 61 slices, 62 breathe, 63 fold, 64 Droste, 65 smear, 66 edge glow. Newer params have no cue CC yet.
+- To let Ableton drive the beat too, send MIDI clock to the same port and set the clock to MIDI or AUTO.
+
+### 7.5 Gamepad
+An Xbox or PlayStation controller plugged into the device showing the panel. Default: left stick = fly yaw / pitch, right stick = roll / travel, triggers = dolly, bumpers = previous / next art piece, A / B / X / Y = flash / punch / ripple / strobe. Remap sticks, triggers and buttons in CONTROLLERS (saved in that browser). Deadzone 15 %, smoothed.
+
+### 7.6 OSC
+There is no OSC input yet.
+
+---
+
+## 8. Mapping
+
+### 8.1 Surfaces (MAPPING tab)
+Each surface is a corner-pinned (or masked) piece of the picture; everything outside the surfaces stays black. With one plain full-frame surface the output is identical to no mapping.
+- **Surfaces list**: + ADD, duplicate, delete (two taps), reorder, ON / OFF, select, rename.
+- **Canvas**: mirrors the projector. Drag corners (an ×8 magnifier shows the pixel grid). Snaps to other corners, the frame, centre lines and whole pixels (Alt = no snap, Shift = 1/8 speed). Drag inside a surface to move it.
+- **Readouts**: the angle at each corner (green at 90°), edge lengths, tilt, skew, aspect, keystone. Type x / y, an angle, an edge length or a tilt directly. **SQUARE IT UP** makes a true rectangle; **LEVEL** levels it.
+- **Nudge**: arrow keys or the nudge pad (Shift = 0.1 px).
+- **Per surface**: content (main picture, solid, glow, black), source (WHOLE FRAME, a rectangle, or **SPANNED**: one picture laid across every spanned surface, seamless on shared edges), opacity, brightness (dim the face that catches most light), **EDGE GLOW**, soft edge, colour.
+- **MASK** for a face that is not four-sided: **+ POINT** / − POINT and drag the points (3-8).
+- **Show on the projector**: OFF, SELECTED or ALL, plus **TEST GRID** (outline in the surface's colour, number, name, white dot on the top-left corner).
+- **UNDO** (Ctrl+Z, 20 steps, kept by the engine so it survives a reload), REDO (Ctrl+Y), SAVE. It also autosaves 1.5 s after the last edit to `surfaces.json`.
+
+Exercise: tape a rectangle on the wall, drag the 4 corners onto it while watching the wall. Then stack a box, + ADD a surface per visible face, turn on ALL + TEST GRID, drag each face's corners (they snap so faces share an edge), and try EDGE GLOW, SPANNED and WHOLE FRAME.
+
+### 8.2 AUTO MAP (camera-assisted)
+A webcam calibrates the projector and finds the faces for you. Results are ordinary surfaces you can edit and undo.
+1. Point a camera at the wall: a USB webcam on a fixed mount, or the **laptop's own webcam** with the lid turned to face the wall. Switch the CAMERA on.
+2. MAPPING > AUTO MAP card. Steps that put light on the wall need a **second tap**:
+   - **1 CHECK CAMERA**: does it see the whole projection? It detects a mirrored camera and measures signal and noise.
+   - **2 CALIBRATE**: black-and-white Gray-code and marker patterns for about 30 s (tick "dense" for a folded wall). Do it before people arrive.
+   - **3 DETECT SURFACES**: faces are outlined and listed. Click a face in the picture to add one, tick and name them, then **CREATE SURFACES**.
+   - **4 VERIFY & REFINE**: moves corners onto the real edges.
+   - UNDO (one step per create or verify), CANCEL, RESET.
+3. **BUILT-IN WEBCAM**: pick it in the card, run the panel from your phone, press **LIVE FRAMING** and follow the hints (tilt up / down, turn left / right, move back / closer) until it says good. Mirroring and the wide-angle lens are handled. If it cannot see the whole projection, calibrate **POSE 1**, turn the laptop to see the rest with some overlap, then **POSE 2**.
+4. **AI assist** (needs ONLINE and your Gemini key): type what to look for, then **AI: FIND SURFACES** or **AI: CHECK OUTLINES**. You see the exact picture that would be sent (people greyed out) and choose SEND or DISCARD. A picture with a person needs an extra tick.
+
+Calibration files hold numbers only, never pictures (`calibration\`). BLACKOUT, master down and PANIC take the pattern off the wall at once. A pattern is capped below full brightness.
+
+---
+
+## 9. Crowd camera
+
+Dancers become part of the picture. **Off by default**, and it never switches itself on, not even after a restart.
+1. CAMERA tab > **CAMERA OFF (click = ON)**. The top bar shows a red blinking **CAMERA ON** while the webcam is in use; click it to switch off and free the webcam.
+2. Raise **Crowd camera** (`l_camera`) and pick an **Integration**: Bodies reveal, Glow outline, Patterns inside, Knockout, Motion trails, Flow push. **Flow push** also works on top of any mode.
+3. **Align silhouettes to the wall**: use Glow outline, stand in front of the wall, and adjust Position, Scale, Keystone and Crop until the outline sits on you. MIRROR depends on where the camera points. **PREVIEW: ON** shows a small mask + skeleton view (never the camera image).
+4. Dancer effects: **Hand ripples**, **Beings follow hands** (negative = flee), **Hands pull swarm** (needs the swarm up), **Serpent on arm** (needs serpents up).
+5. Any fader can follow the crowd through its MOD editor (see [6.1](#61-the-mod-matrix)). The meters on the CAMERA tab show the sources live.
+
+Privacy: frames are analysed in memory by a separate low-priority process bound to the laptop only. They are never saved, sent or recorded; the recorder reads only the engine's own picture. The mask + skeleton preview reaches the panel over the local network while it is on.
+
+Performance: the camera's own frame rate falls in a dark room (about 10 fps measured at night). More light on the dancers gives smoother tracking. The governor lowers the camera's rate under strain. No crowd input can trigger a flash or strobe, and ripples are capped at 2 per second.
+
+---
+
+## 10. Recording
+
+Press **REC** in the top bar (or Ctrl+R in the projector window when not calibrating). The dot blinks, elapsed time and size count up; press again to stop. A few seconds later the MP4 is in `recordings\` (for example `show_20261125_213000.mp4`).
+
+**CONTROLLERS > Record**:
+- **Source**: PROGRAM = the clean picture (best for sharing); PROJECTOR = exactly what is on the wall, mapping included.
+- **Audio**: OFF, LAPTOP AUDIO (whatever the laptop plays) or MIC.
+- **30 / 60 fps**, **native or 1920 x 1080** (letterboxed), **quality** draft / standard / high.
+- **Replay buffer**: keeps the last 10-120 s; **SAVE LAST N s** writes them out after something great happened.
+- **OPEN FOLDER** opens `recordings\`; the list shows the latest files.
 - MIDI: in MIDI LEARN click REC, then hit a pad.
 
-It never slows the show down: if the laptop can't keep up, it drops a frame rather than stutter. It warns when the disk is under 2 GB free and stops (saving what it has) under 0.5 GB. Quitting with Shift+Esc or a crash still saves the file.
+It uses the GPU's video encoder when available (else a CPU encoder, which the card says). It never slows the show: if the laptop cannot keep up it drops a frame rather than stutter. It warns under 2 GB free disk and stops (keeping what it has) under about 0.5 GB. A crash or Shift+Esc still produces a playable file; an interrupted recording is finished at the next start.
 
-## 3. Grow the AI texture library
-```
-.\.venv\Scripts\python.exe ai_gen.py --n 16
-.\.venv\Scripts\python.exe ai_gen.py --prompt "your own vision here, glowing, black background" --n 6
-```
-Easier: use the panel's **AI DREAM** tab during the show. About 2.5 s per image, and the engine crossfades to it automatically.
-Prompt tips: "black background", "glowing", "jewel tones", "intricate", "symmetrical" project best.
+---
 
-## Online assistant + Nano Banana (optional, OFF by default)
-The show never needs the internet. If you want help from an AI while playing, press **ONLINE OFF** in the top bar so it
-reads **ONLINE ON** (amber). Press it again and nothing leaves the laptop.
+## 11. Shows, presets, timeline
 
-- **ASSISTANT tab** (and the small box on PERFORM): type what you want, e.g. "slower and deeper, emerald palette, bring
-  in a jaguar". Claude answers in about 4 s with a list of changes.
-  - **SUGGEST** (default): you see the list first; **APPLY** or **DISMISS**.
-  - **AUTOPILOT**: it applies them straight away. Either way every batch has an **UNDO** in the list on the right.
-  - It can move faders, pick palettes, scenes and images, switch layers, put words on the text layer and start AI images.
-    It can never flash, strobe, black out, PANIC or touch the mapping; PANIC also cancels whatever it was doing.
-- **AI DREAM > Image engine > NANO BANANA**: recognisable subjects (a Buddha, a woman, a jaguar) instead of textures.
-  Paste your own Gemini API key (https://aistudio.google.com) into the box under the selector and press SAVE KEY
-  (it is kept in your Windows user profile, not in the show folder).
-  Prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply. If it fails or you are
-  offline, the local engine makes the image instead. Add "on a pure black background" to prompts.
-- **Allow images through the agy CLI** (checkbox on ASSISTANT, off by default): images without an API key (about 30 s
-  each) through your `agy` login. It can only be ticked on the laptop itself (open the panel at address 127.0.0.1),
-  never from a phone. Read https://antigravity.google/terms first: they may not permit other programs driving the
-  CLI. Your call. Chat is Claude Code only.
-- Everything it does is written to `logs\online_<date>.log`.
+### 11.1 Shows (top bar SHOW)
+A show is the whole project: look, 16 scenes, timelines, settings (BPM, clock, morph, autopilot, camera and governor settings), recorder settings, MIDI map and mapping. It never stores ONLINE or "camera on".
+- **SAVE** (Ctrl+S), **SAVE AS** (name it; optionally collect media into the show, or save as a template).
+- Every save keeps the previous version in `backups\` (last 10). Unsaved changes autosave about 15 s after you stop editing; after a crash the list offers **RECOVER**.
+- **OPEN** loads the parts you tick (look, scenes, timeline, settings, recorder; MIDI and mapping are left alone unless ticked, so the venue rig stays). **NEW SHOW**: clean canvas, factory looks, or from what is on now. **NEW FROM IT** uses a saved show as a template.
+- **EXPORT** downloads one `.entheo` file (with collect media it carries art, textures and audio); **IMPORT .entheo** brings one in. **DELETE** (two taps) moves it to `shows\.trash\`.
 
-## 4. TouchDesigner (the deep, pro tool)
-1. Open TouchDesigner from the Start menu, then sign in and activate a free **Non-Commercial** key (1280x1280 cap, which fits the BenQ).
-2. Starter tutorials and step-by-step audio and mapping recipes: `research/td_audio_mapping.md`.
-3. To bring this app's visuals into TD: run `live_visuals.py --spout`, then in TD add a **Syphon Spout In TOP** and pick `PsyProjector`.
+### 11.2 Presets (top bar PRESETS)
+Smaller pieces: LOOK, LAYER, FX (the filter chain), MOD routing, MAPPING, MIDI map. Type a name, **SAVE PRESET** (a thumbnail is grabbed from the output). Click a card to recall it; tick groups first for a partial recall (only COLOR, say) and pick CUT or a morph length. Star = favourite, search finds names and tags, `...` = rename, tags, export (a small `.json`), **+ CUE** (put it on the timeline), delete. **IMPORT PRESET** loads a `.json`.
 
-## 5. Resolume Arena (VJ-style live mixing)
-Demo mode (watermark). See `research/resolume_spout_mapping.md`. Its built-in web remote (Preferences > Webserver) also works from your phone.
+<!-- TODO(themes+sound-tags): when themes and sound tags land, document them here (how a theme is applied, where tags are set, how they filter presets/scenes). -->
 
-## Suggested learning path
-- **Day 1:** sections 1-3. Get a feel for folds, palettes and trails while music plays, and map one taped rectangle.
-- **Day 2:** generate your own textures with your own prompts; tape 3-5 foam-core shapes or stack boxes and give each its own surface in MAPPING.
-- **Week 1:** TouchDesigner basics (Noise > Feedback > Kaleidoscope > Out), audioAnalysis, Kantan Mapper.
-- **Later:** train your own LoRA (`research/lora_dataset.md`), MIDI controller (`research/hardware_next.md`), Resolume sets.
+### 11.3 Timeline
+A playhead in bars (follows TAP, MIDI clock or Link) or seconds.
+- **Tracks**: Sections (markers), Cues (scene or preset recalls with a morph), automation lanes (any fader, + lane), triggers (flash, punch, freeze ... with a length), events (layer or tab on / off, next video, texture and art picks, text), text.
+- **Editing**: double-click a lane to add, drag to move, Shift-drag on the ruler for the loop range, Shift-click / Shift-drag to select, Del, Ctrl+C / V / D / Z / Y, arrows nudge, wheel / Ctrl+wheel / pinch to zoom. Snap, units, the timeline switcher (several per show) and an inspector for one item. **EDIT LOCK** (on by default on touch screens) stops accidental edits.
+- **Record**: arm REC and PLAY, then perform. Fader moves, scene recalls, triggers and layer switches are written in (OVERDUB or REPLACE; one undo step per pass; loop and punch ranges).
+- **Live override**: touching a fader the timeline drives hands it to you. TOUCH gives it back 1.5 s after you let go; LATCH keeps it until **RE-ENABLE**. **RELEASE** gives every fader back. FOLLOW keeps the playhead in view.
+- **Audio** (optional): **+ AUDIO** uploads a song (`shows\_media\`), pick it, then press **AUDIO HOST** on the one device that should play it. Use SECONDS units for a song with fixed timing.
+- **Safety**: PANIC stops the timeline. Flashes it plays are held to at most 2.5 per second and brightness lanes cannot swing faster than 0.2 s. Timeline events never switch the webcam, PANIC, ONLINE, mapping or recording.
 
+---
 
-## Start simple and build it up (BUILD tab)
-Start on a clean black canvas with one moving stripe layer:
-```
-powershell -ExecutionPolicy Bypass -File run_show.ps1 --monitor 1 --panel --fresh
-```
-or press **NEW CANVAS** on the **BUILD** tab at any time (it crossfades; **RESTORE PREVIOUS** brings your earlier look
-back exactly, nothing is lost).
+## 12. AI: local and online
 
-- **+ ADD LAYER**: pick a generator (stripes, rings, spiral, rays, checker, waves, polygons, noise bands). Up to 8.
-  Further down the same menu you can bring the engine's own layers back in gently (Folding Blocks, Beadwork, Beings,
-  fractals, art, 3D landscapes, text...).
-- Click a layer to shape it on the right. Every number can be dragged, typed, reset (the round arrow, or double-click
-  the fader), modulated (**MOD**: bass, LFOs, sequencer) and MIDI-learned.
-  - **Shape**: how many bands, band width, edge softness, waveform.
-  - **Space**: straight, polar, tunnel, kaleidoscope, mirrors, perspective floor; direction, zoom, centre.
-  - **Motion**: scroll speed (FREE = per second, BEAT = per beat), rotation, pulse, wave.
-  - **Colour**: click a stop on the gradient to change its colour, drag it to move it, **+ STOP** to add one (2 to 6);
-    or FOLLOW THE SHOW PALETTE. "Colour blend" 0 = each stripe takes the next colour, 1 = one smooth gradient.
-  - **Blend**: add, screen, multiply, difference, mask (the layers below show only where this one is lit), replace, over.
-- In the list: arrows reorder, EYE mutes, SOLO shows only that layer, DUP copies, the cross deletes (click twice).
-  **UNDO** steps back.
-- **SIMPLE / FULL** (top bar): SIMPLE keeps only BUILD, PERFORM and SCENES in view; FULL shows every tab.
-- Save what you built into a scene slot as usual (SCENES): the stack is stored with it and morphs on recall.
-- Safety: very wide bands cannot scroll faster than 2.5 per second and pulses never beat faster than that; the panel
-  says "speed limited" when that holds a layer back.
+### 12.1 Local AI (SD-Turbo)
+The AI worker runs as its own low-priority process (started by `run_show.ps1`) on `127.0.0.1:8766`.
+- **AI DREAM** tab: about 2.5 s per image on a 4 GB card during a show. The new image appears in Sources and, with SHOW WHEN READY, cross-fades in.
+- **DREAM FROM CURRENT FRAME** uses the projector picture as the starting point; Strength sets how far it may move.
+- Prompt tips: "black background", "glowing", "jewel tones", "intricate", "symmetrical" project best.
+- Uploaded art gets a depth map automatically (Depth Anything V2 Small).
+- Offline batch: `python ai_gen.py --n 16` or `python ai_gen.py --prompt "your vision, glowing, black background" --n 6` (flags: `--size`, `--seed`, `--steps`, `--base sd-turbo|sd15-lcm`, `--lora`, `--vae-fp32`, `--fp32`, `--out`).
+- **License**: commercial use of SD-Turbo (a paid show) needs a free registration with Stability AI. See the README.
 
+### 12.2 Dreamify
+A real DeepDream (GoogLeNet) on any image in the library. Every Sources thumbnail has a small **DREAM** button: pick a preset (Dog-slugs, Eyes, Architecture, Psychedelic swirl) and a strength, then **DREAM IT**. A progress badge with CANCEL shows from any tab; it takes roughly 30 s to 90 s. The result is a new image next to the original. It needs the AI worker; the first use downloads the 50 MB GoogLeNet weights once. If VRAM is short it runs smaller or on the CPU and may move SD-Turbo to system RAM for the duration.
 
-## Crowd camera (CAMERA tab)
-Dancers become part of the picture: their silhouettes, movement and arms drive the visuals. **Off by default**; it never
-switches itself on, not even after a restart.
-1. Open the **CAMERA** tab, press **CAMERA OFF (click = ON)**. The top bar shows a red blinking **CAMERA ON** while the
-   webcam is in use; one click there is CAMERA OFF and frees the webcam.
-2. Raise **Crowd camera** (`l_camera`, on the LAYERS tab and at the top of the CAMERA faders) and pick an **Integration**:
-   Bodies reveal (visuals only on the people), Glow outline, Patterns inside (bodies carry a hue-turned pattern),
-   Knockout (people black), Motion trails (silhouettes smear into the echo), Flow push (movement pushes the pattern).
-   **Flow push** also works on top of any mode.
-3. Align: Glow outline, stand in front of the wall, move Position / Scale / Keystone / Crop until the outline sits on you.
-   MIRROR / AS SEEN depends on where the camera points. **PREVIEW: ON** shows a small mask + skeleton view (no camera image).
-4. Dancer effects: **Hand ripples**, **Beings follow hands** (negative = they flee), **Hands pull swarm** (needs the
-   particle swarm up), **Serpent on arm** (needs serpents up; serpent 1 rides the most raised arm).
-5. Any fader can follow the crowd: open its **MOD** editor and pick `crowd_motion`, `crowd_left` / `centre` / `right`,
-   `crowd_presence`, `hand_height`, `hands_spread`, `hip_sway` or `hand_speed`. The meters on the CAMERA tab show them live.
+### 12.3 Online assistant and Gemini images
+The show never needs the internet. **ONLINE** in the top bar is OFF by default; while off, nothing is imported, started or sent.
+- **ASSISTANT** tab (and the box on PERFORM): describe what you want ("slower and deeper, emerald palette, bring in a jaguar"). It uses the **Claude Code CLI** installed on the laptop, with tools, file access and settings switched off.
+  - **SUGGEST** (default): you see a before → after list and choose APPLY or DISMISS. **AUTOPILOT**: applied at once. Every batch has **UNDO**.
+  - It can move faders, pick palettes, scenes and images, switch layers, set text and start AI images. It can never flash, strobe, invert, black out, PANIC, touch MIDI, mapping or recording, or leave the wall black. Anything it changes fades or morphs (no hard cuts), and its chase rates are capped at 2.5 Hz.
+  - It only calls the model when you press SEND (no background loop). Rate-limited to 6 requests a minute.
+- **Gemini images ("Nano Banana")**: AI DREAM > Image engine > **NANO BANANA** for recognisable subjects (a Buddha, a jaguar). Paste your own Gemini API key (from https://aistudio.google.com) and press **SAVE KEY**. If it fails or you are offline, the local engine makes the image instead. Add "on a pure black background" to prompts.
+- **Privacy**: assistant prompts include the show's parameter names, current values and file names, and go to Anthropic through your Claude Code login. Image prompts (and the frame, for dream-from-frame) and AUTO MAP AI pictures go to Google with your key; usage limits apply. The key is stored in your Windows user profile (`%APPDATA%\PsyProjector\online_keys.json`), never in the show folder, state or logs. It travels once from the panel to the laptop over the local network: on untrusted venue Wi-Fi, type it on the laptop itself.
+- Everything the online features do is logged to `logs\online_<date>.log` (never the key).
 
-Frames are analysed in memory by a separate low-priority process and are never saved, sent or recorded. A dark room lowers
-the webcam's own frame rate (about 10 fps measured at night): more light on the dancers = smoother tracking.
+---
 
+## 13. Safety
 
-## Filters + Dreamify (FILTERS tab, DREAM buttons)
-Post-effects on the finished picture, before mapping (every surface, Spout, the recording and the panel monitor get them).
-1. **FILTERS** tab -> **+ ADD FILTER** -> pick one: Deep dream, Oil paint, Halftone, Neon edges, Prism split, Posterize,
-   Pixel sort, Glitch, Bloom, Mirror / kaleido. It comes in with its amount up; drag the faders under its name.
-2. Up to 6 filters run top to bottom: **▲ / ▼** reorder, **✕** takes one out (its settings stay for next time).
-   **RESET CHAIN** (tap twice) empties the chain and puts every filter setting back to default.
-3. The power button on the FILTERS tab (and **ALL FX**) switches every filter off and back on to the same settings.
-   With no filter running the pass is skipped completely: no cost at all.
-4. Every filter fader works with **MIDI LEARN** and **MOD** like any other; scenes store and morph the chain.
-   Filters that are not in the chain: open "All filter params" at the bottom of the tab.
-5. Glitch never fires more than 2.5 times a second and every glitch fades in and out (photosensitive-safe).
+### 13.1 PANIC
+Hold **PANIC** for 0.5 s (or hold Esc, from any tab, even inside a text box or drawer). It jumps to the SAFE scene with no morph, clears every trigger, stops the timeline and its recording, empties the BUILD stack, puts skins back to procedural, cancels an AUTO MAP pattern, drops the assistant's queue (back to SUGGEST) and stops online images. It never gives you a black wall: it also leaves a NEW CANVAS. Set which scene is SAFE with SCENES > SET SAFE…. Single-layer and tab bypasses stay as you set them.
 
-**DREAMIFY** (real DeepDream, offline): on the ART, AI DREAM or PERFORM sources picker every image has a small **DREAM**
-button. Pick a preset (**Dog-slugs**, **Eyes**, **Architecture**, **Psychedelic swirl**), a strength, **DREAM IT**.
-A progress badge (bottom right, with CANCEL) shows while it runs, roughly half a minute to a minute and a half per image.
-The result is a NEW image next to the original (art pieces stay art pieces, AI textures stay AI textures) and appears
-in the picker by itself. Needs the AI worker (started by run_show.ps1). The first use downloads the 50 MB GoogLeNet
-weights once (internet needed that one time).
+### 13.2 Flash guard
+An always-on photosensitive limiter: at most 3 flashes per second over a quarter of the picture, and red flashes are held earlier. It applies to everything you can press (strobe at 1/8 or 1/16, flash, invert, hammering blackout, rapid cuts, glitch). Above the limit it holds the picture at its dark phase; the picture never stops and steady light is untouched.
+- **Top bar**: FLASH GUARD is green while it leaves the picture alone, amber HOLDING (with a count) while it steps in. Click it for the card in CONTROLLERS (flashes per second in and out; the white mark is the limit).
+- A **1/4 strobe** (one per beat) is fine up to about 180 BPM.
+- **Override for one show** ("the audience has been warned"): on the **laptop itself** (a phone cannot do it), CONTROLLERS > Flash guard > hold the button for 2 s, then **YES, AUDIENCE WARNED**. A red FLASH GUARD OFF badge stays on every tab; tap it to switch the guard back on. It is back on after every restart.
+- Limits: a mostly black look (like the default mandala) rarely engages it because little of the frame is bright. The first second of a burst can still show up to 3 flashes. Bright things that move fast fade in a little late while it holds. The stripe-pattern rule is not checked.
+- Check it without a projector: `python flashguard.py --demo` (before / after counts) and `--bench`.
 
+<!-- TODO(flashguard): flash-guard fixes are landing (review findings on output order incl. surfaces/calibration overlays). Update this section with any changed behaviour. -->
 
-## AUTO MAP (MAPPING tab): let the camera find the boxes
-1. Point a camera at the wall (turn the laptop lid toward it, or a USB webcam on a fixed mount) and switch the CAMERA on.
-2. MAPPING tab, AUTO MAP card: **1 CHECK CAMERA** (does it see the whole projection?), **2 CALIBRATE** (black-and-white
-   test patterns for about 30 s: do it before people arrive), **3 DETECT SURFACES** (faces are outlined and listed; click a
-   face in the picture to add one), tick / name them, **CREATE SURFACES**, then **4 VERIFY & REFINE** (moves the corners
-   onto the real edges). UNDO puts things back; afterwards edit corners by hand as usual.
+### 13.3 Photosensitive guidance
+Flashing light can trigger seizures in people with photosensitive epilepsy, and can be uncomfortable for many more. Keep the flash guard on unless you have a good reason. Put a visible notice at the entrance if your show uses strobe-like effects. Avoid saturated red flashing. Prefer fades of at least 0.35-0.5 s. Remember the guard limits the projector, not the room's own strobes and lasers.
 
-## Real kene layers (generative studies, off by default)
-The old "kene" layer is now called **Folding Blocks** and is unchanged. Two new layers are studies of the real visual
-grammar documented in `research/kene_reference/` (not copies, and not to be called authentic kené):
-- **BUILD > + ADD LAYER > "Kené study (Shipibo-Konibo inspired)"** or **"Bead study (Huni Kuin inspired)"**, or raise them on LAYERS.
-- Tab **KENÉ STUDY**: Medium (light on black, mud-dyed cloth, embroidery, ceramic, beadwork), Colours (first = follow the
-  show palette), Field (single panel, panels, band, medallion, follow the show's mandala / tunnel), Design 1-32 and
-  **NEW DESIGN**, Pen ("sing it in" over 4-32 bars, a new design each time), Flowing light, Breathing; for the beads:
-  motif, medium (glass beads / woven / painted), colours, motif morph, beads lighting in sequence.
-- For mapping a box face or a strip: Field = Single panel or Band (they stay still and fill the surface cleanly).
-- Credit: "Generative study inspired by Shipibo-Konibo kené / Huni Kuin kenê kuin. For public shows, credit and
-  collaborate with the originating communities — see research/kene_reference."
-- Stills: `test_frames/kene_real/contact_sheet.png` and `reference_pairs.png`.
-- **With the laptop's own webcam:** pick BUILT-IN WEBCAM in the AUTO MAP card, turn the laptop so the lid faces the wall
-  (it can sit next to the projector), run the panel from your phone, press LIVE FRAMING and follow the hints (tilt up /
-  down, turn left / right) until it says "good". Mirroring and the wide-angle lens are handled. If it cannot see all of
-  the projection: calibrate POSE 1, turn the laptop to see the rest (with some overlap), POSE 2, calibrate again.
-- **AI assist** (needs ONLINE and your Gemini key on AI DREAM): type what to look for, AI: FIND SURFACES or AI: CHECK
-  OUTLINES, look at the exact picture that would be sent (people greyed out), then SEND or DISCARD.
+### 13.4 Resource governor
+Keeps the show from bloating into a crash. It lowers costs step by step and puts them back; it never blacks out.
+- **Modes** (CONTROLLERS > Health): OFF (meter only), **SUGGEST** (default: a toast with Apply / Ignore 10 min / Always auto), AUTO (applies after a 5 s countdown, with Cancel).
+- **What it lowers, in order**: offscreen render scales (costliest first), fractal detail and being / serpent counts, new AI jobs held (first if the cause is memory), then render scales to their minimum. Passes cheaper than 1 ms are never touched. It never touches master, blackout, layer opacities or triggers.
+- **Strain** is judged against the display refresh (sustained fps under 90 % while the GPU is the bottleneck), GPU temperature and throttling, RAM and VRAM.
+- **You win**: moving a lowered fader yourself drops that reduction at once. RESTORE ALL gives everything back. Reductions never get saved into scenes.
+- **LOW-POWER PROFILE**: applies the battery savings by hand.
+- **Battery**: on battery the card shows "Running on battery: X %, ~N min". Under 20 % it suggests the low-power profile; under 10 % a red bar crosses the panel. Back on AC restores it.
 
-## Shows, presets and the timeline (save it all, play it back)
-- **SHOW** (top bar) = the whole project in one place: look, 16 scenes, timelines, settings (BPM, clock, morph, autopilot,
-  camera + governor settings), recorder settings, MIDI map and mapping. **Ctrl+S** saves; **SAVE AS** names it. Shows live in
-  `shows\<name>\show.json`, every save keeps the previous version in `backups\`, and unsaved changes autosave about 15 s
-  after you stop editing (the list then offers **RECOVER** after a crash). **OPEN** loads the parts you tick; the venue rig
-  (MIDI map, mapping) is left alone unless you tick it. **NEW SHOW**: clean canvas, factory looks, or "from what's on now";
-  **NEW FROM IT** uses any saved show as a template. **EXPORT** downloads one `.entheo` file (with "collect media" it carries
-  the art / textures / audio too); **IMPORT .entheo** brings one in. Files are pure data and are checked on the way in.
-- **PRESETS** (top bar) = smaller pieces: a LOOK, one LAYER, the EFFECTS chain, a MOD routing, a MAPPING, a MIDI map. Type a
-  name, SAVE PRESET (a thumbnail is grabbed from the output). Click a card to recall it; tick groups first for a partial recall
-  (only COLOR, say), pick CUT or a morph length. Star = favourite, search finds names and tags, `...` = rename, tags, export
-  (a small `.json` to share), **+ CUE** (put it on the timeline), delete. **IMPORT PRESET** loads someone's `.json`.
-- **TIMELINE tab**: a playhead in bars (follows TAP / MIDI clock / Link) or seconds. Tracks: Sections (markers), Cues (scene or
-  preset recalls with a morph), automation lanes (any fader), triggers (flash / punch / freeze ... with a length), events
-  (layer or tab on / off, next video, texture / art picks), text. Double-click a lane to add, drag to move, Shift-drag on the
-  ruler for the loop range. **REC** + PLAY records what you do live (fader moves, scene recalls, triggers, layer switches).
-  While it plays, touching a fader the timeline drives hands it to you (TOUCH: back after 1.5 s; LATCH: until
-  **RE-ENABLE AUTOMATION**); **RELEASE** gives every fader back. PANIC stops the timeline. Flashes it plays are held to
-  <= 2.5 per second and brightness lanes cannot swing faster than 0.2 s.
-- Optional **audio**: + AUDIO uploads a song (`shows\_media\`), pick it in the list, then press **AUDIO HOST** on the ONE device
-  that should play it (the laptop with the speakers). Use SECONDS units for a song with a fixed timing.
+### 13.5 Power balance
+CONTROLLERS > Health > **Power**. For multi-hour shows on a charger that cannot always keep up.
+- **Profiles**: **BALANCED** (default) keeps the battery at or above its level while plugged in. **BATTERY SAVER** starts at a 30 fps cap. **PERFORMANCE** never saves power.
+- **Show length (h)** with SET / CLEAR: on battery, it keeps the draw under what the remaining charge allows for the time left.
+- **What it does, one step at a time** (after about 90 s of sustained drain, giving steps back after about 5 min of surplus): cap the frame rate at 50, 45, then 30 fps; move the idle AI model off the GPU; lower offscreen render scales; run the camera at a reduced rate; suggest switching off the costliest layer.
+- **Standby**: with blackout held or master at 0 nothing is visible, so the engine renders at a trickle.
+- The card shows net battery power, GPU watts, the cap and the savings in force.
 
-## Flash guard (photosensitive limiter, always on)
-The engine will not put out more than 3 flashes a second over a quarter of the picture, whatever you press: strobe at
-1/8 or 1/16, flash, invert, blackout hammering, rapid cuts, glitch. Above the limit it holds the picture at its dark
-phase instead of letting it flash; the picture never stops. Red flashing is held earlier.
-- **Top bar:** FLASH GUARD is green while it leaves the picture alone, amber "HOLDING" with a count while it steps in.
-  Click it for the card in CONTROLLERS (flashes per second coming in and going out, the white mark is the limit).
-- **A 1/4 strobe is fine** up to 180 BPM (3 per second). Faster strobes are what gets held.
-- **Override for one show** ("the audience has been warned"): CONTROLLERS > Flash guard > hold the button for 2 s,
-  then press YES, AUDIENCE WARNED. A red FLASH GUARD OFF badge stays on screen; tap it to switch the guard back on.
-  It is back on by itself after every restart.
-- Check it without a projector: `.\.venv\Scripts\python.exe flashguard.py --demo` (before / after counts) and `--bench`.
+### 13.6 Brightness limiter
+The engine meters its own picture and keeps the average level under a ceiling (`--limit-mean`), smoothed over about 0.8 s so it cannot pump. Flash, strobe and invert are exempt (the flash guard covers those).
 
-## Skins: put your own images on the worlds (3D DECKS and MOTION tabs)
-Any image in the library (uploaded art, an AI texture, a dreamified picture) can become the surface of a world.
-1. **3D DECKS tab > SKINS card.** Each world has slots: Sacred corridor (walls, floor), Torus wormhole (tube, chambers),
-   Prismatic vortex (walls), Hex domes (domes). **MOTION tab > SKINS card** has the travel tunnel (walls).
-2. **Assign:** drag a thumbnail from any Sources picker (or the strip in the card) onto a slot. On a touch screen: tap the
-   slot, then tap an image. PROCEDURAL on a slot goes back to the built-in look (its settings are kept).
-3. **Shape it** (tap a slot first): Mapping (Surface / Triplanar / Screen; the tunnel has Follow the travel mode / Log-polar /
-   Tube / Screen), Mix with the pattern (Replace, Multiply, Screen, Overlay, Lines reveal the skin), Tiling (Mirror =
-   seamless with any picture, Repeat = for AI textures, which already tile), Amount, Scale, Rotation, Scroll speed +
-   direction (Free or On the beat), Follow the show palette, Brightness, Tint.
-4. **GENERATE A SKIN:** type what you want ("molten gold filigree"), press the button. The local AI worker makes a seamless
-   tile when it has nothing else to do and the picture lands on the selected slot by itself.
-5. Every fader has a MOD button and is MIDI-learnable (`skin:<world>:<slot>:<field>`). Skins are saved with scenes, look
-   presets and show files. PANIC puts every slot back to procedural.
-- **Cost:** a world with no skin costs exactly what it did before. A skin is one texture fetch per pixel. Triplanar is
-  three fetches: use it when Surface stretches too much, not by default.
-- **Memory:** 8 skins are kept on the GPU (512 px by default, about 11 MB; `--skin-size 1024` for 43 MB). Under load the
-  governor switches skins off (critical) until the show recovers; the card says so.
-- Look-check without the projector: `.\.venv\Scripts\python.exe materials.py --gallery` -> `test_frames/skins/contact_sheet.png`.
+---
+
+## 14. Troubleshooting
+
+| Problem | Try this |
+|---|---|
+| **No projector detected** (the engine says it is waiting) | Win+P > Extend. Check the projector's input source. Try another `--monitor` index (0 is usually the laptop screen). Reseat HDMI; active cables help over long runs. |
+| **Picture on the laptop screen instead** | Use `--monitor 1` (or the right index). Without `--monitor` you get a preview window. |
+| **Black screen on the projector** | Master up? BLACKOUT not held? Check the tab power buttons and ALL FX, and SHOW ALL HIDDEN on LAYERS. Are you on a NEW CANVAS (press RESTORE PREVIOUS)? Is everything outside a surface (MAPPING: show ALL + TEST GRID)? Hold PANIC to get the safe look. |
+| **Nothing reacts to the music** | Watch the three top-bar meters. Default is the laptop's output (loopback): play the audio through the laptop. For a room mic use `--audio mic`. If the projector's HDMI audio is the default output, switch Windows' output device back or check that loopback follows it. |
+| **Panel will not open on the phone** | Same Wi-Fi? Firewall: allow `python.exe` on Private networks and set the network profile to Private. Venue Wi-Fi isolating clients: use a phone hotspot. Re-open the exact URL with `?k=` (the console prints it). |
+| **Stutter, fan roaring, heat** | Check the Health card. Set the Windows and NVIDIA settings in [1.2](#12-windows-settings-for-shows-power-and-heat). Lower heavy layers (fractals, 3D decks, 8 beings, filters) or their render scales. Switch PREVIEW off. Put the governor on SUGGEST or AUTO. Raise the laptop for airflow. |
+| **Battery falls while plugged in** | Stock charger, plugged in directly. Power profile BALANCED or BATTERY SAVER. Set a show length. Stop other heavy programs. |
+| **Camera does not start** | The CAMERA tab gives the reason. Install `opencv-contrib-python` (not `opencv-python` as well) and `mediapipe`. Close other apps using the webcam. An IR camera is refused. A dark room lowers the frame rate: add light. |
+| **AUTO MAP: "does not see the projection" / too few markers** | Turn the lid (or the USB camera) to the wall, use LIVE FRAMING, make the room dark, or calibrate in two poses. |
+| **AI images fail or "out of memory"** | 4 GB is tight while the show runs. Lower heavy layers first; the power balance and governor can hold AI jobs. Restart the show (the AI worker restarts with it). Run without AI: `$env:NO_AI='1'`. Black images on GTX 16xx cards: `ai_gen.py --vae-fp32`. |
+| **Dreamify slow** | Normal when VRAM is short: it falls back to a smaller size or the CPU. |
+| **Recording has no sound** | Set Audio to LAPTOP AUDIO or MIC in CONTROLLERS > Record. |
+| **"CAN'T SAVE" on MAPPING** | `surfaces.json` is locked (cloud sync, antivirus). It retries; free the file. |
+| **Show crashed** | The watchdog restarts it within a second. After a hard crash open SHOW and press RECOVER. Logs are in `logs\`. |
+| **Panel says the AI worker is not available** | It was skipped (`NO_AI`) or failed: see `logs\ai_*.log`. The rest of the show is unaffected. |
+
+---
+
+## 15. File locations
+
+All paths are relative to the project folder unless noted.
+
+| What | Where |
+|---|---|
+| Live state (faders, mods, settings; autosaved every 5 s, restored on start) | `live_state.json` |
+| Scenes | `scenes.json` |
+| MIDI bindings | `midi_map.json` |
+| Mapping | `surfaces.json` (and `mapping.json`, the older single corner pin it follows) |
+| AUTO MAP calibration (numbers only) | `calibration\` |
+| Shows | `shows\<name>\show.json`, `backups\`, `thumbs\`, `media\`; untitled autosave in `shows\_current\`; timeline audio in `shows\_media\`; deleted shows in `shows\.trash\` |
+| Presets | `presets\<kind>\<name>.json` (+ `.jpg` thumbnail) |
+| Recordings | `recordings\` (settings in `recordings\.settings.json`; in-progress parts in `recordings\.parts\`) |
+| Uploaded art | `art\` (thumbnails in `art\.thumbs\`) |
+| AI and seed textures | `textures\` (AI images are `gen_*.png`) |
+| Video loops | `videos\` |
+| Extra fonts | `fonts\` |
+| Snapshot of the output | `snapshots\current.png` |
+| Logs | `logs\` (`show_*.log`, `ai_*.log`, `online_<date>.log`) |
+| Panel token | `.remote_token` |
+| Gemini API key | `%APPDATA%\PsyProjector\online_keys.json` (outside the project) |
+| Camera models | `models\camera\` |
+| Test renders | `test_frames\` |
+
+A corrupt `scenes.json`, `midi_map.json`, `surfaces.json` or show file is moved aside as `<name>.<time>.bad` and the defaults come back; a file that merely cannot be read (locked) is left alone and saving pauses until it reads again.
+
+---
+
+## 16. Other tools
+
+- **Spout**: run with `--spout`, then in TouchDesigner add a **Syphon Spout In TOP** (or in Resolume a Spout source) and pick `PsyProjector`. Recipes: [research/td_audio_mapping.md](research/td_audio_mapping.md), [research/resolume_spout_mapping.md](research/resolume_spout_mapping.md).
+- **Look-checks without a projector**: `python beings.py --gallery`, `python stack.py --gallery`, `python filters.py --gallery`, `python materials.py --gallery`, `python kene_real.py --gallery`, `python fx_stack.py --gallery`, `python text_layer.py --gallery`. Most also take `--bench`.
+- **Impact audit**: `python impact_audit.py --tag NAME` renders every param at min / mid / max and ranks how much each one changes the picture.
+- **Camera devices**: `python camera_worker.py --list`.
+- **Finish an interrupted recording by hand**: `python recorder.py --finalize <parts folder>`.
+- **Hardware ideas**: [research/hardware_next.md](research/hardware_next.md). Training your own LoRA legally: [research/lora_dataset.md](research/lora_dataset.md).
+
+---
+
+## 17. Coming next
+
+These are planned or in progress and are **not** in the panel yet. See [research/pro_redesign_plan.md](research/pro_redesign_plan.md).
+- **Clip grid with macro knobs**: playable clips per lane (World, Figures, Text, Interact) with 4-8 named macro knobs each, launched from a grid with live thumbnails. The controller-side clip model exists; the panel does not show it yet. <!-- TODO(clips): document the PLAY grid, clip launch/stop, macros and decks when the panel lands. -->
+- **Direct manipulation**: grab and drag on the picture to rotate, move, scale and bend.
+- **Real picture transitions** (dissolve, wipe, portal) between clips.
+- **Themes and sound tags**. <!-- TODO(themes+sound-tags) -->
+- **Layer windowing**: shaped windows, mattes, irises and split screens per layer.
+- **More skins**: beings bodies and the Folding Blocks fill.
+- **A faster AI image engine** for recognisable subjects.
+- **ISF shader import** and new effect worlds.
+- **OSC input**.
+
+---
+
+## 18. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Bypass / power button** | Switches a tab, layer or all effects off and back on to exactly the same settings |
+| **Cue channel** | A MIDI channel whose notes recall scenes and whose CCs set params, for sequencing from Ableton |
+| **Droste** | A picture that spirals into itself |
+| **Echo / trails** | Feedback: each frame keeps a fading, slightly zoomed copy of the last |
+| **Flash guard** | The always-on limiter that holds flashing to at most 3 per second |
+| **Folding Blocks** | The signature generative labyrinth line layer (internal name `l_kene`); not kené |
+| **Governor** | The resource monitor that lowers costs under strain and restores them |
+| **Light chase** | A soft window of light sweeping across the pattern in time with the bar |
+| **Limiter** | Keeps the average brightness under a ceiling |
+| **Loopback** | Listening to what the laptop itself is playing |
+| **Luma key** | Black parts of an image become transparent |
+| **Mandala / flat field** | Symmetry 1 (radial, N folds) / symmetry 0 (a field tiling the frame) |
+| **MOD** | A modulation slot: a fader follows audio, an LFO, random, the sequencer or the camera |
+| **Morph** | A scene recall that glides over some bars instead of cutting |
+| **NEW CANVAS** | A clean black start with one stripe layer; RESTORE PREVIOUS undoes it |
+| **PANIC** | Hold 0.5 s: jump to the SAFE scene, all triggers off |
+| **Power balance** | Profiles that keep the battery from draining during a long show |
+| **PREVIEW** | The panel's own picture of the output; off by default to save the GPU |
+| **Program / projector** (recording) | The clean picture / the mapped picture as on the wall |
+| **Quantize** | A recall waits for the next beat, bar or phrase |
+| **SAFE scene** | The scene PANIC jumps to |
+| **Scene** | A snapshot of every fader, mod, the BUILD stack and skins |
+| **Show** | The whole project in one folder: look, scenes, timelines, settings, MIDI, mapping |
+| **Skin** | An image used as the material of a 3D world or the tunnel |
+| **SOLO** | Show only some layers in the panel's monitor; the projector is unchanged |
+| **Span** | One picture laid across several surfaces, seamless on shared edges |
+| **Spout** | Windows GPU video sharing with TouchDesigner or Resolume |
+| **Stack** | The BUILD tab's pile of hand-made layers |
+| **Surface** | One mapped area on the wall (a box face, a sculpture facet) |
+| **Travel** | Flying into the picture |
+| **Trigger** | A momentary effect: flash, strobe, invert, freeze, blackout, punch |

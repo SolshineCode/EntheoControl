@@ -120,6 +120,10 @@ try:                                                 # [flashguard] engine-wide 
     import flashguard as fg_mod
 except ImportError:
     fg_mod = None
+try:                                                 # [soundtags] audio features for SOUND TAGS (soundtags.py, numpy)
+    import soundtags as stags_mod
+except ImportError:
+    stags_mod = None
 try:                                                 # text layer (l_text): SDF letters + the compositor GLSL for SCENE_FS
     from text_layer import CPU_ONLY_PARAMS as TEXT_CPU_ONLY, SCENE_GLSL as TEXT_GLSL, TextPass
 except ImportError:
@@ -149,6 +153,7 @@ except ImportError:
                    "void camScene(inout vec3 c, inout float v, vec2 a, vec2 b){} void camShow(inout vec3 o, inout float v, vec2 a, vec2 b, float e){}")
 
 HERE = Path(__file__).parent
+ECHO_PER_FRAME = bool(os.environ.get("LV_ECHO_PER_FRAME"))   # debug: old per-frame echo (for the 30 vs 60 fps look test)
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)   # it warns on every (intended) decode-time rescale
 FOLDS = [3, 4, 5, 6, 8, 10, 12, 16, 24]
 # layer presets (key M, --mode): name -> (l_kene, l_beads, l_lines, l_ai)
@@ -235,6 +240,7 @@ uniform float p_travel_mode, p_tunnel_curve, p_depth_fog;
 uniform float p_serpent, p_serpent_mode, p_serpent_count, p_serpent_segments, p_serpent_wiggle, p_serpent_size;
 uniform float p_swim, p_ripple, p_ripple_decay, p_twirl, p_bulge, p_wave, p_density;
 uniform float p_hue, p_saturation, p_chase, p_chase_width, p_chase_mode, p_trails;
+uniform float dtK;                       // frame time x 60: the echo decays / drifts per SECOND, not per frame (fps caps)
 uniform float p_l_kene, p_l_beads, p_l_lines, p_l_ai, p_l_echo, p_l_video, p_luma_key, p_l_fractal, p_l_art, p_l_land, p_l_beings;
 uniform vec3 pal[5];
 uniform vec3 rip[8];                // x, y (content uv), age in seconds (< 0 = inactive)
@@ -256,6 +262,7 @@ vec3 hueRot(vec3 c, float a){
   vec3 y=toY*c; float h=atan(y.z,y.y+1e-6)+a, ch=length(y.yz);
   return toR*vec3(y.x, ch*cos(h), ch*sin(h));
 }
+// Hash without Sine, Copyright (c) 2014 David Hoskins, MIT License (full text: THIRD_PARTY_NOTICES.md)
 float hash21(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
 float vnoise(vec2 p){ vec2 i=mod(floor(p),64.), j=mod(i+1.,64.), u=fract(p); u=u*u*(3.-2.*u);   // period 64
   return mix(mix(hash21(i),hash21(vec2(j.x,i.y)),u.x), mix(hash21(vec2(i.x,j.y)),hash21(j),u.x), u.y); }
@@ -963,14 +970,15 @@ void main(){
   // ---- energy-conserving echo: zoomed/rotated copy that only ever decays (max-blend, clamp, knee to black).
   // Freeze holds it exactly. The echo is shown dimmer than fresh geometry so trails read as an aura.
   float hold = clamp(p_freeze, 0.0, 1.0);
-  vec2 q = (v_uv-0.5)*asp; float fr = (0.0015+0.002*mid)*(1.0-hold), z = mix(0.9955-0.004*bass, 1.0, hold);
+  float dk = dtK > 0.0 ? dtK : 1.0;
+  vec2 q = (v_uv-0.5)*asp; float fr = (0.0015+0.002*mid)*(1.0-hold)*dk, z = pow(mix(0.9955-0.004*bass, 1.0, hold), dk);
   q = (rot(fr)*q*z)/asp+0.5;
   float melt = amode == 5.0 ? p_l_art*(1.0-hold) : 0.0;              // art_use 5: the echo runs like wet paint
-  q += (fbm2(v_uv*vec2(5.0, 3.0)+vec2(swN[4], swN[5]))*0.010 + vec2(0.0, 0.0030*(0.4+fbm(v_uv*vec2(22.0, 1.5)))))*melt;
+  q += (fbm2(v_uv*vec2(5.0, 3.0)+vec2(swN[4], swN[5]))*0.010 + vec2(0.0, 0.0030*(0.4+fbm(v_uv*vec2(22.0, 1.5)))))*melt*dk;
   bool held = hold > 0.999;                                          // fully frozen: copy the texel, no resampling
   vec3 prev = held ? texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb : texture(prevFrame,q).rgb;
   if (nanGuard > 0.5 && !(prev.r >= 0.0 && prev.g >= 0.0 && prev.b >= 0.0)) prev = vec3(0);
-  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)*(1.0-0.6*melt)), 0.0, 1.0)*mix(mix(min(p_trails*0.94 + 1.6*max(p_trails-0.94, 0.0) + 0.30*max(p_l_echo-0.6, 0.0), 0.960), 0.958, melt), 1.0, hold);   // above 0.94 (no factory scene goes higher): long trails, up to 0.96 / frame (longer ones wash out to pastel)
+  vec3 trail = held ? prev : clamp(hueRot(prev, (0.012+0.035*high)*(1.0-hold)*(1.0-0.6*melt)*dk), 0.0, 1.0)*pow(mix(mix(min(p_trails*0.94 + 1.6*max(p_trails-0.94, 0.0) + 0.30*max(p_l_echo-0.6, 0.0), 0.960), 0.958, melt), 1.0, hold), dk);   // above 0.94 (no factory scene goes higher): long trails, up to 0.96 / frame (longer ones wash out to pastel)
   trail *= mix(smoothstep(0.05, 0.24, max3(trail)), 1.0, hold);
   fbE = vec4(max(col, trail), 1.0);
   vec3 o = max(col, trail*mix(min((0.30+0.25*p_trails)*(min(p_l_echo/0.6, 1.0) + 3.0*max(p_l_echo-0.6, 0.0)), 0.95), 0.92, melt));   // echo above its default: x2.2 at 1
@@ -1004,10 +1012,12 @@ void main(){
 """
 SCENE_FS = SCENE_FS.replace("//@TEXT_GLSL", TEXT_GLSL)   # the text compositor lives in text_layer.py
 SCENE_FS = SCENE_FS.replace("//@CAMERA_GLSL", CAMERA_GLSL)   # crowd camera compositor (camera_layer.py)
-if skin_mod is not None:                                      # [skins] one slot (the tunnel walls), the scene's own palette
-    SCENE_FS = SCENE_FS.replace("//@SKIN_GLSL", skin_mod.glsl(1, "palette"))
-else:                                                         # no materials.py: the block is cut out again
-    SCENE_FS = SCENE_FS[:SCENE_FS.index("  // [skins>")] + SCENE_FS[SCENE_FS.index("  // <skins]") + len("  // <skins]"):]
+# [skins] SCENE_FS_PLAIN = the scene with the skin block cut out again: THE program the show runs (pixel- and
+# cost-identical to the engine before skins). SCENE_FS (block + materials chunk: one slot, the tunnel walls, the
+# scene's own palette) is only drawn while a skin is on the travel tunnel.
+SCENE_FS_PLAIN = (SCENE_FS[:SCENE_FS.index("  // [skins>")]
+                  + SCENE_FS[SCENE_FS.index("  // <skins]") + len("  // <skins]"):]).replace("//@SKIN_GLSL" + chr(10), "")
+SCENE_FS = SCENE_FS.replace("//@SKIN_GLSL", skin_mod.glsl(1, "palette")) if skin_mod is not None else SCENE_FS_PLAIN
 
 OUT_FS = """
 #version 330
@@ -2016,6 +2026,8 @@ def main():
     ap.add_argument("--out", default=None, help="headless: folder for saved frames (default test_frames/)")
     ap.add_argument("--snapshot", action="store_true", help="headless: also write <out>/snapshots/current.png at the last frame")
     ap.add_argument("--test-audio", default="beat", choices=["beat", "silent"], help="headless --test: synthetic kick or silence")
+    ap.add_argument("--test-fps", type=float, default=60.0, help="headless: show-time frame rate (dt = 1/N per frame)")
+    ap.add_argument("--pace", action="store_true", help="headless: also pace frames to --test-fps in real time (power tests)")
     ap.add_argument("--phase-offset", type=int, default=0, metavar="K",
                     help="headless: add K whole wrap periods to every wrapped phase (the picture must not change)")
     ap.add_argument("--no-nan-guard", action="store_true", help="headless: shader outputs raw values, NaN guards off (tests)")
@@ -2101,7 +2113,7 @@ def main():
     print(f"[gl] {ctx.info['GL_RENDERER']} / {ctx.info['GL_VERSION']}")
 
     quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4"))
-    scene_prog = ctx.program(vertex_shader=VS, fragment_shader=SCENE_FS)
+    scene_prog = ctx.program(vertex_shader=VS, fragment_shader=SCENE_FS_PLAIN)
     out_prog = ctx.program(vertex_shader=VS, fragment_shader=OUT_FS)
     meter_prog = ctx.program(vertex_shader=VS, fragment_shader=METER_FS)
     scene_vao = ctx.vertex_array(scene_prog, [(quad, "2f", "in_pos")])
@@ -2213,16 +2225,32 @@ def main():
     own_stack = stack_mod.StackState() if stack_mod is not None else None   # used when the controller has no stack
     # [skins> environment skins: ONE texture array on unit 22, shared by the 3D decks and the travel tunnel. With no
     # skin assigned nothing below costs anything (the decks keep their original programs, the tunnel block is skipped).
-    skins, own_skins, sk_eff, sk_st = None, None, {"tunnel": 1}, dict(on=False, travel=None)
+    skins, own_skins, sk_eff, sk_st = None, None, {"tunnel": 1}, dict(on=False, travel=None, cut=0)
     if skin_mod is not None:
         own_skins = skin_mod.SkinState()             # used when the controller has none (static controller)
         skins = guarded("skins", skin_mod.SkinEngine, ctx, skin_mod.roots_for(args.textures, args.art),
                         size=args.skin_size, sync=bool(headless))
-        if skins is not None:
-            _land = next((e["obj"] for e in extra if e["param"] == "l_land"), None)
-            if _land is not None:
-                _land.skins = skins
-    sk_zero = np.zeros((1, 4), dtype="f4")       # <skins]
+        _land = next((e["obj"] for e in extra if e["param"] == "l_land"), None)
+        sk_st["ready"] = False                       # skins are INACTIVE until switched on: nothing compiled, no VRAM
+    scene_plain, scene_skin = (scene_prog, scene_vao), None
+
+    def skin_scene():                            # the scene program with the tunnel-skin block: compiled ONCE. A failed
+        nonlocal scene_skin                      # compile is remembered (False): no retry per frame, the tunnel stays
+        if scene_skin is None:                   # procedural, one log line
+            try:
+                prog = ctx.program(vertex_shader=VS, fragment_shader=SCENE_FS)
+                scene_skin = (prog, ctx.vertex_array(prog, [(quad, "2f", "in_pos")]))
+            except Exception as ex:
+                scene_skin = False
+                print(f"[skins] tunnel skins disabled (shader did not compile): {str(ex)[:300]}")
+        return scene_skin or None
+
+    def skins_ready():                           # the performer switched skins ON: compile their programs once, now
+        sk_st["ready"] = True                    # (a short stall at that deliberate moment, never at a later skin swap)
+        if _land is not None:
+            _land.skins = skins
+        if not headless:
+            skin_scene()                         # <skins]
     preview = guarded("preview", PreviewTap, ctx) if PreviewTap is not None and not headless else None
     filt = None                                  # post-FX filter chain (filters.py); never called while every filter is off
     if FilterPass is not None:
@@ -2242,6 +2270,9 @@ def main():
     gov = None                                   # resource governor (show mode, or headless with --governor)
     if gov_mod is not None and not sheet and (args.governor or not headless):
         gov = guarded("governor", gov_mod.for_engine, ctx, controller, args.governor)
+    if gov:                                      # frame time is judged against the display's own refresh (vsync)
+        gov.refresh_source = lambda: gov_mod.display_refresh(glfw, win)
+        controller.gov_status = gov.status       # the online assistant checks strain before turning heavy layers on
     cam = None                                   # crowd camera: OFF until the panel switches it on (no process, no cost)
     if cam_mod is not None and not sheet:
         cam = guarded("camera", cam_mod.CameraLayer.for_engine, ctx, controller, extra, rw / rh)
@@ -2282,7 +2313,11 @@ def main():
             own_stack.add(stack_mod.CANVAS_START["gen"], stack_mod.CANVAS_START)
             own_stack.restore(own_stack.to_json())
     if args.skins and own_skins is not None and headless:
-        (getattr(controller, "skins", None) or own_skins).load(json.loads(Path(args.skins).read_text(encoding="utf-8")))
+        _s0 = getattr(controller, "skins", None) or own_skins
+        _s0.on = True
+        _s0.load(json.loads(Path(args.skins).read_text(encoding="utf-8")))
+    elif own_skins is not None:
+        own_skins.on = False                         # no control system and no --skins file: inactive
     if args.stack and stack_mod is not None and headless:
         the_stack().restore(json.loads(Path(args.stack).read_text(encoding="utf-8")))
     apply_start(controller)
@@ -2443,6 +2478,11 @@ def main():
             print(f"[spout] disabled: {ex}")
 
     audio = Audio("none" if headless else args.audio)
+    if stags_mod is not None and audio.source != "none" and not sheet and hasattr(controller, "soundtags"):
+        stags = guarded("soundtags", stags_mod.SoundTags)                 # [soundtags] one tap on the same loopback
+        if stags is not None:                                              # stream (features only, never the audio)
+            audio.taps.append(lambda blk, t, f=stags.feed: f(blk, t))
+            controller.soundtags = stags
     recorder = None                              # show recorder (recorder.py): panel REC, Ctrl+R, MIDI target "rec"
     if rec_mod is not None and not sheet:
         recorder = guarded("rec", rec_mod.for_engine, ctx, audio, (rw, rh), args, headless)
@@ -2521,10 +2561,13 @@ def main():
         return sum(int((~np.isfinite(np.frombuffer(fbo.read(components=3, attachment=i, dtype="f4"), dtype="f4"))).sum())
                    for i in (0, 1))
 
+    head_pacer = gov_mod.FramePacer() if (headless and args.pace and gov_mod is not None) else None
     try:
         while not glfw.window_should_close(win):
             now = time.perf_counter() - t0
-            t = frame / 60.0 if headless else now
+            t = frame / args.test_fps if headless else now
+            if head_pacer is not None:
+                head_pacer.wait(args.test_fps)
             dt = min(0.1, max(1e-3, t - prev_t)); prev_t = t
             for a in script.get(frame, ()):
                 run_action(a)
@@ -2544,7 +2587,7 @@ def main():
             # ---- controller: one Frame of final values, events and clock. Non-GL steps are guarded: a bug in
             # the control system, a MIDI device or the panel must never take the picture down.
             if cam is not None:                      # crowd camera mod sources + hand ripples (returns at once while off)
-                guarded("camera", cam.pre_update, dt, getattr(gov, "level", 0) if gov else 0)
+                guarded("camera", cam.pre_update, dt, gov.camera_strain() if gov else 0)
             fr = guarded("control", controller.update, dt, sm, default=None)
             if fr is None:
                 fr = Frame(values=dict(last_frame.values), events=[], clock=dict(last_frame.clock))
@@ -2658,16 +2701,28 @@ def main():
                 if _ss is None:
                     _ss = own_skins
                     own_skins.step(dtf)
-                _lvl = getattr(gov, "level", 0) if gov else 0
-                if hasattr(controller, "gov_level"):
-                    controller.gov_level = _lvl      # "generate a skin" waits while the governor reports strain
-                if _lvl != skins.level:
-                    skins.govern(_lvl)
+                if _ss.on != skins.enabled or (_ss.on and not sk_st["ready"]):
+                    skins.enabled = bool(_ss.on)
+                    if _ss.on and not sk_st["ready"]:
+                        skins_ready()                # GL (shader compiles): not guarded
+                if gov:
+                    if hasattr(controller, "gov_level"):          # "generate a skin" waits while there is ANY strain and
+                        controller.gov_level = gov.level          # checks free VRAM before the worker loads its model
+                        _vt, _vu = gov.snap.get("vram_total_mb"), gov.snap.get("vram_mb")
+                        controller.gov_vram_free_mb = _vt - _vu if _vt is not None and _vu is not None else None
+                    # skins follow what the governor has DECIDED (its applied reductions: mode off / suggest, 3 s
+                    # sustain and 15 s recovery included), never the raw level: no reload storm on a noisy sensor
+                    _q = gov.skin_quality()
+                    if _q != skins.level or skins.want_size != skins.base_size:
+                        skins.govern(_q)
                 _tm = int(round(vals.get("travel_mode", 0.0)))
                 sk_eff["tunnel"] = ((skin_mod.EFF_TUBE if vals.get("symmetry", 1.0) >= 0.5 else skin_mod.EFF_GROUND)
                                     if _tm == 1 else skin_mod.EFF_LOGPOLAR)
-                guarded("skins", skins.update, _ss.frame, dtf, clock, (not headless) and dt > 0.022, sk_eff)
-                if skins.active("tunnel"):
+                _cut = getattr(_ss, "cut", 0)                     # PANIC: this frame's changes are cuts, not fades
+                guarded("skins", skins.update, _ss.frame, dtf, clock, False, sk_eff, _cut != sk_st["cut"], False)
+                sk_st["cut"] = _cut
+                skins.gl_step((not headless) and dt > 0.022)      # GL (one upload piece): NOT guarded, errors reach the watchdog
+                if skins.active("tunnel"):                        # travel first, bind (which reads the phases) later
                     if sk_st["travel"] is not None:
                         skins.advance("tunnel", ph.travel - sk_st["travel"])
                     sk_st["travel"] = ph.travel
@@ -2790,7 +2845,7 @@ def main():
                         src_ai = True                    # no art uploaded at all: the AI texture stands in
                     layer_on["l_art"] = amount
                     continue
-                if ex["obj"] is None or amount <= 0.001 or ex["fails"] >= 5:
+                if ex["obj"] is None or amount <= 0.001 or ex["fails"] >= 5 or (gov and gov.standby):
                     continue
                 if ex["param"] == "l_stack" and not (the_stack() is not None and the_stack().frame):
                     continue                             # empty stack: the pass is never drawn
@@ -2827,6 +2882,7 @@ def main():
                        bass=smr[0], mid=smr[1], high=smr[2], aspect=rw / rh, pxh=1.0 / rh,
                        hasVideo=1.0 if has_video else 0.0, limiter=limiter.value, nanGuard=0.0 if args.no_nan_guard else 1.0,
                        chasePh=chase % 1.0, chaseCol=(chase * 0.15) % 1.0, breath=breath, calm=calm,
+                       dtK=1.0 if ECHO_PER_FRAME else min(4.0, max(0.25, dt * 60.0)),
                        beat=clk["beat"] % 4096.0, beat_phase=clk["beat_phase"],
                        bar_phase=clk["bar_phase"], phrase_phase=clk["phrase_phase"])
             uni.update(ph.uniforms(vals, args.phase_offset if headless else 0))
@@ -2851,6 +2907,11 @@ def main():
             if filt_on:
                 uni.update(limiter=0.0, p_master=1.0, p_blackout=0.0)
             # <filters]
+            scene_prog, scene_vao = scene_plain      # [skins> the plain program unless a skin is on the travel tunnel
+            if skins is not None and skins.active("tunnel"):
+                scene_prog, scene_vao = skin_scene() or scene_plain
+                if scene_prog is not scene_plain[0]:
+                    skins.bind(scene_prog, "tunnel")     # GL: not guarded <skins]
             for kname, v in uni.items():
                 if kname in scene_prog:
                     if isinstance(v, np.ndarray):
@@ -2861,13 +2922,6 @@ def main():
                 scene_prog["pal"].write(np.ascontiguousarray(pal, dtype="f4").tobytes())
             if "rip" in scene_prog:
                 scene_prog["rip"].write(ripples.tobytes())
-            if skins is not None and "skA" in scene_prog:   # [skins> tunnel skin: bound only while one is on
-                if skins.active("tunnel"):
-                    guarded("skins", skins.bind, scene_prog, "tunnel")
-                    sk_st["on"] = True
-                elif sk_st["on"]:
-                    scene_prog["skA"].write(sk_zero)
-                    sk_st["on"] = False              # <skins]
             if gov: gov.timer.start("scene")
             scene_vao.render(moderngl.TRIANGLE_STRIP)
             if gov: gov.timer.stop()
@@ -2891,7 +2945,9 @@ def main():
                     scene_vao.render(moderngl.TRIANGLE_STRIP)   # <filters]
             if fguard is not None:                   # [flashguard] in place on disp: everything below shows the guarded frame
                 if gov: gov.timer.start("flashguard")
+                fguard.note_panics(getattr(controller, "panics", 0))   # PANIC always brings the guard back
                 guarded("flashguard", fguard.process, disp, t)
+                controller.fg_hold = bool(getattr(fguard, "logic", None) is not None and fguard.logic.engaged())   # [themes]
                 if gov: gov.timer.stop()
 
             if spout:
@@ -2931,6 +2987,11 @@ def main():
             # the surface draw keeps failing (it lights only the inside of that one quad, and the surface path is
             # tried again every couple of seconds for as long as it takes, never given up on).
             plan = mapper.gate.plan((fw, fh), mapper.set.trivial(), surf_draw is not None, now)
+            real_target = target                     # [flashguard] anything more than a plain corner pin of the guarded
+            # picture (surfaces: brightness / opacity / on-off / fills / glow; the grid; AUTO MAP patterns) is drawn
+            # into the guard's own texture, guarded again, and only then put on the projector (output_end below)
+            if fguard is not None and plan != "skip" and fguard.wants_output_stage(plan == "multi", st["grid"] or st["calib"], amap):
+                target = guarded("flashguard", fguard.output_begin, (fw, fh)) or real_target
             if plan == "multi":
                 try:
                     surf_draw.render(mapper.set, disp, target, (fw, fh), T, float(smr[0]), grid=st["grid"])
@@ -2950,6 +3011,9 @@ def main():
 
             if amap is not None and plan != "skip":  # AUTO MAP calibration pattern: over everything, mapping bypassed
                 guarded("automap", amap.draw, target, (fw, fh), vals.get("blackout", 0.0) > 0.05 or vals.get("master", 1.0) < 0.05)
+            if target is not real_target:            # [flashguard] the mapped frame: guard it, then onto the projector
+                guarded("flashguard", fguard.output_end, real_target, (fw, fh), t)
+                target = real_target
             if recorder is not None:                 # show recorder: async PBO readback, never waits on the encoder
                 guarded("rec", recorder.frame, {"program": ((fbos[dst], 0), (rw, rh)), "projector": ((target, 0), (fw, fh))})
                 if headless and recorder.active:     # headless recording: real-time pace, since t = frame / 60
@@ -3023,6 +3087,7 @@ def main():
                           f" nonfinite={read_nonfinite(fbos[dst])} limiter={limiter.value:.4f} limiter_span={max(tail) - min(tail):.4f}")
                     break
             else:
+                if gov: gov.pace()                   # power-balance frame-rate cap / standby trickle (None = vsync only)
                 glfw.swap_buffers(win)
             glfw.poll_events()
     finally:
@@ -3044,7 +3109,8 @@ def main():
             guarded("exit", filt.release)
         if skins is not None:                        # [skins]
             if headless:
-                print(f"[skins] binds={skins.binds} uploads={skins.lib.uploads} vram_mb={skins.status()['vram_mb']}")
+                print(f"[skins] binds={skins.binds} uploads={skins.lib.uploads} vram_mb={skins.status()['vram_mb']} "
+                      f"ready={int(sk_st['ready'])} arrays={skins.lib.allocs}")
             guarded("exit", skins.release)
         for ex in extra:
             if headless and hasattr(ex["obj"], "draws"):          # tests: a layer at 0 must not have drawn at all

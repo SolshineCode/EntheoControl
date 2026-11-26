@@ -65,7 +65,6 @@ HERE = Path(__file__).resolve().parent
 MAX_BODY = 32768       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB, and a full
                        # 24-surface mapping layout with 8-point masks (surf "replace") about 17 kB
 MAX_BATCH = 64         # commands per POST
-LOCAL_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")   # clients on the laptop itself (see control.mark_local)
 MAX_UPLOAD = 25 << 20  # bytes per uploaded art image
 MAX_ART_SIDE = 4096
 MAX_ART_PIXELS = 40_000_000   # decoded size guard (decompression bombs, and RAM next to a running show)
@@ -634,10 +633,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, self.server.rc._state_bytes())
         elif path == "/params":
             self._send(200, control.meta())
-        elif path in ("/timeline", "/shows", "/presets"):     # big documents: fetched only when their rev changes
+        elif path in ("/timeline", "/shows", "/presets", "/clips", "/themes"):    # big documents: fetched only when their rev changes
             b = control.blob(path[1:])
             self._send(200, b[1] if b else b"{}")
-        elif path.startswith(("/preset-thumb/", "/scene-thumb/", "/preset-export/", "/show-export/", "/media/",
+        elif path.startswith(("/preset-thumb/", "/scene-thumb/", "/theme-thumb/", "/preset-export/", "/show-export/", "/media/",
                               "/media-peaks/")):
             self._library_get(path, parse_qs(urlsplit(self.path).query))
         elif path == "/art":
@@ -721,6 +720,10 @@ class _Handler(BaseHTTPRequestHandler):
             if head == "preset-thumb" and len(parts) == 2:
                 f = root / "presets" / parts[0] / (shows.check_slug(parts[1]) + ".jpg")
                 if parts[0] in shows.KINDS and shows.inside(root / "presets", f) and f.is_file():
+                    data, ctype = f.read_bytes(), "image/jpeg"
+            elif head == "theme-thumb" and len(parts) == 1 and re.match(r"^[a-z0-9]{1,16}$", parts[0]):   # [themes]
+                f = root / "shows" / "_current" / "themes" / f"{parts[0]}.jpg"
+                if f.is_file():
                     data, ctype = f.read_bytes(), "image/jpeg"
             elif head == "scene-thumb" and len(parts) == 1 and parts[0].isdigit() and int(parts[0]) < control.N_SCENES:
                 f = root / "shows" / "_current" / "thumbs" / f"scene_{int(parts[0])}.jpg"
@@ -948,10 +951,30 @@ class _Handler(BaseHTTPRequestHandler):
         code, out = ai_call(rc.ai_url, rc.token_paths, "/dreamify", req)
         self._send(code if code in (200, 400, 503) else 502, out)
 
+    def _same_site(self):
+        """State-changing requests must come from the panel itself, not from another web page open in a browser on
+        this network (CSRF) and not through a DNS name pointed at us (rebinding). A browser always sends Origin on a
+        POST; scripts and tools that send neither Origin nor Sec-Fetch-Site are judged by the token alone, as before."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        origin, site = self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site")
+        browser = origin is not None or site is not None
+        if browser and not (name == "localhost" or name.startswith("[") or re.fullmatch(r"[0-9.]+", name)):
+            return False                                 # the panel is only ever opened by IP address or localhost
+        if (site or "same-origin").lower() not in ("same-origin", "none"):
+            return False
+        if origin is not None:
+            o = origin.strip().lower()
+            if o == "null" or o.split("://", 1)[-1] != host:
+                return False
+        return True
+
     def do_POST(self):
         path = self._gate()
         if path is None:
             return
+        if not self._same_site():
+            return self._send(403, {"ok": False, "error": "cross-site request refused"}, close=True)
         if path == "/upload":
             return self._upload()
         if path == "/art-delete":
@@ -971,8 +994,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not 1 <= len(cmds) <= MAX_BATCH:
                 raise ValueError(f"send 1..{MAX_BATCH} commands")
             cmds = [validate_command(c) for c in cmds]  # all-or-nothing
-            if self.client_address[0] in LOCAL_ADDRS:
-                cmds = [control.mark_local(c) for c in cmds]   # some switches are honoured from this laptop only
+            # the flash guard override: only from a panel opened on this laptop at a loopback address (the
+            # connection AND the Host it asked for; cross-site / rebinding POSTs were refused by _same_site above)
+            if flashguard.is_local_request(self.client_address[0], self.headers.get("Host")):
+                cmds = [flashguard.mark_local(c) for c in cmds]
         except (ValueError, RecursionError) as ex:  # JSONDecodeError / UnicodeDecodeError are ValueErrors
             return self._send(400, {"ok": False, "error": str(ex)[:200]})
         try:

@@ -50,7 +50,7 @@ OPS = ("play", "stop", "seek", "home", "rec", "rec_mode", "ovr_mode", "reenable"
 REC_MODES = ("overdub", "replace")
 OVR_MODES = ("touch", "latch")
 _EASE_I = {e: i for i, e in enumerate(EASES)}
-PRESET_KINDS = ("look", "layer", "fx", "mod", "mapping", "midi")      # == shows.KINDS
+PRESET_KINDS = ("look", "layer", "fx", "mod", "mapping", "midi", "theme")      # == shows.KINDS
 _SLUG = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")      # == shows.SLUG
 _MEDIA = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,119}$")   # == shows.MEDIA_NAME
 
@@ -594,7 +594,10 @@ class Timeline:
                 else:
                     c = it["cmd"]
                     key = ("bypass", c.get("key")) if c["cmd"] == "bypass" else (
-                        "media" if c["cmd"] in ("show_texture", "art_pick") else None)
+                        "media" if c["cmd"] in ("show_texture", "art_pick") else
+                        ("clip", c.get("lane") or c.get("id")) if c["cmd"] == "clip" else      # latest launch per lane
+                        ("scene_go",) if c["cmd"] == "scene_go" else
+                        ("macro", c.get("lane"), c.get("n")) if c["cmd"] == "macro" else None)
                 if key is not None and (key not in best or it["t"] > best[key][1]["t"]):
                     best[key] = (tr, it)
                 if tr["kind"] in ("cue", "text"):

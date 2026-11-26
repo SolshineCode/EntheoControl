@@ -182,6 +182,7 @@ float max3(vec3 c){ return max(c.r, max(c.g, c.b)); }
 // NaN / Inf / absurd -> black; a slightly negative channel (hueRot of a saturated colour) is clamped, not blanked
 vec3 safe(vec3 c){ vec3 a = abs(c); return (a.r < 64.0 && a.g < 64.0 && a.b < 64.0) ? max(c, 0.0) : vec3(0.0); }
 vec3 tap(sampler2D s, vec2 uv){ return safe(texture(s, uv).rgb); }
+// Hash without Sine, Copyright (c) 2014 David Hoskins, MIT License (full text: THIRD_PARTY_NOTICES.md)
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
 vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33);
   return fract((p3.xx + p3.yz)*p3.zy); }

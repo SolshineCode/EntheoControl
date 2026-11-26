@@ -3,7 +3,6 @@
 control.py calls these hooks (each is a no-op while the plugin is not loaded):
 
     validate(c)        validator for {"cmd": "online", "op": ...}           (control._VALIDATORS)
-    mark_local(c)      called by remote_control for requests from 127.0.0.1 only (see cli_google)
     do(ctl, c)         run one validated "online" command                    (Controller._do)
     boot(ctl)          load the plugin if the saved switch says ON           (end of Controller.__init__)
     tick(ctl)          collect finished jobs, apply autopilot batches        (Controller.update, GL thread)
@@ -12,18 +11,13 @@ control.py calls these hooks (each is a no-op while the plugin is not loaded):
     on_panic(ctl)      PANIC: drop everything queued / in flight, autopilot -> suggest   (Controller.panic)
     close(ctl)         stop worker threads, kill child processes             (Controller.close)
 
-Settings live in ctl.ext["online"] = {on, mode, backend, engine, cli_google}, saved with live_state.json.
+Settings live in ctl.ext["online"] = {on, mode, backend, engine}, saved with live_state.json.
 
 Commands (all {"cmd": "online", "op": ...}):
     enable {on: bool}                      the master ONLINE switch (default OFF)
     mode {mode: "suggest" | "autopilot"}   suggest = show a diff with Apply; autopilot = apply, undoable
     backend {backend: "claude"}            which CLI answers the chat (Claude Code only: agy has no tool-less mode)
     engine {engine: "local" | "nano"}      AI DREAM image engine (nano = Nano Banana, only while ONLINE is on)
-    cli_google {on: bool}                  opt-in (default OFF) to the agy CLI as an IMAGE provider. LOCAL ONLY: it is
-                                           honoured when the request came from 127.0.0.1 (remote_control marks it), or
-                                           set by hand in online_local.json next to the code ({"cli_google": true}).
-                                           From any other address it is refused: a panel on the venue Wi-Fi can never
-                                           switch on a tool that acts on this laptop.
     key {key: str}                         the user's own Gemini API key for Nano Banana ("" = forget it); kept in the
                                            user's app-data folder, never logged, never sent back to a panel
     ask {text}                             chat message (<= MAX_ASK characters)
@@ -32,7 +26,6 @@ Commands (all {"cmd": "online", "op": ...}):
     cancel                                 stop the running request and clear the queue
     clear                                  clear the chat (history of applied batches is kept)
 """
-import json
 import re
 from pathlib import Path
 
@@ -41,23 +34,9 @@ BACKENDS = ("claude",)
 ENGINES = ("local", "nano")
 MAX_ASK = 1000
 MAX_ID = 10 ** 9
-DEFAULTS = dict(on=False, mode="suggest", backend="claude", engine="local", cli_google=False)
-OPS = ("enable", "mode", "backend", "engine", "cli_google", "key", "ask", "apply", "dismiss", "undo", "cancel", "clear")
+DEFAULTS = dict(on=False, mode="suggest", backend="claude", engine="local")
+OPS = ("enable", "mode", "backend", "engine", "key", "ask", "apply", "dismiss", "undo", "cancel", "clear")
 KEY_RX = re.compile(r"^[A-Za-z0-9_\-]{20,200}$")
-LOCAL = object()             # identity marker: cannot be produced by JSON, so a network client cannot forge it
-LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
-LOCAL_FILE = "online_local.json"
-
-
-def is_loopback(addr):
-    return isinstance(addr, str) and addr in LOOPBACK
-
-
-def mark_local(c):
-    """remote_control calls this for a command that arrived from this laptop itself (client address 127.0.0.1)."""
-    if isinstance(c, dict) and c.get("cmd") == "online":
-        c["_local"] = LOCAL
-    return c
 
 
 def _choice(c, key, allowed):
@@ -80,9 +59,7 @@ def validate(c):
     if not isinstance(op, str) or op not in OPS:
         raise ValueError(f"'op' must be one of {list(OPS)}")
     out = {"cmd": "online", "op": op}
-    if c.get("_local") is LOCAL:                      # only the object remote_control put there survives
-        out["_local"] = LOCAL
-    if op in ("enable", "cli_google"):
+    if op == "enable":
         if not isinstance(c.get("on"), bool):
             raise ValueError("'on' must be true or false")
         out["on"] = c["on"]
@@ -116,27 +93,12 @@ def settings(ctl):
     raw = ctl.ext.get("online") if isinstance(getattr(ctl, "ext", None), dict) else None
     s = dict(DEFAULTS)
     if isinstance(raw, dict):
-        for key in ("on", "cli_google"):
-            if isinstance(raw.get(key), bool):
-                s[key] = raw[key]
+        if isinstance(raw.get("on"), bool):
+            s["on"] = raw["on"]
         for key, allowed in (("mode", MODES), ("backend", BACKENDS), ("engine", ENGINES)):
             if raw.get(key) in allowed:
                 s[key] = raw[key]
     return s
-
-
-def _root(ctl):
-    opts = getattr(ctl, "online_opts", None) or {}
-    return Path(opts.get("root") or Path(__file__).resolve().parents[2])
-
-
-def _local_file(ctl):
-    """online_local.json next to the code: the by-hand way to give (or withdraw) the cli_google opt-in."""
-    try:
-        d = json.loads((_root(ctl) / LOCAL_FILE).read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
 
 
 def _load(ctl):
@@ -144,10 +106,6 @@ def _load(ctl):
     if getattr(ctl, "online", None) is not None:
         return ctl.online
     s = settings(ctl)
-    f = _local_file(ctl)
-    if isinstance(f.get("cli_google"), bool):         # the file on this laptop's disk wins over the saved state
-        s["cli_google"] = f["cli_google"]
-        ctl.ext["online"] = s
     from .plugin import OnlinePlugin                 # subprocess-capable code is imported here and nowhere else
     opts = dict(getattr(ctl, "online_opts", None) or {})
     opts.setdefault("root", Path(__file__).resolve().parents[2])
@@ -185,12 +143,8 @@ def do(ctl, c):
         else:
             _unload(ctl)
         return
-    if op == "cli_google" and c.get("_local") is not LOCAL:
-        if p is not None:                             # not from this laptop: refused, and said so
-            p.refused("cli_google", "only from the laptop itself (http://127.0.0.1) or online_local.json")
-        return
-    if op in ("mode", "backend", "engine", "cli_google"):
-        s[op] = c["on"] if op == "cli_google" else c[op]
+    if op in ("mode", "backend", "engine"):
+        s[op] = c[op]
         ctl.ext["online"] = s
         if p is not None:
             p.configure(s)
@@ -209,7 +163,7 @@ def state(ctl):
     s = settings(ctl)
     p = getattr(ctl, "online", None)
     if p is None:
-        return dict(on=False, mode=s["mode"], backend=s["backend"], engine=s["engine"], cli_google=s["cli_google"])
+        return dict(on=False, mode=s["mode"], backend=s["backend"], engine=s["engine"])
     return p.state()
 
 

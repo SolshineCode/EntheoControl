@@ -649,6 +649,58 @@ def test_unhashable_and_odd_values_are_value_errors(bad):
         remote_control.validate_command(dict(bad, cmd="stack"))
 
 
+def test_no_two_layers_ever_share_runtime_state(tmp_path):
+    """Neon B15: dup shallow-copied the phase record, so the original and the copy shared the slew dict ph["v"] and
+    dragged each other's values. Every layer's runtime state must be its own after dup, replace / undo, a scene
+    recall and a morph."""
+    def own(st):
+        phs = [st._phase(x["id"]) for x in st.layers]
+        vs = [id(p["v"]) for p in phs if p.get("v") is not None]
+        return len({id(p) for p in phs}) == len(phs) and len(set(vs)) == len(vs)
+
+    st = StackState()
+    sdo(st, op="add", gen=0, layer=dict(freq=4, duty=0.5))
+    for _ in range(30):
+        st.step(1 / 60)
+    sdo(st, op="dup", id=1)
+    assert st._phase(2)["v"] is not st._phase(1)["v"] and st._phase(2)["v"] == st._phase(1)["v"]
+    assert st._phase(2)["scroll"] == st._phase(1)["scroll"]            # still starts exactly on top of the original
+    sdo(st, op="set", id=2, set=dict(freq=24, duty=0.9, hue=0.5))
+    for _ in range(60):
+        st.step(1 / 60)
+    v1, v2 = st._phase(1)["v"], st._phase(2)["v"]
+    assert (v1["freq"], v1["duty"], v1["hue"]) == (4.0, 0.5, 0.0)      # the original never moved
+    assert (v2["freq"], v2["duty"], v2["hue"]) == (24.0, 0.9, 0.5)     # the copy landed on its own values
+    r = {x["id"]: x for x in st.frame}
+    assert r[1]["E"][2] == 0.5 and r[2]["E"][2] == 0.9
+    sdo(st, op="dup", id=2)
+    sdo(st, op="dup", id=3)
+    for _ in range(10):
+        st.step(1 / 60)
+    assert own(st)
+    snap = st.to_json()                                                # undo = replace with an older snapshot
+    sdo(st, op="del", id=3)
+    st.step(1 / 60)
+    st.do(stack.validate(dict(cmd="stack", op="replace", stack=snap)))
+    for _ in range(20):
+        st.step(1 / 60)
+    assert own(st) and [x["id"] for x in st.layers] == [1, 2, 3, 4]
+
+    c = make(tmp_path)                                                 # scene recall + morph through the controller
+    do(c, cmd="stack", op="add", gen=0)
+    do(c, cmd="stack", op="dup", id=1)
+    do(c, cmd="scene_save", i=9)
+    do(c, cmd="stack", op="set", id=2, f="freq", v=20)
+    do(c, cmd="stack", op="dup", id=2)
+    c.morph_bars, c.bpm = 1.0, 120.0
+    do(c, cmd="scene_recall", i=9, now=True)
+    for _ in range(12):
+        run(c, 0.25)
+        assert own(c.stack)
+    assert c.stack.to_json()["layers"] == c.scenes[9]["stack"]["layers"]
+    assert c.scenes[9]["stack"]["layers"] is not c.stack.layers and c.scenes[9]["stack"]["layers"][0] is not c.stack.layers[0]
+
+
 def test_band_index_survives_a_change_of_wrap_period():
     st = StackState()
     sdo(st, op="add", gen=0, layer=dict(space=1, freq=7, angle=0.25, speed=0.0))      # 7 rays: W = 7

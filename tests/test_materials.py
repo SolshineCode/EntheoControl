@@ -33,7 +33,7 @@ class FakeTime:
         return self.t
 
 
-def make(tmp_path, **kw):
+def make(tmp_path, skins_on=True, **kw):
     ft = FakeTime()
     kw.setdefault("restore", False)
     kw.setdefault("autosave", True)
@@ -41,6 +41,8 @@ def make(tmp_path, **kw):
     c.ft = ft
     c.quantize = "off"
     c.morph_bars = 0.0
+    if skins_on and c.skins is not None and not c.skins.on:     # the feature ships OFF; most tests want it on
+        c.apply([dict(cmd="skin", op="enable", on=True)])
     return c
 
 
@@ -96,7 +98,7 @@ def fake_loader(path, size):
 
 def make_lib(tmp_path, n=12, size=512, **kw):
     d = tmp_path / "textures"
-    d.mkdir(exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     for i in range(n):
         (d / f"t{i}.png").write_bytes(b"x")
     ctx = FakeCtx()
@@ -259,6 +261,82 @@ def test_panic_returns_every_skin_to_procedural_but_keeps_the_settings(tmp_path)
     assert not c.skins.any() and c.skins.slots["tunnel"]["walls"]["scale"] == 3.0
 
 
+def test_panic_cuts_skins_without_the_stack_module_and_stops_the_ai_job(tmp_path):
+    """Review #6: independent of stack.py, a cut (not a 0.4 s fade), and an in-flight generation is cancelled."""
+    c = make(tmp_path)
+    ai = FakeAI()
+    ai.cancelled = 0
+    ai.cancel = lambda: setattr(ai, "cancelled", ai.cancelled + 1)
+    c.ai = ai
+    c.stack = None                                       # as if stack.py had failed to import
+    do(c, cmd="skin", op="assign", env="corridor", slot="walls", kind="ai", name="t0.png")
+    do(c, cmd="skin", op="gen", env="torus", slot="tube", prompt="neon moss")
+    run(c, 0.2)
+    assert len(ai.jobs) == 1 and c.skins.gen["sent"]
+    eng, lib, _ = make_engine(tmp_path / "e")
+    for _ in range(60):
+        eng.update(c.skins.step(1 / 60), 1 / 60, None)
+    assert eng._u["corridor"][0, 0, 3] == 1.0
+    cut0 = c.skins.cut
+    c.panic()
+    assert not c.skins.any() and c.skins.gen is None and ai.cancelled == 1 and c.skins.cut == cut0 + 1
+    eng.update(c.skins.step(1 / 60), 1 / 60, None, snap=c.skins.cut != cut0)
+    assert eng._u["corridor"][0, 0, 3] == 0.0 and not eng.any_active(), "gone on the very next frame"
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert '_cut != sk_st["cut"]' in src
+
+
+class FakeUniform:
+    def __init__(self, n):
+        self.array_length, self.data = n, None
+
+    def write(self, a):
+        self.data = np.array(a, dtype="f4").copy()
+
+
+class FakeProg(dict):
+    def __init__(self, n=2):
+        super().__init__({k: FakeUniform(n) for k in ("skA", "skB", "skC", "skD", "skE")})
+
+
+def test_the_bound_phase_is_this_frames_phase(tmp_path):
+    """Review #5: update -> advance -> bind. The uniform carries the travel of THIS frame (no one-frame lag)."""
+    eng, lib, ctx = make_engine(tmp_path)
+    st = frame_with(corridor__walls="t0.png")
+    steps(eng, st, 40)
+    sl = eng._slots["corridor"][0]
+    prog = FakeProg()
+    for dz in (0.13, 0.31, 0.07):
+        eng.update(st.step(1 / 60), 1 / 60, None)
+        eng.advance("corridor", dz)
+        eng.bind(prog, "corridor")
+        assert prog["skD"].data[0, 1] == np.float32(sl.pv) and prog["skD"].data[0, 0] == np.float32(sl.pu)
+    assert ctx.made[0].used and ctx.made[0].used[-1] == mt.UNIT
+
+
+def test_engine_hooks_keep_gl_out_of_the_guard_and_compile_once():
+    """Review #7 + #8 (source level: the hooks live inside the engine's main loop)."""
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert 'guarded("skins", skins.bind' not in src and 'guarded("skins", skin_scene' not in src
+    assert "skins.gl_step(" in src and 'guarded("skins", skins.gl_step' not in src
+    i = src.index("def skin_scene():")
+    body = src[i:src.index("def skins_ready():", i)]
+    assert "scene_skin = False" in body and "if scene_skin is None:" in body and "return scene_skin or None" in body
+    assert "skin_scene() or scene_plain" in src, "a failed compile falls back to the plain scene program"
+    # update() itself does no GL when asked not to
+    assert "def gl_step" in (ROOT / "materials.py").read_text(encoding="utf-8")
+
+
+def test_update_without_gl_never_touches_the_texture(tmp_path):
+    eng, lib, ctx = make_engine(tmp_path)
+    st = frame_with(corridor__walls="t0.png")
+    for _ in range(30):
+        eng.update(st.step(1 / 60), 1 / 60, None, gl=False)
+    assert ctx.made == [] and lib.request(("ai", "t0.png")) == -1, "logic only: no allocation, no upload"
+    eng.gl_step(False)
+    assert len(ctx.made) == 1
+
+
 def test_mod_matrix_and_midi_reach_skin_fields(tmp_path):
     c = make(tmp_path)
     do(c, cmd="skin", op="assign", env="corridor", slot="walls", kind="ai", name="a.png")
@@ -271,8 +349,106 @@ def test_mod_matrix_and_midi_reach_skin_fields(tmp_path):
         control.validate(dict(cmd="mod", name="skin:corridor:walls:mix", slot=0, src="bass", amt=1))
     c.skins.midi("corridor", "walls", "scale", 1.0)
     assert c.skins.slots["corridor"]["walls"]["scale"] == 8.0
-    c.skins.midi("corridor", "walls", "mix", 1.0, press=True)
+    c.skins.midi("corridor", "walls", "mix", 1.0, pad=True, press=True)
     assert c.skins.slots["corridor"]["walls"]["mix"] == 1
+
+
+def test_midi_on_stepped_fields_cc_is_absolute_encoder_steps_pad_cycles():
+    """Review #3."""
+    st = mt.SkinState()
+    w = st.slots["corridor"]["walls"]
+    w["mix"] = 4
+    st.midi("corridor", "walls", "mix", 1.0)             # CC 127 with the knob already at the top: stays there
+    assert w["mix"] == 4
+    w["mix"] = 2
+    st.midi("corridor", "walls", "mix", 0.0)             # CC 0: the bottom, not "one step up"
+    assert w["mix"] == 0
+    st.midi("corridor", "walls", "mix", 0.5)
+    assert w["mix"] == 2
+    w["map"] = 1
+    st.midi("corridor", "walls", "map", 1 / 127, rel=1)  # relative encoder: one step per click, clamped
+    assert w["map"] == 2
+    st.midi("corridor", "walls", "map", 1 / 127, rel=1)
+    assert w["map"] == 2
+    st.midi("corridor", "walls", "map", 127 / 127, rel=-1)
+    assert w["map"] == 1
+    st.midi("corridor", "walls", "tile", 1.0, pad=True, press=False)
+    assert w["tile"] == 1
+    st.midi("corridor", "walls", "tile", 1.0, pad=True, press=True)      # a pad steps and wraps
+    assert w["tile"] == 0
+    # the controller's MIDI path: only a NOTE is a pad
+    src = (ROOT / "control.py").read_text(encoding="utf-8")
+    assert 'self.skins.midi(t[0], t[1], t[2], 1.0, pad=True, press=edge)' in src
+    assert 'self.skins.midi(t[0], t[1], t[2], val / 127.0, rel=rel)' in src
+
+
+def test_mod_slot_and_source_are_validated():
+    """Review #9."""
+    base = dict(cmd="skin", op="mod", env="corridor", slot="walls", f="scale", src="bass", amt=0.5)
+    assert mt.validate(dict(base, mslot=1))["mslot"] == 1
+    for bad in (1.0, True, "1", 2, None):
+        with pytest.raises(ValueError):
+            mt.validate(dict(base, mslot=bad))
+    with pytest.raises(ValueError):
+        mt.validate(dict(base, mslot=0, src="not_a_source"))
+    st = mt.SkinState()
+    sdo(st, **{k: v for k, v in dict(base, mslot=1).items() if k != "cmd"})
+    assert st.mods["corridor:walls:scale"][1]["src"] == "bass"
+    j = mt.clean_skins(dict(mods={"corridor:walls:scale": [dict(src="not_a_source", amt=1), dict(src="mid", amt=0.2)]}))
+    assert j["mods"]["corridor:walls:scale"] == [None, dict(src="mid", amt=0.2, rate=1.0, phase=0.0)], "junk sources never persist"
+    st.load(dict(mods={"corridor:walls:scale": [dict(src="nope", amt=1), None]}))
+    assert st.mods == {}
+
+
+# ---------------------------------------------------------------- ships inactive (PR review B21)
+
+
+def test_skins_ship_inactive_and_switch_on_explicitly(tmp_path):
+    c = make(tmp_path, skins_on=False)
+    assert c.skins.on is False and c.state()["skins"]["on"] is False
+    do(c, cmd="skin", op="assign", env="corridor", slot="walls", kind="ai", name="a.png")
+    run(c, 0.1)
+    assert c.skins.frame == {} and not c.skins.any(), "off: whatever the slots hold, the engine is given nothing"
+    do(c, cmd="skin", op="gen", env="corridor", slot="walls", prompt="p")
+    assert c.skins.gen is None and "off" in c.skins.gen_note, "off: no generation job either"
+    do(c, cmd="skin", op="enable", on=True)
+    assert c.skins.frame["corridor"]["walls"]["src"]["name"] == "a.png", "the slot kept what it held"
+    c._autosave()
+    assert json.loads((tmp_path / "live_state.json").read_text())["settings"]["skins_on"] is True
+    c2 = make(tmp_path, skins_on=False, restore=True)
+    assert c2.skins.on is True and c2.skins.any()
+    do(c2, cmd="skin", op="enable", on=False)
+    assert c2.skins.frame == {} and c2.skins.slots["corridor"]["walls"]["src"]["name"] == "a.png"
+    with pytest.raises(ValueError):
+        mt.validate(dict(cmd="skin", op="enable", on="yes"))
+    assert "skins_on" not in shows.clean_settings(c._settings()), "a show file never switches the feature on by itself"
+
+
+def test_switching_skins_off_fades_out_and_frees_the_array(tmp_path):
+    eng, lib, ctx = make_engine(tmp_path)
+    st = frame_with(corridor__walls="t0.png")
+    steps(eng, st, 60)
+    assert eng.vram_bytes() > 0
+    st.enable(False)
+    eng.enabled = False
+    rows = steps(eng, st, 60)
+    assert rows[0][3] > 0.9 and rows[-1][3] == 0.0, "a fade, not a cut"
+    assert ctx.made[0].released and eng.vram_bytes() == 0 and eng.idle()
+    st.enable(True)
+    eng.enabled = True
+    rows = steps(eng, st, 60)
+    assert rows[-1][3] == 1.0 and len(ctx.made) == 2
+
+
+def test_engine_compiles_nothing_for_skins_until_they_are_on():
+    fx_src = (ROOT / "fx_stack.py").read_text(encoding="utf-8")
+    init = fx_src[fx_src.index("class LandPass"):fx_src.index("def skins(self, engine):")]
+    assert "skinned_source(" not in init, "LandPass.__init__ compiles only the original programs"
+    lv = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert lv.count("_land.skins = skins") == 1 and "def skins_ready():" in lv
+    body = lv[lv.index("def skins_ready():"):lv.index("# <skins]", lv.index("def skins_ready():"))]
+    assert "_land.skins = skins" in body and "skin_scene()" in body
+    assert "SkinState(on=False)" in (ROOT / "control.py").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------- tiling maths
@@ -313,36 +489,126 @@ def test_plane_matrix_is_scale_times_rotation():
 
 def test_library_is_one_rgba8_array_with_bounded_vram(tmp_path):
     lib, ctx = make_lib(tmp_path, n=12, size=1024)
-    assert len(ctx.made) == 1 and ctx.made[0].size == (1024, 1024, mt.MAX_LAYERS)
+    assert ctx.made == [] and lib.vram_bytes() == 0, "no skin used: no texture, no VRAM"
+    for i in range(12):                                 # far more images than layers
+        lib.request(("ai", f"t{i}.png"))
+        lib.flush()
+    assert len(ctx.made) == 1 and ctx.made[0].size == (1024, 1024, mt.MAX_LAYERS), "one array, whatever is requested"
     assert ctx.made[0].repeat_x and ctx.made[0].anisotropy == 4.0
     budget = lib.vram_bytes()
     assert budget == mt.vram_bytes(1024) and budget < 46 * 1024 * 1024
     assert mt.vram_bytes(512) < 12 * 1024 * 1024
-    for i in range(12):                                 # far more images than layers
-        lib.request(("ai", f"t{i}.png"))
-        lib.flush()
-    assert len(ctx.made) == 1, "never a second texture, whatever is requested"
-    assert lib.vram_bytes() == budget and lib.status()["resident"] == mt.MAX_LAYERS and lib.evictions == 4
+    assert lib.status()["resident"] == mt.MAX_LAYERS and lib.evictions == 4
     assert lib.status()["vram_mb"] == round(budget / 1048576, 1)
 
 
 def test_uploads_are_chunked_and_never_on_a_late_frame(tmp_path):
+    """The moderngl-only fallback path (no raw GL): level 0 in strips, then one mip build."""
     lib, ctx = make_lib(tmp_path, size=1024)
-    tex = ctx.made[0]
     assert lib.request(("ai", "t0.png")) == -1
     for _ in range(50):
         assert lib.tick(late=True) is False
-    assert tex.writes == [] and lib.deferred == 50, "a late frame gets no upload work at all"
+    assert ctx.made == [] and lib.deferred == 50, "a late frame gets no upload work at all (not even the allocation)"
     steps = 0
     while lib.request(("ai", "t0.png")) < 0:
-        before = len(tex.writes) + tex.mips
         lib.tick(late=False)
-        assert len(tex.writes) + tex.mips - before == 1, "one small piece of GL work per frame"
         steps += 1
         assert steps < 20
+    tex = ctx.made[0]
     assert all(n <= lib.STRIP_BYTES for n, _ in tex.writes) and len(tex.writes) == 4 and tex.mips == 2   # 1 at allocation
     assert [vp[1] for _, vp in tex.writes] == [0, 256, 512, 768] and all(vp[2] == 0 and vp[5] == 1 for _, vp in tex.writes)
     assert lib.tick(False) is False, "nothing pending: tick does nothing"
+
+
+class FakeRaw:
+    """Stands in for materials.RawGL (glTexImage3D / glTexSubImage3D through ctypes)."""
+
+    def __init__(self):
+        self.allocs, self.subs = [], []
+
+    def alloc_levels(self, glo, size, layers):
+        self.allocs.append((size, layers))
+        return True
+
+    def sub(self, glo, level, y, layer, width, rows, arr, offset):
+        assert arr.shape == (width, width, 4) and arr.dtype == np.uint8 and offset == y * width * 4
+        self.subs.append((level, y, layer, width, rows))
+
+
+@pytest.mark.parametrize("size, ticks", [(1024, 6), (512, 2)])
+def test_mips_come_from_the_loader_thread_and_are_uploaded_per_level(tmp_path, size, ticks):
+    """Review #2: never glGenerateMipmap over all 8 layers. Every level of ONE layer is uploaded, <= 1 MB per frame."""
+    raw = FakeRaw()
+    lib, ctx = make_lib(tmp_path, size=size, raw=raw)
+    lib.request(("ai", "t0.png"))
+    per_tick = []
+    while lib.request(("ai", "t0.png")) < 0:
+        n = len(raw.subs)
+        assert lib.tick(False)
+        per_tick.append(sum(w * rows * 4 for _, _, _, w, rows in raw.subs[n:]))
+        assert len(per_tick) < 20
+    tex = ctx.made[0]
+    tex.glo = 1
+    assert raw.allocs == [(size, mt.MAX_LAYERS)] and tex.mips == 0 and tex.writes == [], "no mip generation on the render thread"
+    assert len(per_tick) == ticks and max(per_tick) <= lib.STRIP_BYTES
+    levels = sorted({lv for lv, *_ in raw.subs})
+    assert levels == list(range(int(np.log2(size)) + 1)), "the whole chain down to 1 x 1"
+    for lv in levels:                                    # every row of every level, on the one layer
+        rows = sum(r for l2, _, lay, _, r in raw.subs if l2 == lv)
+        assert rows == size >> lv and all(lay == 0 for _, _, lay, _, _ in raw.subs)
+
+
+def test_mip_chain_is_a_box_filter():
+    a = np.zeros((4, 4, 4), dtype="u1")
+    a[:2, :2] = 200
+    chain = mt.mip_chain(a)
+    assert [c.shape[0] for c in chain] == [4, 2, 1]
+    assert chain[1][0, 0, 0] == 200 and chain[1][1, 1, 0] == 0 and chain[2][0, 0, 0] == 50
+
+
+def test_a_stale_decode_never_cancels_the_new_request(tmp_path):
+    """Review #4a: a result decoded for the old array must not delete the pending entry of the new request."""
+    calls = []
+
+    def loader(path, size):
+        calls.append((path.name, size))
+        return bytes(size * size * 4), 1.0
+
+    d = tmp_path / "textures"
+    d.mkdir()
+    (d / "t0.png").write_bytes(b"x")
+    ctx = FakeCtx()
+    lib = mt.SkinLibrary(ctx, dict(ai=d, art=tmp_path / "art"), size=1024, loader=loader, sync=True)
+    key = ("ai", "t0.png")
+    lib.request(key)                                     # decoded for 1024 (result waits in the queue)
+    lib.set_size(512)
+    lib.request(key)                                     # asked again for 512
+    assert calls == [("t0.png", 1024), ("t0.png", 512)]
+    lib.tick(False)                                      # the stale 1024 result arrives first
+    assert key in lib._pending, "the 512 request is still pending"
+    assert lib.request(key) == -1 and len(calls) == 2, "no duplicate decode"
+    lib.flush()
+    assert lib.request(key) >= 0 and lib.status()["resident"] == 1 and len(ctx.made) == 1 and ctx.made[0].size[0] == 512
+
+
+def test_an_image_nobody_wants_any_more_is_not_uploaded(tmp_path):
+    """Review #4b: tapping through the strip must not upload (or evict for) pictures that were skipped past."""
+    lib, ctx = make_lib(tmp_path, n=4)
+    for i in range(3):
+        lib.request(("ai", f"t{i}.png"))
+    wanted = {("ai", "t2.png")}
+    for _ in range(10):
+        lib.tick(False, (), wanted)
+    assert lib.skipped == 2 and lib.status()["resident"] == 1 and lib.request(("ai", "t2.png")) >= 0
+    assert lib.request(("ai", "t0.png")) == -1
+    assert len(ctx.made[0].writes) == 1, "only the wanted image reached the GPU"
+    # the engine passes its wanted set: a slot that moved on before the decode landed
+    eng, lib2, ctx2 = make_engine(tmp_path / "e", size=1024)
+    st = frame_with(corridor__walls="t0.png")
+    eng.update(st.step(1 / 60), 1 / 60, None, late=True)     # requested, result waits (late frame)
+    st.assign("corridor", "walls", "ai", "t1.png")
+    steps(eng, st, 40)
+    assert lib2.request(("ai", "t0.png")) == -1 and lib2.skipped == 1 and lib2.status()["resident"] == 1
 
 
 def test_a_permanently_late_show_still_gets_its_skin(tmp_path, monkeypatch):
@@ -383,8 +649,13 @@ def test_missing_or_escaping_files_fail_quietly(tmp_path):
 def test_real_decode_gives_square_rgba8(tmp_path):
     from PIL import Image
     Image.new("RGB", (300, 200), (255, 0, 0)).save(tmp_path / "a.png")
-    data, asp = mt.load_image(tmp_path / "a.png", 512)
-    assert len(data) == 512 * 512 * 4 and data[:4] == b"\xff\x00\x00\xff" and abs(asp - 1.5) < 1e-6
+    levels, asp = mt.load_image(tmp_path / "a.png", 512)
+    assert [a.shape for a in levels] == [(512 >> i, 512 >> i, 4) for i in range(10)], "the whole mip chain, off the render thread"
+    assert all(a.dtype == np.uint8 and tuple(a[0, 0]) == (255, 0, 0, 255) for a in levels) and abs(asp - 1.5) < 1e-6
+    big = Image.new("RGBA", (4000, 3000), (0, 255, 0, 255))
+    big.save(tmp_path / "big.png")
+    levels, asp = mt.load_image(tmp_path / "big.png", 512)
+    assert levels[0].shape == (512, 512, 4) and tuple(levels[0][5, 5]) == (0, 255, 0, 255)
 
 
 # ---------------------------------------------------------------- engine side: crossfade, phases, governor
@@ -405,7 +676,8 @@ def test_nothing_skinned_does_no_work(tmp_path):
     for _ in range(20000):
         eng.update(st.frame, 1 / 60)
     assert (time.perf_counter() - t0) / 20000 < 5e-6, "the all-procedural frame costs a dict check"
-    assert not eng.any_active() and ctx.made[0].writes == [] and ctx.made[0].used == [] and eng.binds == 0
+    assert not eng.any_active() and eng.binds == 0
+    assert ctx.made == [] and eng.vram_bytes() == 0 and eng.status()["vram_mb"] == 0.0, "never used: no texture array, zero VRAM"
 
 
 def test_a_skin_fades_in_then_swaps_by_crossfade_without_a_dip(tmp_path):
@@ -474,7 +746,8 @@ def test_beat_sync_scrolls_in_tiles_per_beat(tmp_path):
     assert abs(((sl.pu - p0) % 2.0) - 0.5) < 1e-6
 
 
-def test_no_per_frame_allocation_while_a_skin_runs(tmp_path):
+def test_nothing_is_retained_per_frame_while_a_skin_runs(tmp_path):
+    """Retained memory only: a skinned frame still creates short-lived floats / one small tuple (documented)."""
     eng, lib, _ = make_engine(tmp_path)
     st = frame_with(corridor__walls="t0.png", corridor__floor="t1.png")
     sdo(st, op="set", env="corridor", slot="walls", set=dict(scroll=0.5))
@@ -486,28 +759,77 @@ def test_no_per_frame_allocation_while_a_skin_runs(tmp_path):
         eng.advance("corridor", 0.02)
     b = tracemalloc.take_snapshot()
     tracemalloc.stop()
-    grown = sum(s.size_diff for s in b.compare_to(a, "filename") if "materials.py" in str(s.traceback))
+    grown = sum(x.size_diff for x in b.compare_to(a, "filename") if "materials.py" in str(x.traceback))
     assert grown < 4096, f"{grown} bytes kept after 600 frames"
 
 
-def test_governor_lowers_resolution_then_drops_to_procedural(tmp_path):
-    eng, lib, ctx = make_engine(tmp_path, size=1024)
-    eng.base_size = eng.want_size = 1024
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def make_governed(tmp_path):
+    lib, ctx = make_lib(tmp_path, size=1024)
+    clk = Clock()
+    eng = mt.SkinEngine(None, None, lib=lib, clock=clk)
+    return eng, lib, ctx, clk
+
+
+def test_governor_decision_lowers_resolution_then_drops_to_procedural(tmp_path):
+    eng, lib, ctx, clk = make_governed(tmp_path)
     st = frame_with(corridor__walls="t0.png")
     steps(eng, st, 60)
     full = eng.vram_bytes()
-    eng.govern(1)
+    eng.govern(1)                                        # the governor APPLIED a reduction
     rows = steps(eng, st, 120)
-    assert lib.size == 512 and eng.vram_bytes() < full / 3.5 and rows[-1][3] == 1.0, "strained: 512 px, skin back on"
+    assert lib.size == 512 and eng.vram_bytes() < full / 3.5 and rows[-1][3] == 1.0, "512 px, skin back on"
     amts = [r[3] for r in rows]
     assert max(abs(b - a) for a, b in zip(amts, amts[1:])) <= (1 / 60) / mt.FADE_S + 1e-6, "the change is a fade, never a cut"
     assert ctx.made[0].released and len(ctx.made) == 2
-    eng.govern(2)
+    eng.govern(2)                                        # its last-resort step
     rows = steps(eng, st, 60)
     assert rows[-1][3] == 0.0 and not eng.any_active() and eng.status()["procedural"]
-    eng.govern(0)
+    eng.govern(0)                                        # restored: skins come back at once, still small
+    rows = steps(eng, st, 80)
+    assert rows[-1][3] == 1.0 and lib.size == 512
+    clk.t += mt.UPSIZE_CALM_S + 1
+    eng.govern(0)                                        # the big array only after a long calm
     rows = steps(eng, st, 160)
     assert lib.size == 1024 and rows[-1][3] == 1.0
+
+
+def test_no_reload_storm_when_the_governor_decision_flips(tmp_path):
+    """Review #1: a decision that comes and goes costs ONE shrink; nothing is reloaded again until a long calm."""
+    eng, lib, ctx, clk = make_governed(tmp_path)
+    st = frame_with(corridor__walls="t0.png")
+    steps(eng, st, 60)
+    for i in range(40):                                  # 0 / 1 / 0 / 1 ... every half second for 20 s
+        eng.govern(i % 2)
+        steps(eng, st, 30)
+        clk.t += 0.5
+    assert len(ctx.made) == 2 and lib.size == 512, "one reallocation in total"
+    assert lib.allocs == 2 and lib.evictions == 0
+
+
+def test_governor_skin_quality_follows_applied_steps_not_the_raw_level():
+    import governor
+    g = governor.Governor(sensors=None, mode="off", log=lambda *a: None)
+    g.level = 2                                          # raw strain, but the governor is OFF: it decided nothing
+    assert g.skin_quality() == 0
+    g.mode = "suggest"
+    assert g.skin_quality() == 0, "a suggestion that was not applied changes nothing"
+    res = next(s for s in g.steps if s.cat == 0)
+    assert g._apply(res.id, "perf")
+    assert g.skin_quality() == 1
+    floor = next(s for s in g.steps if s.cat >= 3)
+    assert g._apply(floor.id, "perf")
+    assert g.skin_quality() == 2
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert "_q = gov.skin_quality()" in src and "skins.govern(_q)" in src
+    assert "skins.govern(_lvl)" not in src and "skins.govern(gov.level" not in src, "never the raw level"
 
 
 # ---------------------------------------------------------------- generate a skin
@@ -543,13 +865,76 @@ def test_generate_a_skin_waits_for_calm_and_an_idle_worker_then_assigns():
     assert len(ai.jobs) == 1
     job = ai.jobs[0]
     assert job["show"] is False and job["n"] == 1 and job["init"] is None and job["prompt"].startswith("glowing coral lattice")
-    assert "seamless" in job["prompt"]
+    assert "seamless" in job["prompt"] and job["tag"] == "skin1"
     st.gen_tick(4.0, ai.status(), ai.submit)
     assert len(ai.jobs) == 1 and not st.any()
     ai.st["done"] = ai.st["done"] + [dict(id=2, name="gen_other.png", prompt="something else"),
                                      dict(id=3, name="gen_new.png", prompt=job["prompt"][:80])]
     assert st.gen_tick(5.0, ai.status(), ai.submit) == "gen_new.png"
     assert st.slots["corridor"]["walls"]["src"] == dict(kind="ai", name="gen_new.png") and st.gen is None
+
+
+def test_generate_matches_by_job_tag_not_by_prompt():
+    """Review #10: a manual AI job with the same prompt must not be taken for the skin."""
+    st, ai = mt.SkinState(), FakeAI()
+    ai.st["loaded"] = True
+    results = {}
+    sdo(st, op="gen", env="vortex", slot="walls", prompt="x" * 200)
+    st.gen_tick(0.0, ai.status(), ai.submit, result=results.get)
+    job = ai.jobs[0]
+    ai.st["done"] = ai.st["done"] + [dict(id=7, name="gen_manual.png", prompt=job["prompt"][:80])]     # same prompt prefix, another job
+    assert st.gen_tick(1.0, ai.status(), ai.submit, result=results.get) is None and not st.any()
+    results[job["tag"]] = "gen_mine.png"
+    assert st.gen_tick(2.0, ai.status(), ai.submit, result=results.get) == "gen_mine.png"
+    assert st.slots["vortex"]["walls"]["src"]["name"] == "gen_mine.png"
+
+
+def test_generate_never_overwrites_a_slot_the_performer_changed_meanwhile():
+    st, ai = mt.SkinState(), FakeAI()
+    results = {}
+    sdo(st, op="gen", env="vortex", slot="walls", prompt="p")
+    st.gen_tick(0.0, ai.status(), ai.submit, result=results.get)
+    st.assign("vortex", "walls", "art", "my choice.jpg")          # the performer picked something while it rendered
+    results[ai.jobs[0]["tag"]] = "gen_late.png"
+    assert st.gen_tick(1.0, ai.status(), ai.submit, result=results.get) is None
+    assert st.slots["vortex"]["walls"]["src"] == dict(kind="art", name="my choice.jpg") and st.gen is None
+    assert "left alone" in st.gen_note
+
+
+def test_generate_does_not_cold_load_the_model_without_free_vram():
+    st, ai = mt.SkinState(), FakeAI()
+    ai.st["loaded"] = False
+    sdo(st, op="gen", env="vortex", slot="walls", prompt="p")
+    st.gen_tick(0.0, ai.status(), ai.submit, vram_free_mb=900)
+    assert ai.jobs == [] and "VRAM" in st.gen_note, "one click must not load 2.5 GB onto a full card"
+    st.gen_tick(1.0, ai.status(), ai.submit, strained=True, vram_free_mb=3500)
+    assert ai.jobs == [], "calm is re-checked at the moment of sending"
+    st.gen_tick(2.0, ai.status(), ai.submit, vram_free_mb=3500)
+    assert len(ai.jobs) == 1 and "loading" in st.gen_note
+    st2 = mt.SkinState()
+    sdo(st2, op="gen", env="vortex", slot="walls", prompt="p")
+    st2.gen_tick(0.0, ai.status(), lambda j: None, vram_free_mb=900)
+    st2.gen_tick(mt.GEN_WAIT_S + 1, ai.status(), lambda j: None, vram_free_mb=900)
+    assert st2.gen is None, "it does not wait for ever"
+
+
+def test_ai_link_matches_tagged_jobs_by_worker_id():
+    import ai_link
+    link = ai_link.AIClient([], start=False)
+    sent = []
+
+    def http(path, body=None, timeout=None):
+        if path == "/job":
+            sent.append(dict(body))
+            return dict(id=41)
+        return dict(done=[dict(id=40, name="other.png", prompt="p"), dict(id=41, name="mine.png", prompt="p")], queue=[])
+
+    link._http = http
+    link._send_job(dict(prompt="p", show=False, tag="skin3"))
+    assert "tag" not in sent[0], "the tag is the link's own business, the worker never sees it"
+    assert link.tagged("skin3") is None
+    link.poll_once()
+    assert link.tagged("skin3") == "mine.png" and link.tagged("skin3") is None
 
 
 def test_generate_gives_up_without_a_worker_and_can_be_cancelled():
@@ -676,20 +1061,28 @@ def test_gl_every_world_takes_a_skin_in_every_mapping_and_mix(rig):
 
 
 def test_gl_black_floor_and_no_blowout(rig):
+    """A skin never lights the room more than the world's own look does: black stays black (dark paint is keyed out),
+    nothing clips to white, even at brightness 2."""
     fx, lp, eng = rig
     lp.skins = eng
-    for name in tex_names(3):
-        for mode, env in enumerate(mt.LAND_ENVS):
+    for mode, env in enumerate(mt.LAND_ENVS):
+        settle(eng, mt.SkinState())
+        base = gl_shot(fx, lp, land_a=mode)[..., :3].astype("f4") / 255.0
+        base_black = (base.max(axis=2) < 0.08).mean()
+        for name in tex_names(3):
             st = mt.SkinState()
             for slot in mt.ENVS[env]["slots"]:
                 st.assign(env, slot, "ai", name)
-                sdo(st, op="set", env=env, slot=slot, set=dict(bright=2.0))
-            settle(eng, st)
-            img = gl_shot(fx, lp, land_a=mode)[..., :3].astype("f4") / 255.0
-            lum = img.max(axis=2)
-            assert (lum > 0.97).mean() < 0.02, f"{env} {name}: blown out"
-            assert (lum < 0.06).mean() > 0.04, f"{env} {name}: no black left (black = no light)"
-            assert img.mean() < 0.55
+            for bright in (2.0, 1.0):
+                for slot in mt.ENVS[env]["slots"]:
+                    sdo(st, op="set", env=env, slot=slot, set=dict(bright=bright))
+                settle(eng, st)
+                img = gl_shot(fx, lp, land_a=mode)[..., :3].astype("f4") / 255.0
+                lum = img.max(axis=2)
+                assert (lum > 0.97).mean() < 0.02, f"{env} {name}: blown out"
+                assert img.mean() < max(0.45, base.mean() * 1.5), f"{env} {name}: brighter than the world itself"
+            assert img.mean() < base.mean() * 1.5 + 0.02, f"{env} {name}: at brightness 1 a skin lights the room about as much as the world did"
+            assert (lum < 0.08).mean() > min(0.04, base_black * 0.4), f"{env} {name}: the black of the procedural look is gone"
 
 
 def test_gl_wrap_and_travel_have_no_pop(rig):
@@ -703,13 +1096,21 @@ def test_gl_wrap_and_travel_have_no_pop(rig):
         sdo(st, op="set", env=env, slot=slot, set=dict(rot=33.0, scale=1.7))
         settle(eng, st)
         sl = eng._slots[env][0]
+        gl_shot(fx, lp, land_a=mode)                     # the pass's first frame carries a start-up travel step: get it out of the way
         sl.pu, sl.pv = 1.9990, 0.0005
         eng.update(st.step(0.0), 0.0)
         a = gl_shot(fx, lp, land_a=mode).astype("f4")
         sl.pu, sl.pv = (1.9990 + 0.002) % 2.0, (0.0005 - 0.001) % 2.0        # both cross the wrap
         eng.update(st.step(0.0), 0.0)
         b = gl_shot(fx, lp, land_a=mode).astype("f4")
-        assert np.abs(a - b).mean() < 1.2, f"{env}: crossing the phase wrap must look like any other tiny step"
+        sl.pu, sl.pv = 0.7000, 0.9000                                        # the same step far from any wrap
+        eng.update(st.step(0.0), 0.0)
+        c = gl_shot(fx, lp, land_a=mode).astype("f4")
+        sl.pu, sl.pv = 0.7020, 0.8990
+        eng.update(st.step(0.0), 0.0)
+        d = gl_shot(fx, lp, land_a=mode).astype("f4")
+        step, plain = np.abs(a - b).mean(), np.abs(c - d).mean()
+        assert step < 1.6 * plain + 0.4, f"{env}: crossing the phase wrap ({step:.2f}) must look like any other tiny step ({plain:.2f})"
 
 
 def test_gl_no_seam_at_the_angle_cut(rig):
@@ -800,6 +1201,20 @@ def test_gl_state_is_restored(rig):
     probe.release()
 
 
+def gpu_ms2(ctx, draw_a, draw_b, n=40, warm=6):
+    """Median GPU times of two draws measured alternately (ms)."""
+    out = ([], [])
+    for i in range(n + warm):
+        for k, draw in enumerate((draw_a, draw_b)):
+            q = ctx.query(time=True)
+            with q:
+                draw()
+            ctx.finish()
+            if i >= warm:
+                out[k].append(q.elapsed / 1e6)
+    return float(np.median(out[0])), float(np.median(out[1]))
+
+
 def gpu_ms(ctx, draw, n=40, warm=6):
     """Median GPU time of draw() in ms (timer queries)."""
     out = []
@@ -833,19 +1248,21 @@ def test_gl_cost_budget(ctx):
                     p.render(v, clock, 4.0, 0.0, 0.0, fx.GALLERY_PALETTE, (0.5, 0.3, 0.2))
 
                 settle(eng, mt.SkinState())
-                pre = gpu_ms(ctx, lambda: draw(lp0))             # the pre-skin build (no engine attached)
-                off = gpu_ms(ctx, lambda: draw(lp))              # engine attached, every slot procedural
+                # interleaved, so thermal drift hits both alike: the pre-skin build (no engine attached) and the
+                # same pass with the engine attached and every slot procedural
+                pre, off = gpu_ms2(ctx, lambda: draw(lp0), lambda: draw(lp))
                 st = mt.SkinState()
                 for slot in mt.ENVS[env]["slots"]:
                     st.assign(env, slot, "ai", name)
                 settle(eng, st)
-                on = gpu_ms(ctx, lambda: draw(lp))
+                pre2, on = gpu_ms2(ctx, lambda: draw(lp0), lambda: draw(lp))
+                on += pre - pre2                                  # same baseline as the first pair
                 report.append((res, env, pre, off, on))
         print()
         for res, env, pre, off, on in report:
             print(f"[skin cost] land_res {res:.1f} {env:9s} pre-skin {pre:.3f} ms  procedural {off:.3f} ms  skinned {on:.3f} ms  (+{on - off:.3f})")
         for res, env, pre, off, on in report:
-            assert off - pre < max(0.08, 0.06 * pre), f"{env}: procedural must cost what the pre-skin build costs"
+            assert abs(off - pre) < max(0.06, 0.05 * pre), f"{env}: procedural must cost what the pre-skin build costs"
             assert on - off <= 0.30, f"{env} at land_res {res}: a skin costs {on - off:.3f} ms (> 0.3)"
     finally:
         lp.release()
@@ -872,7 +1289,7 @@ def test_panel_skins_card_assigns_by_click_and_by_drag(tmp_path):
     s.close()
     rc = RemoteControl(port=port, token="tok", quiet=True, host="127.0.0.1", art_dir=tmp_path / "art", tex_dir=tmp_path / "tex")
     rc.start()
-    ctl = control.Controller(tmp_path, midi=False, ai=False, art_dir=tmp_path / "art")
+    ctl = control.Controller(tmp_path, midi=False, ai=False, art_dir=tmp_path / "art", restore=False)
     stop = threading.Event()
 
     def loop():
@@ -902,6 +1319,14 @@ def test_panel_skins_card_assigns_by_click_and_by_drag(tmp_path):
             page.goto(f"http://127.0.0.1:{port}/?k=tok")
             page.wait_for_function("window.__panel && window.__skins", timeout=10000)
             page.click('#tabs button[data-tab="land"]')
+            # ships OFF: one switch and one honest line; no slots, no strip, no generate box, no /sources request
+            page.wait_for_selector("#skins-land .sksw", timeout=8000)
+            assert not ctl.skins.on and page.inner_text("#skins-land .sksw") == "SKINS: OFF"
+            assert page.locator("#skins-land .sksl:visible").count() == 0 and page.locator("#skins-land .skgen:visible").count() == 0
+            assert page.locator("#skins-land .skstrip .skt").count() == 0
+            page.click("#skins-land .sksw")
+            page.wait_for_timeout(300)
+            assert ctl.skins.on
             page.wait_for_selector("#skins-land .skstrip .skt", timeout=8000)
             assert page.locator("#skins-land .sksl").count() == 6, "corridor 2 + torus 2 + vortex 1 + hexdome 1"
             # touch path: tap a slot, then an image
@@ -952,40 +1377,166 @@ def test_panel_skins_card_assigns_by_click_and_by_drag(tmp_path):
 
 
 def test_gl_scene_shader_without_a_skin_is_the_pre_skin_shader(ctx):
-    """The travel-tunnel hook in SCENE_FS: with no skin the block is skipped. Same pixels and the same GPU time as the
-    shader with the hook cut out again (the pre-skin build)."""
+    """The engine draws SCENE_FS_PLAIN (no skin code at all) unless a skin is on the travel tunnel; SCENE_FS (with the
+    block) at amount 0 gives the same picture. Prints what the skipped block would have cost had it been left in."""
     import moderngl
     import live_visuals as lv
-    fs = lv.SCENE_FS
-    assert fs.count("// [skins>") == 1 and fs.count("// <skins]") == 1
-    pre = fs[:fs.index("  // [skins>")] + fs[fs.index("  // <skins]") + len("  // <skins]"):]
-    pre = pre.replace(mt.glsl(1, "palette"), "")
-    assert "texSkin" not in pre and "skA" not in pre
+    plain, fs = lv.SCENE_FS_PLAIN, lv.SCENE_FS
+    assert "texSkin" not in plain and "skA" not in plain and "skins>" not in plain and "SKIN_GLSL" not in plain
+    assert fs.count("// [skins>") == 1 and fs.count("// <skins]") == 1 and "sampler2DArray texSkin" in fs
+    cutout = fs[:fs.index("  // [skins>")] + fs[fs.index("  // <skins]") + len("  // <skins]"):]
+    assert cutout.replace(mt.glsl(1, "palette"), "").split() == plain.split(), "plain = the scene minus the skin block, nothing else"
+    src_engine = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert "scene_prog = ctx.program(vertex_shader=VS, fragment_shader=SCENE_FS_PLAIN)" in src_engine
     size = (1280, 800)
     quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
     fbo = ctx.framebuffer(color_attachments=[ctx.texture(size, 4, dtype="f2"), ctx.texture(size, 4, dtype="f2")])
     sets = dict(p_symmetry=1.0, p_folds=8.0, p_l_kene=1.0, p_l_beads=0.6, p_l_lines=0.5, p_master=1.0, aspect=1.6, pxh=1 / 800,
                 p_density=0.5, p_saturation=1.0, limiter=1.0, coreOn=1.0, p_travel_mode=1.0, t=3.0, tK=0.3, bass=0.4)
-    out = []
-    for src in (pre, fs):
+    vaos, progs = [], []
+    for src in (plain, fs):
         prog = ctx.program(vertex_shader=lv.VS, fragment_shader=src)
         for k, v in sets.items():
             if k in prog:
                 prog[k].value = v
         if "pal" in prog:
             prog["pal"].write(np.array([(0, .85, .8), (1, .05, .55), (1, .7, .05), (.28, .1, 1), (.1, .9, .3)], dtype="f4").tobytes())
-        vao = ctx.vertex_array(prog, [(quad, "2f", "in_pos")])
-        fbo.use()
-        ctx.viewport = (0, 0) + size
-        ctx.disable(moderngl.BLEND)
-        ms = gpu_ms(ctx, lambda: vao.render(moderngl.TRIANGLE_STRIP), n=30)
-        img = np.frombuffer(fbo.read(components=3, attachment=0, dtype="f4"), dtype="f4").copy()
-        out.append((ms, img))
-        vao.release()
-        prog.release()
+        progs.append(prog)
+        vaos.append(ctx.vertex_array(prog, [(quad, "2f", "in_pos")]))
+    fbo.use()
+    ctx.viewport = (0, 0) + size
+    ctx.disable(moderngl.BLEND)
+    times, imgs = [[], []], []
+    for it in range(30):                                 # interleaved, so drift / throttling hits both alike
+        for i, vao in enumerate(vaos):
+            q = ctx.query(time=True)
+            with q:
+                vao.render(moderngl.TRIANGLE_STRIP)
+            ctx.finish()
+            if it >= 5:
+                times[i].append(q.elapsed / 1e6)
+    for vao in vaos:
+        vao.render(moderngl.TRIANGLE_STRIP)
+        imgs.append(np.frombuffer(fbo.read(components=3, attachment=0, dtype="f4"), dtype="f4").copy())
     ctx.screen.use()
-    (ms_pre, a), (ms_now, b) = out
-    print(f"\n[skin cost] scene shader 1280x800: pre-skin {ms_pre:.3f} ms, with the (skipped) tunnel hook {ms_now:.3f} ms")
-    assert a.max() > 0.05, "the test picture must not be black"
-    assert np.array_equal(a, b), "no skin: the scene must be the pre-skin picture bit for bit"
-    assert ms_now - ms_pre < max(0.10, 0.05 * ms_pre)
+    for o in vaos + progs:
+        o.release()
+    print(f"\n[skin cost] scene shader 1280x800: plain (what the show runs) {np.median(times[0]):.3f} ms; "
+          f"with the tunnel block compiled in but skipped {np.median(times[1]):.3f} ms")
+    assert imgs[0].max() > 0.05, "the test picture must not be black"
+    assert np.array_equal(imgs[0], imgs[1]), "amount 0: the skinned program draws the plain picture bit for bit"
+
+
+def test_gl_engine_tunnel_skin_end_to_end(tmp_path):
+    """The real engine, headless: no skin = no bind and no upload; a skin on the tunnel changes the picture, stays finite."""
+    import subprocess
+    name = tex_names(1)[0]
+    (tmp_path / "skins.json").write_text(json.dumps(dict(slots={"tunnel:walls": dict(src=dict(kind="ai", name=name), mix=4)})))
+    outs = []
+    for tag, extra in (("plain", []), ("skin", ["--skins", str(tmp_path / "skins.json")])):
+        r = subprocess.run([sys.executable, str(ROOT / "live_visuals.py"), "--test", "24", "--out", str(tmp_path / tag),
+                            "--set", "travel=0.6", "--set", "travel_mode=1", "--test-audio", "silent"] + extra,
+                           capture_output=True, text=True, timeout=120, cwd=str(ROOT))
+        assert r.returncode == 0, r.stdout[-800:] + r.stderr[-800:]
+        outs.append(r.stdout)
+    assert "[skins] binds=0 uploads=0" in outs[0], "no skin: the engine never binds or uploads a skin texture"
+    assert "ready=0 arrays=0" in outs[0] and "vram_mb=0.0" in outs[0], "inactive: no skinned programs, no texture array"
+    assert "nonfinite=0" in outs[1] and "[skins] binds=0" not in outs[1] and "uploads=0" not in outs[1]
+    assert "ready=1 arrays=1" in outs[1]
+    from PIL import Image
+    a = np.asarray(Image.open(sorted((tmp_path / "plain").glob("frame_*.png"))[-1]).convert("RGB")).astype("f4")
+    b = np.asarray(Image.open(sorted((tmp_path / "skin").glob("frame_*.png"))[-1]).convert("RGB")).astype("f4")
+    assert np.abs(a - b).mean() > 1.0
+
+
+
+def test_gl_uploads_never_rebuild_mips_and_every_step_is_small(ctx):
+    """Review #2 on the real GPU: mips come from the loader thread, each level goes up with glTexSubImage3D, no
+    glGenerateMipmap after a load, and no single upload step is long (1024 px, glFinish included)."""
+    name = tex_names(1)[0]
+    lib = mt.SkinLibrary(ctx, mt.roots_for(TEX, ROOT / "art"), size=1024, sync=True)
+    try:
+        assert lib.tex is None and lib.vram_bytes() == 0, "allocated on first use only"
+        lib.request(("ai", name))
+        worst, n = 0.0, 0
+        while lib.request(("ai", name)) < 0:
+            t0 = time.perf_counter()
+            lib.tick(False)
+            ctx.finish()
+            if n:                                        # the first step also allocates the array (once per show)
+                worst = max(worst, (time.perf_counter() - t0) * 1000.0)
+            n += 1
+            assert n < 30
+        if lib.raw is None:
+            pytest.skip("raw GL uploads unavailable here: the moderngl fallback is in use")
+        assert lib.mips == 0, "glGenerateMipmap must never run for a loaded skin"
+        assert n == 6 and worst < 3.0, f"{n} steps, worst {worst:.2f} ms"
+        print(f"\n[skin cost] 1024 px skin upload: {n} frames, worst step {worst:.2f} ms (no mip rebuild)")
+    finally:
+        lib.release()
+
+
+def test_gl_per_level_uploads_match_the_gl_generated_mips(ctx):
+    """The ctypes path puts every level into the right level / layer: a far, minified view (high mips) looks like the
+    same view with GL-generated mips."""
+    import fx_stack as fx
+    name = tex_names(2)[1]
+    shots = []
+    for raw in (None, False):
+        lib = mt.SkinLibrary(ctx, mt.roots_for(TEX, ROOT / "art"), size=512, sync=True, raw=raw)
+        eng = mt.SkinEngine(None, None, lib=lib)
+        eng.fade_s = 0.0
+        lp = fx.LandPass(ctx, OUT)
+        lp.settle_s = 0.0
+        lp.skins = eng
+        try:
+            st = mt.SkinState()
+            st.assign("vortex", "walls", "ai", name)
+            sdo(st, op="set", env="vortex", slot="walls", set=dict(scale=4.0, mix=0))
+            settle(eng, st)
+            if raw is None and lib.raw is None:
+                pytest.skip("raw GL uploads unavailable here")
+            shots.append(gl_shot(fx, lp, land_a=2, land_res=0.25).astype("f4"))
+        finally:
+            lp.release()
+            eng.release()
+    assert shots[0].max() > 30
+    assert np.abs(shots[0] - shots[1]).mean() < 3.0, "box-filtered CPU mips and GL mips must agree closely"
+
+
+def test_gl_cost_budget_triplanar_two_images_and_1024(ctx):
+    """Review #15: the 0.3 ms budget also holds for the expensive cases: triplanar (3 fetches), two DIFFERENT images
+    on a two-slot world, and the 1024 px array."""
+    import fx_stack as fx
+    size = (1280, 800)
+    a, b = tex_names(2)
+    lp, lp0 = fx.LandPass(ctx, size), fx.LandPass(ctx, size)
+    eng = mt.SkinEngine(ctx, mt.roots_for(TEX, ROOT / "art"), size=1024, sync=True)
+    eng.fade_s = 0.0
+    lp.skins = eng
+    rows = []
+    try:
+        for mode, env in ((0, "corridor"), (1, "torus")):
+            v = fx.default_values(land_a=mode, land_res=1.0)
+            clock = fx.make_clock(4.0)
+
+            def draw(pss):
+                pss.render(v, clock, 4.0, 0.0, 0.0, fx.GALLERY_PALETTE, (0.5, 0.3, 0.2))
+
+            for mp in (0, 1):
+                st = mt.SkinState()
+                for slot, nm in zip(mt.ENVS[env]["slots"], (a, b)):
+                    st.assign(env, slot, "ai", nm)
+                    sdo(st, op="set", env=env, slot=slot, set=dict(map=mp))
+                settle(eng, st)
+                pre, on = gpu_ms2(ctx, lambda: draw(lp0), lambda: draw(lp))
+                rows.append((env, mp, pre, on))
+        print()
+        for env, mp, pre, on in rows:
+            print(f"[skin cost] 1024 px, two images, {env:9s} {'triplanar' if mp else 'surface  '} pre-skin {pre:.3f} ms  skinned {on:.3f} ms  (+{on - pre:.3f})")
+        for env, mp, pre, on in rows:
+            assert on - pre <= 0.30, f"{env} map {mp}: +{on - pre:.3f} ms"
+    finally:
+        lp.release()
+        lp0.release()
+        eng.release()

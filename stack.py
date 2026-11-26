@@ -572,7 +572,7 @@ class StackState:
                     self.mods[f"{new['id']}:{f}"] = copy.deepcopy(v)
             src = self._ph.get(lay["id"])
             if src:                                  # the copy starts exactly on top of the original
-                self._ph[new["id"]] = dict(src, op=0.0)
+                self._ph[new["id"]] = dict(copy.deepcopy(src), op=0.0)   # its own runtime state (ph["v"] is a dict)
             self.edits += 1
         elif op == "move":
             self.layers.remove(lay)
@@ -870,6 +870,7 @@ uniform float aspect, amount;
 in vec2 v_uv; out vec4 f;
 const float TAU = 6.28318530718, PI = 3.14159265359;
 
+// sine hash in the form used in Inigo Quilez's MIT-licensed shaders, Copyright (c) 2013 Inigo Quilez, MIT License (THIRD_PARTY_NOTICES.md)
 float h11(float n){ return fract(sin(n*127.1+311.7)*43758.5453); }
 float max3(vec3 c){ return max(c.r, max(c.g, c.b)); }
 vec3 hueRot(vec3 c, float a){

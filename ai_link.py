@@ -22,8 +22,11 @@ class AIClient:
         self._lock = threading.Lock()
         self._jobs = []                 # (due time, job dict)
         self._cancel = False
+        self._offload = False           # governor.py power balance: move the idle model off the GPU
         self._show_ids = set()
         self._shown = []
+        self._tags = {}                 # worker job id -> the caller's tag (job["tag"]): results matched by job id
+        self._tagged = {}               # tag -> file name of the finished image
         self._status = {"available": False, "error": "starting" if start else "off"}
         self._note = ""                 # last submit error, shown in the panel until the next good submit
         self._stop = threading.Event()
@@ -40,6 +43,12 @@ class AIClient:
         with self._lock:
             if len(self._jobs) < 32:
                 self._jobs.append((time.monotonic() + max(0.0, delay), dict(job)))
+        self._wake.set()
+
+    def offload(self):
+        """Ask the worker to move its idle model to system RAM (it comes back on the next image)."""
+        with self._lock:
+            self._offload = True
         self._wake.set()
 
     def set_hold(self, on):
@@ -126,7 +135,10 @@ class AIClient:
                 due = self._take_due(now)
                 with self._lock:
                     cancel, self._cancel = self._cancel, False
+                    offl, self._offload = self._offload, False
                     wait = min([t - now for t, _ in self._jobs if not self.hold] + [self.poll_s])
+                if offl:
+                    self._try(lambda: self._http("/offload", {}), "offload")
                 if cancel:
                     self._try(lambda: self._http("/cancel", {}), "cancel")
                     with self._lock:
@@ -151,12 +163,25 @@ class AIClient:
             self._note = f"{what} failed: {ex}"[:200]
             return None
 
+    def tagged(self, tag):
+        """File name of the finished job that was submitted with job["tag"] == tag (once), else None."""
+        if not self._tagged:
+            return None
+        with self._lock:
+            return self._tagged.pop(tag, None)
+
     def _send_job(self, job):
         show = bool(job.get("show"))
+        tag = job.pop("tag", None) if isinstance(job, dict) else None      # ours, not the worker's
         out = self._try(lambda: self._http("/job", job), "generate")
-        if out is not None and show and "id" in out:
+        if out is not None and "id" in out:
             with self._lock:
-                self._show_ids.add(out["id"])
+                if show:
+                    self._show_ids.add(out["id"])
+                if tag is not None:
+                    self._tags[out["id"]] = tag
+                    while len(self._tags) > 64:
+                        self._tags.pop(next(iter(self._tags)))
         return out
 
     def poll_once(self):
@@ -171,6 +196,7 @@ class AIClient:
         queue_ = s.get("queue") if isinstance(s.get("queue"), list) else []
         clean = dict(available=True, loaded=bool(s.get("loaded")), loading=bool(s.get("loading")),
                      busy=bool(s.get("busy")), queue=len(queue_), error=str(s.get("error") or "")[:300],
+                     on_gpu=bool(s.get("on_gpu", s.get("loaded"))),
                      base=str(s.get("base") or "")[:60], done=[])
         with self._lock:
             for d in done[-8:]:
@@ -180,6 +206,8 @@ class AIClient:
                 clean["done"].append(dict(id=d.get("id"), name=str(name)[:120] if name else "",
                                           prompt=str(d.get("prompt") or "")[:80], secs=d.get("secs")))
             for d in done:
+                if isinstance(d, dict) and d.get("id") in self._tags and isinstance(d.get("name"), str):
+                    self._tagged[self._tags.pop(d["id"])] = d["name"]
                 if isinstance(d, dict) and d.get("id") in self._show_ids and isinstance(d.get("name"), str):
                     self._show_ids.discard(d["id"])
                     self._shown.append(d["name"])

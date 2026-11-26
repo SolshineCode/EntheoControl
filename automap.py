@@ -31,6 +31,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 CALIB_DIR = HERE / "calibration"
 PATTERN_LEVEL = 170            # white of the calibration patterns (of 255): bright enough, not blinding
+LEVEL_MAX = 190                # never brighter, whatever the camera needs (patterns are static, but full-frame)
 HOLD_S = 0.5                   # every pattern stays at least this long (<= 2 changes per second)
 STRIPE = 4                     # Gray code resolution, projector px per code step (camera can't resolve finer)
 ARUCO_GRID = (6, 4)            # markers across x down
@@ -45,7 +46,7 @@ AI_MAX_POLYS = 12
 
 # per-camera profiles (calibration/<profile>/pose<n>/): how to capture with that kind of camera
 PROFILES = {
-    "builtin": dict(label="Built-in webcam", n_avg=3, settle=1.6, level=200),   # auto exposure, noisy, often mirrored
+    "builtin": dict(label="Built-in webcam", n_avg=3, settle=1.6, level=190),   # auto exposure, noisy, often mirrored
     "usb": dict(label="USB webcam", n_avg=1, settle=1.0, level=PATTERN_LEVEL),
 }
 BUILTIN_NAME = r"(integrated|built-?in|facetime|internal|hd (web)?cam|front)"
@@ -97,7 +98,7 @@ def gray_nbits(n, stripe=STRIPE):
 def gray_sequence(w, h, stripe=STRIPE, level=PATTERN_LEVEL):
     """[(key, image)]: white, black, then for x and y every Gray-code bit (MSB first) and its inverse.
     stripe = projector px per code step (wider for a low-res / far camera), level = white (dim room: brighter)."""
-    level = int(min(max(level, 60), 235))
+    level = int(min(max(level, 60), LEVEL_MAX))
     seq = [("white", np.full((h, w), level, np.uint8)), ("black", np.zeros((h, w), np.uint8))]
     for axis, n in (("x", w), ("y", h)):
         nb = gray_nbits(n, stripe)
@@ -813,6 +814,7 @@ class AutoMap:
         self._load_profile()
         self.step, self.busy, self.msg, self.err, self.progress = "idle", False, "", "", 0.0
         self.scene = None                                # (grey, black) camera stills of the scene
+        self.scene_person = (None, False)                # (person mask, segmentation trusted) taken with the scene
         self.found = []                                  # candidate faces (camera px)
         self.made = []                                   # surface ids created by the last "create"
         self.report = []                                 # per-surface verify result
@@ -858,6 +860,9 @@ class AutoMap:
             raise CalibError("cancelled")
         n0 = self._shown_id()
         self._show(img)
+        if self._cancel.is_set():                        # cancelled while we were putting it up: take it down again
+            self._show(None)
+            raise CalibError("cancelled")
         t0 = self.clock()
         while self._shown_id() <= n0:
             if self._cancel.is_set():
@@ -868,7 +873,11 @@ class AutoMap:
         t0 = self.clock()                                # the hold counts from when the pattern is really up
         rest = (self.hold * PROFILES[self.profile]["settle"] if settle is None else settle) - (self.clock() - t0)
         if rest > 0:
-            self.sleep(rest)
+            if self.sleep is time.sleep:                 # the real clock: CANCEL / PANIC ends the hold at once
+                if self._cancel.wait(rest):
+                    raise CalibError("cancelled")
+            else:                                        # tests with a fake clock
+                self.sleep(rest)
 
     def _cap(self, img, skip=2, n=None):
         """Show a pattern, then the average of n stills (noisy built-in webcams), unmirrored if the camera mirrors."""
@@ -952,7 +961,7 @@ class AutoMap:
             stripe *= 2
         level = PROFILES[self.profile]["level"]
         if snr < 8:
-            level = 235                                    # dim / noisy: brightest pattern we use (still static)
+            level = LEVEL_MAX                              # dim / noisy: brightest pattern we use (still static)
         self.adapt = dict(stripe=stripe, level=level, snr=round(snr, 1), scale=round(scale, 3))
         self.msg = (("camera image is mirrored (handled automatically). " if self.mirrored else "")
                     + f"the projection covers {frac * 100:.0f}% of the camera view; signal/noise {snr:.0f}"
@@ -1053,6 +1062,7 @@ class AutoMap:
         black = self._cap(np.zeros((H, W), np.uint8))
         grey = self._cap(np.full((H, W), int(PATTERN_LEVEL * 0.6), np.uint8))
         self.scene = (grey, black)
+        self.scene_person = self._person_now()           # who was in front of the camera when THIS photo was taken
         self.found = candidates(grey, black)
         self._picture("scene", grey, None)
         self.msg = f"{len(self.found)} face(s) found; click a face in the picture to add one, untick the ones you don't want"
@@ -1187,25 +1197,34 @@ class AutoMap:
             if self.scene is None:
                 self.err = "run 3 DETECT SURFACES first (it takes the photo the AI looks at)"
                 return False
-            self._ai_stage("detect", self.scene[0], instruction, None)
+            self._ai_stage("detect", self.scene[0], instruction, None, self.scene_person)
             return True
         if self.calib is None:
             self.err = "calibrate first (step 2)"
             return False
         return self._run("ai_prepare", self._ai_prepare_verify, instruction)
 
-    def _ai_stage(self, kind, gray, instruction, extra):
+    def _person_now(self):
+        """(mask or None, segmentation trusted?) at this moment, un-mirrored like the stills."""
+        got = self._person()
+        mask, seg = got if isinstance(got, tuple) else (got, got is not None)
+        if mask is not None:
+            mask = np.array(mask, np.float32)
+            if self.mirrored:
+                mask = mask[:, ::-1]
+        return mask, bool(seg)
+
+    def _ai_stage(self, kind, gray, instruction, extra, person=None):
         from plugins.online import vision as V
-        mask = self._person()
-        if mask is not None and self.mirrored:
-            mask = np.asarray(mask)[:, ::-1]
+        mask, seg = person if person is not None else (None, False)
         g, frac = redact(gray, mask)
         h, w = g.shape
         if kind == "detect":
             prompt = V.detect_prompt(w, h, instruction, AI_MAX_POLYS)
         else:
             prompt = V.verify_prompt(w, h, extra["shapes"], instruction, AI_MAX_NUDGE)
-        person = mask is not None and float(np.max(mask)) > 0.5
+        # no person segmentation for this photo (MediaPipe missing, camera just started): always ask
+        person = (not seg) or (mask is not None and float(np.max(mask)) > 0.5)
         self.ai = dict(kind=kind, png=png_bytes(g), prompt=prompt, instruction=V.clean_instruction(instruction),
                        person=person, redacted=round(frac, 3), extra=extra, size=(w, h))
         self._picture("ai_send", g, None)
@@ -1227,9 +1246,10 @@ class AutoMap:
         grey = self._cap(np.full((H, W), int(PATTERN_LEVEL * 0.6), np.uint8))
         pat = np.maximum(np.full((H, W), int(PATTERN_LEVEL * 0.3), np.uint8), outline_image(list(quads.values()), size))
         photo = self._cap(pat)
+        person = self._person_now()
         shapes = [dict(id=sid, points=self.calib.proj_to_cam(q).tolist()) for sid, q in quads.items()]
         self._ai_stage("verify", photo, instruction, dict(shapes=shapes, quads={k: v.tolist() for k, v in quads.items()},
-                                                          grey=grey, black=black))
+                                                          grey=grey, black=black), person)
 
     def ai_send(self, confirm_person=False):
         if self.ai is None:
@@ -1312,6 +1332,7 @@ class AutoMap:
     def cancel(self, why=""):
         self._why = why
         self._cancel.set()
+        self._show(None)                                 # the pattern leaves the wall NOW, not when the step unwinds
 
     def undo(self):
         self._surf({"cmd": "surf", "op": "undo"})
@@ -1346,7 +1367,7 @@ class AutoMap:
         if self.busy:
             self.cancel()
         had = self.image is not None or self.scene is not None or self.ai is not None
-        self.image, self.scene, self.ai = None, None, None
+        self.image, self.scene, self.ai, self.scene_person = None, None, None, (None, False)
         if had and why:
             self.msg = f"camera pictures dropped ({why})"
 
@@ -1412,7 +1433,7 @@ class AutoMap:
         elif op == "reset":
             self.cancel()
             self.scene, self.found, self.made, self.report, self.image, self.msg, self.err = None, [], [], [], None, "", ""
-            self.ai = None
+            self.ai, self.scene_person = None, (None, False)
             self.step = "idle"
 
 
@@ -1521,7 +1542,7 @@ class EngineBridge:
         self.wizard = AutoMap(show, shown, lambda skip: cam.still(skip), lambda: self._snap, self._enqueue,
                               exposure=getattr(cam, "lock_exposure", None),
                               ready=lambda: _camera_ready(cam),
-                              vision=lambda: _vision_for(controller), person=lambda: getattr(cam, "mask", None),
+                              vision=lambda: _vision_for(controller), person=lambda: _person_of(cam),
                               profile=camera_profile(cam), stills=getattr(cam, "allow_stills", None))
         self.cam, self.controller = cam, controller
         self._panics = getattr(controller, "panics", 0)
@@ -1541,6 +1562,8 @@ class EngineBridge:
         p = getattr(self.controller, "panics", 0)
         if p != self._panics or (suppress and w.busy):
             self._panics = p
+            if self.overlay is not None:
+                self.overlay.show(None)
             if w.busy:
                 w.cancel("stopped by PANIC / BLACKOUT: run the step again when the room is ready")
         if not getattr(self.cam, "on", True) and (w.image is not None or w.scene is not None or w.ai is not None):
@@ -1584,9 +1607,23 @@ class EngineBridge:
             ACTIVE = None
 
 
+def _person_of(cam):
+    """(mask, trusted): trusted only with MediaPipe segmentation (the motion fallback misses people standing still)."""
+    mask = getattr(cam, "mask", None)
+    link = getattr(cam, "link", None)
+    backend = str(((getattr(link, "status", None) or {}).get("backend")) or "")
+    return (None if mask is None else np.array(mask, np.float32)), backend.startswith("mediapipe") and mask is not None
+
+
 def _camera_ready(cam):
     if not getattr(cam, "on", True):
         return "switch the CAMERA on (CAMERA tab) and point it at the projection"
+    try:
+        import cv2
+        if not hasattr(cv2, "aruco"):
+            return ("this OpenCV has no ArUco markers: install opencv-contrib-python (not opencv-python) in the venv")
+    except ImportError:
+        return "OpenCV is not installed in the venv (opencv-contrib-python)"
     try:
         dev = int((getattr(cam, "s", None) or {}).get("device", 0))
         for d in getattr(cam, "devices", None) or []:

@@ -124,5 +124,16 @@ def test_timeline_tab_show_menu_presets_and_perform_hook(served):
             ctl.set("hue", 0.9)
         dw.locator(".pcard").first.click()
         assert wait(lambda: abs(ctl.base["hue"] - 0.0) < 1e-6)
+        # B18 (PR2 review): DELETE (two taps) must not bubble to the card and recall the preset
+        with lock:
+            ctl.set("hue", 0.9)
+        card = dw.locator(".pcard").first
+        card.locator("button[title=more]").click()
+        dele = card.locator(".mn button:has-text('DELETE')")
+        dele.click()
+        dele.click()
+        assert wait(lambda: not list((ctl.dir / "presets" / "look").glob("*.json")))
+        time.sleep(0.3)
+        assert ctl.base["hue"] == 0.9
         br.close()
     assert not [e for e in errors if "favicon" not in e], errors

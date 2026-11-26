@@ -11,11 +11,10 @@ variable is added to the child.
                   --strict-mcp-config), no user / project / local settings (--setting-sources ""), no permission
                   escalation, its own short system prompt, no session saved. The flags are checked against
                   `claude --help` once (`verify`); if one is missing the backend refuses to start.
-  agy chat        REMOVED. agy has no tool-less mode (`agy --help`: only --mode accept-edits | auto | plan and
-                  --dangerously-skip-permissions), so chat text would always reach an agent that can act on this
-                  laptop. Chat is Claude Code only.
-  agy_pty         kept for the opt-in agy IMAGE provider only (images.py): constant instruction on argv, the image
-                  prompt in a file, `--mode accept-edits` (never --dangerously-skip-permissions).
+  agy / gemini    REMOVED, chat AND images AND vision. Neither CLI has a tool-less mode (`agy --help`: only --mode
+                  accept-edits | auto | plan and --dangerously-skip-permissions; the gemini CLI needs --yolo), so any
+                  text or picture handed to them reaches an agent that can read and edit files on this laptop.
+                  Online images and AUTO MAP vision use the Gemini API with the user's own key and nothing else.
 
 Children are put into one Windows Job Object with KILL_ON_JOB_CLOSE, so they die with the engine even if it
 crashes, and cancel / timeout kills the whole process tree (taskkill /T).
@@ -316,26 +315,6 @@ class ClaudeBackend:
         return out[:MAX_REPLY]
 
 
-# ------------------------------------------------------------------------------------- agy (ConPTY, images only)
-
-_ANSI = [re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"), re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]"),
-         re.compile(r"\x1b[()][0-9A-B]"), re.compile(r"\x1b[=>]")]
-PREAMBLE = ("Warning: True color", "Ripgrep is not available", "YOLO mode", "Loaded cached",
-            "Tips for getting started", "data is collected")
-ARGV_SAFE = re.compile(r"^[A-Za-z0-9 .,:;()\-_']{1,600}$")     # what may ride on the agy command line
-
-
-def strip_ansi(s):
-    for rx in _ANSI:
-        s = rx.sub("", s)
-    return s.replace("\r", "")
-
-
-def clean_screen(raw):
-    lines = [ln for ln in strip_ansi(raw).splitlines() if not any(m in ln for m in PREAMBLE)]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip())
-
-
 def fresh_dir(root, prefix):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -344,98 +323,6 @@ def fresh_dir(root, prefix):
     return d
 
 
-def agy_command(exe, instruction, timeout, model=None, extra=()):
-    """The exact command line for agy. The instruction must be a CONSTANT of this program (never user or LLM text):
-    letters, digits and plain punctuation only, so nothing in it can close the quote, expand %VAR% or escape.
-    No --dangerously-skip-permissions: `--mode accept-edits` lets it write inside its own folder and nothing else."""
-    if not ARGV_SAFE.match(instruction):
-        raise BackendError("agy instruction contains characters that are not allowed on a command line")
-    exe = str(exe)
-    cmd = (f'"{exe}"' if " " in exe else exe) + f' --print "{instruction}" --mode accept-edits --print-timeout {int(timeout)}s'
-    if model:
-        if not SAFE_NAME.match(str(model)):
-            raise BackendError("bad model name")
-        cmd += f" --model {model}"
-    for x in extra:
-        if not SAFE_NAME.match(str(x).lstrip("-")):
-            raise BackendError("bad agy option")
-        cmd += f" {x}"
-    return cmd
-
-
-def agy_pty(exe, instruction, cwd, timeout=600.0, done_file=None, settle=1.5, idle_after=12.0, cancel=None,
-            progress=None, model=None, extra=()):
-    """Run agy under a ConPTY in cwd (it only renders to a real console). Returns the cleaned screen text.
-
-    Ends when agy exits, when done_file exists and has been stable for `settle` s, or when real (non-preamble)
-    output appeared and then stayed silent for idle_after s. Before any real output only the hard `timeout` applies.
-    The whole process tree is killed afterwards, whatever the reason for stopping.
-    """
-    cmd = agy_command(exe, instruction, timeout, model, extra)
-    try:
-        import winpty
-    except ImportError as ex:
-        raise BackendError("agy needs the pywinpty package in this venv (pip install pywinpty)") from ex
-    try:
-        pty = winpty.PtyProcess.spawn(cmd, cwd=str(cwd), dimensions=(50, 250))
-    except Exception as ex:
-        raise BackendError(f"could not start agy: {ex}") from ex
-    pid = getattr(pty, "pid", None)
-    contain(pid)
-    buf, stop = [], threading.Event()
-
-    def reader():
-        while not stop.is_set():
-            try:
-                data = pty.read(2048)
-            except Exception:
-                break
-            if data:
-                if sum(len(x) for x in buf) < MAX_STDOUT:
-                    buf.append(data)
-            else:
-                time.sleep(0.03)
-
-    threading.Thread(target=reader, daemon=True).start()
-    start = time.monotonic()
-    prev, grew, done_seen, done_size = 0, None, None, -1
-    try:
-        while True:
-            time.sleep(0.1)
-            now = time.monotonic()
-            if cancel is not None and cancel.is_set():
-                raise BackendCancelled("cancelled")
-            if not pty.isalive():
-                break
-            if now - start > timeout:
-                raise BackendTimeout(f"agy gave no answer within {timeout:.0f} s")
-            n = len(clean_screen("".join(buf)))
-            if n > prev:
-                prev, grew = n, now
-            if progress is not None:
-                try:
-                    progress(n)
-                except Exception:
-                    pass
-            if done_file is not None:
-                try:
-                    size = Path(done_file).stat().st_size
-                except OSError:
-                    size = -1
-                if size > 0:
-                    if size != done_size:
-                        done_size, done_seen = size, now
-                    elif now - done_seen > settle:
-                        break
-            if grew is not None and now - grew > idle_after:
-                break
-    finally:
-        stop.set()
-        try:
-            if pty.isalive():
-                kill_pid_tree(pid)                        # agy AND whatever it started (only while the pid is ours)
-            if pty.isalive():
-                pty.terminate(force=True)
-        except Exception:
-            pass
-    return clean_screen("".join(buf))
+def agy_pty(*args, **kwargs):
+    """REMOVED. Only the name is kept, for modules that still import it: it never starts anything."""
+    raise BackendError("the agy CLI is not used any more: it is a coding agent with no tool-less mode")

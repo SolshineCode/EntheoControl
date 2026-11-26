@@ -34,6 +34,7 @@ Governor: Recorder.active (bool) and Recorder.cost() -> {active, encoders, readb
 """
 import collections
 import json
+import re
 import math
 import os
 import queue
@@ -722,6 +723,25 @@ def _lock_fresh(d):
         return False
 
 
+_SAFE_MP4 = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,150}[.]mp4$", re.I)
+
+
+def safe_output_name(name, fallback, folder):
+    """meta.json is a file on disk and may be damaged or planted: the output name taken from it must be a plain
+    .mp4 file name that lands directly inside `folder` (no path, no drive, no "..", no odd characters). Anything
+    else falls back to the parts folder's own name (made safe the same way)."""
+    folder = Path(folder)
+    for cand in (name, fallback, "recovered.mp4"):
+        if not isinstance(cand, str) or not _SAFE_MP4.match(cand) or ".." in cand or Path(cand).name != cand:
+            continue
+        try:
+            if (folder / cand).resolve().parent == folder.resolve():
+                return cand
+        except OSError:
+            continue
+    return "recovered.mp4"
+
+
 def finalize_parts(parts, ffmpeg, popen=subprocess.Popen, disk_free=None, log=print, procs=None, wait_lock=0.0):
     """Turn one sealed (or crash-left) parts dir into recordings/<name>.mp4. Returns (status, message, secs).
 
@@ -739,7 +759,12 @@ def finalize_parts(parts, ffmpeg, popen=subprocess.Popen, disk_free=None, log=pr
         meta = json.loads((parts / "meta.json").read_text(encoding="utf-8"))
     except Exception:
         meta = {}
-    name = meta.get("name") or f"{parts.name}.mp4"
+    if not isinstance(meta, dict):
+        meta = {}
+    for k in ("fps", "frames", "mux_failed"):               # numbers only: a planted string must not crash recovery
+        if not isinstance(meta.get(k), (int, float)) or isinstance(meta.get(k), bool) or not meta[k] == meta[k] or meta[k] < 0:
+            meta.pop(k, None)
+    name = safe_output_name(meta.get("name"), f"{parts.name}.mp4", folder)
     video, pcm = parts / "video.mp4", parts / "audio.pcm"
     vsize = video.stat().st_size if video.exists() else 0
     asize = pcm.stat().st_size if pcm.exists() else 0

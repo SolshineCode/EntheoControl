@@ -679,6 +679,7 @@ vec4 shipiboLayout(vec2 P, float px){
   return s * (1.0 - smoothstep(0.30, 0.60, fw));         // too small to draw (centre of the tunnel): fade to black
 }
 
+// sine hash in the form used in Inigo Quilez's MIT-licensed shaders, Copyright (c) 2013 Inigo Quilez, MIT License (THIRD_PARTY_NOTICES.md)
 float hash21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
 
 vec3 beadCol(vec2 b, out float lit){                    // colour of bead b (integer lattice position) + its sequence light

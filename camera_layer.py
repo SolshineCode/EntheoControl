@@ -80,6 +80,9 @@ def clean_settings(raw):
     for k, lo, hi in (("pos_x", -1.0, 1.0), ("pos_y", -1.0, 1.0), ("scale", 0.25, 4.0), ("key_x", -1.0, 1.0),
                       ("key_y", -1.0, 1.0), ("gain", 0.25, 4.0)):
         s[k] = _f(raw.get(k, DEFAULTS[k]), lo, hi, DEFAULTS[k])
+    tot = abs(s["key_x"]) + abs(s["key_y"])
+    if tot > KEY_SUM_MAX:                               # both keystones at full fold three corners onto a line
+        s["key_x"], s["key_y"] = s["key_x"] * KEY_SUM_MAX / tot, s["key_y"] * KEY_SUM_MAX / tot
     c = raw.get("crop")
     if isinstance(c, (list, tuple)) and len(c) == 4:
         x0, y0, x1, y1 = (_f(v, 0.0, 1.0, d) for v, d in zip(c, DEFAULTS["crop"]))
@@ -92,6 +95,7 @@ def clean_settings(raw):
 
 
 SET_KEYS = set(DEFAULTS)
+KEY_SUM_MAX = 1.4                                       # |key_x| + |key_y|: keeps the alignment quad convex
 
 
 def validate_command(c):
@@ -139,6 +143,19 @@ def screen_quad(s):
     kx, ky = 0.5 * s["key_x"], 0.5 * s["key_y"]               # keystone: top narrower (+x), right taller (+y)
     return [(cx - hw * (1 - kx), cy + hh * (1 - ky)), (cx + hw * (1 - kx), cy + hh * (1 + ky)),
             (cx + hw * (1 + kx), cy - hh * (1 + ky)), (cx - hw * (1 + kx), cy - hh * (1 - ky))]
+
+
+def safe_align(s):
+    """(H, H inverse) for the settings; never raises: a degenerate quad falls back to the default alignment."""
+    try:
+        H = align_matrix(s)
+        Hi = np.linalg.inv(H)
+        if np.isfinite(H).all() and np.isfinite(Hi).all():
+            return H, Hi
+    except (np.linalg.LinAlgError, ValueError):
+        pass
+    H = align_matrix(clean_settings({"mirror": s.get("mirror", True)}))
+    return H, np.linalg.inv(H)
 
 
 def align_matrix(s):
@@ -328,7 +345,8 @@ def arm_track(b, aspect):
 def available():
     """(ok, reason, notes): can the camera run at all, without importing anything heavy."""
     if importlib.util.find_spec("cv2") is None:
-        return False, "opencv-python is not installed in the venv (.\\.venv\\Scripts\\pip.exe install opencv-python)", ""
+        return False, ("OpenCV is not installed in the venv (.\\.venv\\Scripts\\pip.exe install opencv-contrib-python; "
+                       "the contrib build, it has the ArUco markers AUTO MAP needs)"), ""
     if not (HERE / "camera_worker.py").is_file():
         return False, "camera_worker.py is missing", ""
     notes = []
@@ -514,8 +532,8 @@ class CameraLayer:
         self._devices_fn = devices_fn
         ext = getattr(controller, "ext", None)
         self.s = clean_settings(ext.get("camera") if isinstance(ext, dict) else None)
-        self.H = align_matrix(self.s)
-        self.Hinv = np.linalg.inv(self.H)
+        self.H, self.Hinv = safe_align(self.s)
+        self._lk = threading.Lock()                    # guards on / _gen / proc / link / port / token (GL vs start thread)
         self.on = False
         self.proc, self.link, self.port = None, None, None
         self.status, self.reason = "off", ""
@@ -563,8 +581,7 @@ class CameraLayer:
     def _set(self, vals):
         old = dict(self.s)
         self.s = clean_settings(dict(self.s, **vals))
-        self.H = align_matrix(self.s)
-        self.Hinv = np.linalg.inv(self.H)
+        self.H, self.Hinv = safe_align(self.s)
         self._save()
         if self.on and any(old[k] != self.s[k] for k in ("device",)):
             self.stop(); self.start()                  # new device: reopen
@@ -613,9 +630,10 @@ class CameraLayer:
             return
         if manual:
             self.restarts = 0
-        self.on, self.status, self.reason, self._started, self.quality = True, "starting", "", self.clock(), 0
-        self._gen += 1
-        gen, prev = self._gen, self._teardown
+        with self._lk:
+            self.on, self.status, self.reason, self._started, self.quality = True, "starting", "", self.clock(), 0
+            self._gen += 1
+            gen, prev = self._gen, self._teardown
         if self.sync:
             self._spawn_now(gen, prev)
         else:
@@ -627,7 +645,7 @@ class CameraLayer:
             prev.join(timeout=8.0)                     # the old worker must have let go of the webcam first
         port = free_port()
         if port is None:
-            self.status, self.reason, self.on = "error", "no free local port in 8767-8775", False
+            self._fail(gen, "no free local port in 8767-8775")
             return
         from camera_worker import unpack
         token = secrets.token_urlsafe(24)
@@ -636,14 +654,22 @@ class CameraLayer:
         except TypeError:                              # an older spawn signature (tests)
             proc = self._spawn(port, self.s, self.here)
         except Exception as ex:
-            self.status, self.reason, self.on = "error", f"could not start camera_worker.py: {ex}"[:200], False
+            self._fail(gen, f"could not start camera_worker.py: {ex}"[:200])
             return
         link = self._link_factory(port, token, unpack)
-        if gen != self._gen or not self.on:            # switched OFF meanwhile: undo
+        with self._lk:                                 # commit only if this start is still the wanted one
+            ok = gen == self._gen and self.on
+            if ok:
+                self.token, self.port, self.proc, self.link = token, port, proc, link
+        if not ok:                                     # switched OFF (or ON again) meanwhile: this worker goes
             self._stop_worker(link, proc)
             return
-        self.token, self.port, self.proc, self.link = token, port, proc, link
         print(f"[camera] ON (worker pid {getattr(proc, 'pid', '?')}, port {port})")
+
+    def _fail(self, gen, why):
+        with self._lk:
+            if gen == self._gen:                       # a stale start never overwrites a newer state
+                self.status, self.reason, self.on = "error", why, False
 
     @staticmethod
     def _stop_worker(link, proc):
@@ -661,10 +687,12 @@ class CameraLayer:
     def stop(self):
         """CAMERA OFF: returns at once; the worker is asked to quit (it releases the device) and, failing that, its
         process tree is killed, on a teardown thread. A following ON waits for that teardown."""
-        was = self.on
-        self.on = False
-        self._gen += 1
-        link, proc, self.link, self.proc = self.link, self.proc, None, None
+        with self._lk:
+            was = self.on
+            self.on = False
+            self._gen += 1
+            link, proc, self.link, self.proc = self.link, self.proc, None, None
+            self.port, self.token = None, None
         if link is not None or proc is not None:
             if self.sync:
                 self._stop_worker(link, proc)
@@ -675,7 +703,7 @@ class CameraLayer:
         self.status = "off" if self.ok else "unavailable"
         self.reason = "" if self.ok else self.reason
         self.t_data, self.mask, self.flow, self.bodies, self.hands = None, None, None, [], {}
-        self._mask_target, self.live, self._data_t, self.port, self.token = None, 0.0, None, None, None
+        self._mask_target, self.live, self._data_t = None, 0.0, None
         self.signals.lost()
         if was:
             print("[camera] OFF (device released)")
@@ -933,11 +961,13 @@ class CameraLayer:
     def still(self, skip=2, timeout=6.0):
         """AUTO MAP (its own thread, never the GL thread): a fresh grey camera still, 640x360 uint8, taken `skip`
         frames after the request. Memory only. Raises RuntimeError with a reason the wizard shows."""
-        if not self.on or self.port is None:
+        with self._lk:
+            on, port, token = self.on, self.port, self.token
+        if not on or not port or not token:
             raise RuntimeError("switch the CAMERA on (CAMERA tab) and point it at the projection")
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         try:
-            c.request("GET", f"/still?skip={int(skip)}", headers={"X-Token": self.token or ""})
+            c.request("GET", f"/still?skip={int(skip)}", headers={"X-Token": token})
             r = c.getresponse()
             body = r.read()
         finally:
@@ -949,12 +979,14 @@ class CameraLayer:
 
     def _post_config(self, cfg, timeout=3.0):
         """Synchronous /config (wizard thread only): the change is in force when this returns."""
-        if not self.on or self.port is None:
+        with self._lk:
+            on, port, token = self.on, self.port, self.token
+        if not on or not port or not token:
             raise RuntimeError("switch the CAMERA on (CAMERA tab) and point it at the projection")
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
         try:
             c.request("POST", "/config", body=json.dumps(cfg).encode(),
-                      headers={"X-Token": self.token or "", "Content-Type": "application/json"})
+                      headers={"X-Token": token, "Content-Type": "application/json"})
             r = c.getresponse()
             r.read()
         finally:

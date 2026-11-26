@@ -82,6 +82,11 @@ def test_page_is_self_contained(rc):
     html = body.decode("utf-8")
     assert status == 200 and "<html" in html
     low = html.lower()
+    # The ONE allowed URL: the AGPL-3.0 section 13 "Source code" link in the ? help sheet. It is a plain link the user may
+    # click, nothing is loaded from it. Everything else must stay offline (no CDN, no remote script / style / font).
+    agpl = 'href="https://github.com/solshinecode/entheocontrol"'
+    assert low.count(agpl) == 1, "the help sheet must keep exactly one AGPL source link"
+    low = low.replace(agpl, "")
     assert "http://" not in low and "https://" not in low  # no CDN: must work offline
     assert "touch-action" in low and "pointerdown" in low
     assert "tok123" not in html  # token is not baked into the page

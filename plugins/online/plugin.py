@@ -10,14 +10,13 @@ from pathlib import Path
 from . import protocol
 from .assistant import Assistant, OnlineLog
 from .backends import ClaudeBackend
-from .images import AgyImageProvider, GeminiApiProvider, KeyStore, NanoBanana, default_key_path
+from .images import GeminiApiProvider, KeyStore, NanoBanana, default_key_path
 
 PRIVACY_NOTE = ("ONLINE is on: chat messages + the current settings go to the chosen assistant (Anthropic / Google); "
                 "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.")
-CLI_NOTE = ("Images through the agy CLI: driving it from other software may not be allowed by Antigravity's terms "
-            "(https://antigravity.google/terms). This can only be switched on from the laptop itself "
-            "(open the panel at http://127.0.0.1) or in online_local.json.")
-AGY_CHAT_NOTE = "agy chat is not offered: agy has no tool-less mode, so chat text could make it act on this laptop."
+CLI_NOTE = ("Google's CLIs (agy, gemini) are not used: they are coding agents with no tool-less mode. Online images "
+            "and AUTO MAP vision need your own Gemini API key.")
+AGY_CHAT_NOTE = CLI_NOTE
 TEX_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 
@@ -43,7 +42,8 @@ class OnlinePlugin:
         self.tex_dir = Path(tex_dir) if tex_dir else self.root / "textures"
         self.art_dir = Path(art_dir) if art_dir else self.root / "art"
         s = dict(protocol.DEFAULTS, **(settings or {}))
-        self.engine, self.cli_google = s["engine"], bool(s.get("cli_google"))
+        self.engine = s["engine"]
+        self._vision = None                                        # plugins.online.vision.Vision, one per session
         self.keys = KeyStore(keys_path or default_key_path())      # outside the project folder
         self.sync = bool(sync)
         self._lists = ([], [])                                     # cached (textures, art), refreshed by _scan
@@ -89,20 +89,12 @@ class OnlinePlugin:
             threading.Thread(target=self._scan, name="online-scan", daemon=True).start()
 
     def _providers(self):
-        """Recommended: the Gemini API with the user's own key. Google's CLIs only after the explicit opt-in."""
-        out = [GeminiApiProvider(self.keys)]
-        if self.cli_google:
-            out += [AgyImageProvider()]
-        return out
+        """The Gemini API with the user's own key. Nothing else (see images.py)."""
+        return [GeminiApiProvider(self.keys)]
 
     def configure(self, s):
         self.assistant.mode, self.assistant.backend, self.engine = s["mode"], s["backend"], s["engine"]
-        if bool(s.get("cli_google")) != self.cli_google:
-            self.cli_google = bool(s.get("cli_google"))
-            if not self._fixed_providers:
-                self.images.set_providers(self._providers())
-            self.rescan()
-        self.log.log("settings", mode=s["mode"], backend=s["backend"], engine=s["engine"], cli_google=self.cli_google)
+        self.log.log("settings", mode=s["mode"], backend=s["backend"], engine=s["engine"])
 
     # ---------------------------------------------------------------- hooks (GL thread)
     def command(self, ctl, c):
@@ -159,7 +151,7 @@ class OnlinePlugin:
     def state(self):
         st = self.assistant.state()
         st.update(on=True, engine=self.engine, nano=self.images.state(), privacy=PRIVACY_NOTE,
-                  cli_google=self.cli_google, cli_note=CLI_NOTE, has_key=bool(self.keys._key),
+                  cli_note=CLI_NOTE, has_key=bool(self.keys._key),
                   agy_chat=AGY_CHAT_NOTE, notice=self.notice)
         return st
 

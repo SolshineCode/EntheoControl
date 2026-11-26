@@ -7,8 +7,9 @@ Three parts, one file:
     Commands `{"cmd": "skin", "op": ...}` are validated by `validate()`. Targets for MIDI learn and the mod matrix are
     named `skin:<env>:<slot>:<field>` (same idea as the math stack's `stack:<id>:<field>`).
   * the LIBRARY (GL): `SkinLibrary` = ONE RGBA8 texture array (8 layers, 512 or 1024 px, mipmapped, hardware
-    anisotropic) on ONE private texture unit. Images are decoded and resized on a worker thread, uploaded in strips,
-    never on a frame that is already late, least-recently-used layer replaced. VRAM is accounted (`vram_bytes`).
+    anisotropic) on ONE private texture unit. Images are decoded, resized AND mip-mapped on a worker thread; the render
+    thread only copies about 1 MB per frame (per mip level, glTexSubImage3D), skipped after a late frame; the
+    least-recently-used layer is replaced. VRAM is accounted (`vram_bytes`).
   * the ENGINE side: `SkinEngine` = crossfades, float64 phases wrapped at 2 (one mirrored repeat), the per-slot uniform
     block, the governor hook (`govern`), and `GLSL`, the shader chunk the worlds paste in.
 
@@ -16,8 +17,9 @@ COST RULES (the user's priority: "very compute efficient")
   * every slot procedural  -> the host uses its ORIGINAL shader program: no sampler, no bind, no branch, no uniform.
   * a skinned slot         -> ONE hardware-filtered fetch per pixel (two only during a 0.4 s source crossfade).
   * triplanar              -> THREE fetches; it is the expensive mapping and is only run when chosen.
-  * no float textures, no per-frame uploads, no per-frame numpy / dict allocations (`SkinEngine.update` writes into
-    preallocated arrays).
+  * no VRAM until the first skin is used (the array is allocated lazily); no float textures; no per-frame uploads;
+    nothing is RETAINED per frame (`SkinEngine.update` writes into preallocated arrays). A skinned frame still makes a
+    few short-lived Python floats / tuples (the uv matrix); an all-procedural frame makes none.
 
 Environments (`ENVS`): corridor (walls, floor), torus (tube, chambers), vortex (walls), hexdome (domes) = the four
 fx_stack.LandPass worlds; tunnel (walls) = the travel modes of the main scene shader.
@@ -31,6 +33,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+try:                             # the mod sources the control system knows (unknown ones are refused / dropped)
+    from params import MOD_SOURCES as _MOD_SOURCES
+    MOD_SOURCES = frozenset(_MOD_SOURCES)
+except Exception:
+    MOD_SOURCES = None
 
 TAU = 2.0 * math.pi
 VERSION = 1
@@ -222,7 +230,8 @@ def parse_target(t):
 def clean_mod(m, sources=None):
     if not isinstance(m, dict) or not isinstance(m.get("src"), str):
         return None
-    if sources is not None and m["src"] not in sources:
+    sources = MOD_SOURCES if sources is None else sources
+    if (sources is not None and m["src"] not in sources) or m["src"] in ("", "none", "off"):
         return None
     amt, rate, phase = m.get("amt", 0.0), m.get("rate", 1.0), m.get("phase", 0.0)
     if not (_isnum(amt) and _isnum(rate) and _isnum(phase)):
@@ -319,12 +328,14 @@ def validate(c):
             raise ValueError("only numeric skin fields can be modulated")
         out["f"] = c["f"]
         slot_i = c.get("mslot", c.get("slot_i", 0))
-        if isinstance(slot_i, bool) or slot_i not in (0, 1):
-            raise ValueError("mod slot must be 0 or 1")
+        if type(slot_i) is not int or slot_i not in (0, 1):          # 1.0 or True would index the pair wrongly
+            raise ValueError("mod slot must be the integer 0 or 1")
         out["mslot"] = slot_i
         src = c.get("src")
         if not isinstance(src, str) or len(src) > 24:
             raise ValueError("bad mod source")
+        if MOD_SOURCES is not None and src not in MOD_SOURCES and src not in ("", "none", "off"):
+            raise ValueError("unknown mod source")
         out["src"] = src
         for k, lo, hi, d in (("amt", -1.0, 1.0, 0.0), ("rate", 1 / 64, 64.0, 1.0), ("phase", 0.0, 1.0, 0.0)):
             v = c.get(k, d)
@@ -341,6 +352,10 @@ def validate(c):
             raise ValueError("prompt must be 1..400 characters")
     elif op == "gen_cancel":
         pass
+    elif op == "enable":
+        if not isinstance(c.get("on"), bool):
+            raise ValueError("'on' must be true or false")
+        out["on"] = c["on"]
     else:
         raise ValueError("unknown skin op")
     return out
@@ -348,6 +363,8 @@ def validate(c):
 
 GEN_SUFFIX = ", seamless tileable pattern, glowing on a pure black background"
 GEN_TIMEOUT_S = 240.0
+GEN_WAIT_S = 600.0               # an unsent job is dropped after this long (the show never got calm / the worker never idle)
+GEN_LOAD_FREE_MB = 2600          # free VRAM wanted before a click may make the worker LOAD its model
 
 
 class SkinState:
@@ -355,13 +372,21 @@ class SkinState:
     one (saved in live_state.json, scenes and show files); `step()` resolves the modulated values into `frame`, which
     is what the engine reads. `frame` only holds slots that HAVE a source: with none it is empty and nothing runs."""
 
-    def __init__(self):
+    def __init__(self, on=True):
+        # `on`: the feature switch. The CONTROLLER creates its state with on=False: skins ship INACTIVE (no texture
+        # array, no extra shader programs, nothing drawn) until the performer switches them on in the panel
+        # ({"cmd": "skin", "op": "enable", "on": true}; remembered in live_state.json as settings.skins_on).
+        # While off, `frame` stays empty whatever the slots hold, so the engine never sees a skin.
+        self.on = bool(on)
         self.slots = {env: {s: default_slot() for s in e["slots"]} for env, e in ENVS.items()}
         self.mods = {}
         self.frame = {}                  # env -> slot -> resolved dict (reused objects: no per-frame allocation)
         self.edits = 0
-        self.gen = None                  # a pending "generate a skin" job: dict(env, slot, prompt, known, t, sent)
+        self.gen = None                  # a pending "generate a skin" job: dict(env, slot, prompt, tag, src0, known, t, sent)
         self.gen_note = ""
+        self.gen_n = 0                   # job tags count up: results are matched by the worker's job id, not by prompt
+        self.cancel_ai = False           # set when a job that was already SENT is cancelled: the owner cancels the worker
+        self.cut = 0                     # bumps when the next change must be a cut, not a fade (PANIC)
         self._rebuild()
 
     # ---- (de)serialise
@@ -383,15 +408,24 @@ class SkinState:
     def _rebuild(self):
         """Rebuild `frame` after a structural change (a source set or cleared, a load)."""
         frame = {}
-        for env, ss in self.slots.items():
+        for env, ss in (self.slots.items() if self.on else ()):
             for s, d in ss.items():
                 if d["src"] is not None:
                     frame.setdefault(env, {})[s] = dict(d, tint=list(d["tint"]), src=dict(d["src"]))
         self.frame = frame
-        self._modded = [(k, parse_key(k)) for k in self.mods]
+        self._modded = [(k, parse_key(k), "skin:" + k) for k in self.mods]
 
     def any(self):
         return bool(self.frame)
+
+    def enable(self, on):
+        """The feature switch. Off: nothing reaches the engine (it fades out and frees its texture array) and a pending
+        generation is dropped; the slots keep what they hold for the next time."""
+        self.on = bool(on)
+        if not self.on:
+            self.gen_cancel()
+        self.edits += 1
+        self._rebuild()
 
     # ---- commands
     def assign(self, env, slot, kind, name):
@@ -438,24 +472,53 @@ class SkinState:
             else:
                 self.mods.pop(key, None)
             self._rebuild()
+        elif op == "enable":
+            self.enable(c["on"])
         elif op == "gen":
-            self.gen = dict(env=c["env"], slot=c["slot"], prompt=c["prompt"], known=None, t=None, sent=False)
+            self.gen_cancel()
+            if not self.on:
+                self.gen_note = "skins are switched off"
+                return
+            self.gen_n += 1
+            src = self.slots[c["env"]][c["slot"]]["src"]
+            self.gen = dict(env=c["env"], slot=c["slot"], prompt=c["prompt"], tag=f"skin{self.gen_n}",
+                            src0=dict(src) if src else None, known=None, t=None, sent=False)
             self.gen_note = "waiting for the AI worker"
         elif op == "gen_cancel":
-            self.gen, self.gen_note = None, ""
+            self.gen_cancel()
 
-    def midi(self, env, slot, field, val, rel=None, press=True):
-        """A bound knob: val 0..1 across the field's range (rel = relative encoder steps). A pad on a stepped field
-        steps it on press."""
+    def gen_cancel(self, note=""):
+        """Drop the pending generate-a-skin job. If it was already sent, `cancel_ai` asks the owner to stop the worker."""
+        if self.gen is not None and self.gen["sent"]:
+            self.cancel_ai = True
+        self.gen, self.gen_note = None, note
+
+    def panic(self):
+        """PANIC: every slot procedural NOW (a cut: `cut` tells the engine not to fade), settings kept, generation off."""
+        for ss in self.slots.values():
+            for d in ss.values():
+                d["src"] = None
+        self.gen_cancel()
+        self.cut += 1
+        self.edits += 1
+        self._rebuild()
+
+    def midi(self, env, slot, field, val, rel=None, pad=False, press=True):
+        """A bound control. A knob / fader (CC): val 0..1 is ALWAYS the absolute position across the field's range, also
+        at its end stops; rel = relative encoder steps (a stepped field moves one step per click, clamped). pad=True
+        (a note): a stepped field steps to its next option on press and wraps."""
         d = self.slots[env][slot]
         if field in INT:
             lo, hi = INT[field][:2]
             hi = min(hi, len(ENVS[env]["maps"]) - 1) if field == "map" else hi
-            if rel is None and val in (0.0, 1.0):
-                if press:
-                    d[field] = lo if d[field] >= hi else d[field] + 1
+            if pad:
+                if not press:
+                    return
+                d[field] = lo if d[field] >= hi else d[field] + 1
+            elif rel is not None:
+                d[field] = int(min(max(d[field] + (rel > 0) - (rel < 0), lo), hi))
             else:
-                d[field] = int(min(max(round(lo + (hi - lo) * val), lo), hi))
+                d[field] = int(min(max(round(lo + (hi - lo) * min(1.0, max(0.0, val))), lo), hi))
         else:
             lo, hi = NUM[field][:2]
             v = d[field] + rel * (hi - lo) / 127.0 if rel is not None else lo + (hi - lo) * min(1.0, max(0.0, val))
@@ -464,43 +527,62 @@ class SkinState:
         self._rebuild()
 
     # ---- "generate a skin": the controller drives this with its AI link (see control.py)
-    def gen_tick(self, now, ai_status, submit, strained=False):
-        """One step of the pending generate-a-skin job. `ai_status`: AIClient.status(); `submit(job)`: AIClient.submit.
-        The job is only SENT while the governor is calm and the worker has nothing else to do (lowest priority); the
-        finished image is assigned to the slot. Returns the new texture name once, else None."""
+    def gen_tick(self, now, ai_status, submit, strained=False, result=None, vram_free_mb=None):
+        """One step of the pending generate-a-skin job. `ai_status`: AIClient.status(); `submit(job)`: AIClient.submit;
+        `result(tag)`: AIClient.tagged (file name of the finished job with that tag, matched by the worker's job id).
+        The job is only SENT while the governor is calm and the worker has nothing else to do (lowest priority). If the
+        worker has not loaded its model yet, sending would load about 2.5 GB onto the GPU: that only happens while
+        calm AND with GEN_LOAD_FREE_MB of VRAM free (unknown = allowed). The finished image goes onto the slot unless
+        the performer has put something else there since. Returns the new texture name once, else None."""
         g = self.gen
         if g is None:
             return None
-        done = ai_status.get("done") or []
         if not g["sent"]:
+            if g["t"] is None:
+                g["t"] = now
+            if now - g["t"] > GEN_WAIT_S:
+                self.gen_cancel("gave up waiting: the show stayed busy. Try again later")
+                return None
             if strained:
                 self.gen_note = "waiting: the show is under load"
                 return None
             if not ai_status.get("available"):
                 self.gen_note = "the AI worker is not running"
-                if g["t"] is None:
-                    g["t"] = now
-                elif now - g["t"] > 20.0:
-                    self.gen, self.gen_note = None, "no AI worker: nothing was generated"
+                if now - g["t"] > 20.0:
+                    self.gen_cancel("no AI worker: nothing was generated")
                 return None
-            if ai_status.get("busy") or ai_status.get("queue") or ai_status.get("pending"):
+            if ai_status.get("busy") or ai_status.get("queue") or ai_status.get("pending") or ai_status.get("loading"):
                 self.gen_note = "waiting for the AI worker to finish its other jobs"
                 return None
-            g["known"] = {d.get("name") for d in done}
+            if not ai_status.get("loaded"):
+                if vram_free_mb is not None and vram_free_mb < GEN_LOAD_FREE_MB:
+                    self.gen_note = (f"waiting: the AI model is not loaded and only {int(vram_free_mb)} MB of VRAM is free "
+                                     f"(it needs about {GEN_LOAD_FREE_MB})")
+                    return None
+                self.gen_note = "loading the AI model, then generating"
+            else:
+                self.gen_note = "generating"
+            g["known"] = {d.get("name") for d in ai_status.get("done") or []}
             g["sent"], g["t"] = True, now
-            submit(dict(prompt=(g["prompt"] + GEN_SUFFIX)[:500], negative="", n=1, init=None, strength=0.45, show=False))
-            self.gen_note = "generating"
+            submit(dict(prompt=(g["prompt"] + GEN_SUFFIX)[:500], negative="", n=1, init=None, strength=0.45, show=False,
+                        tag=g["tag"]))
             return None
-        want = (g["prompt"] + GEN_SUFFIX)[:80]
-        for d in done:
-            name = d.get("name")
-            if name and name not in g["known"] and str(d.get("prompt") or "")[:80] == want:
-                self.gen, self.gen_note = None, ""
-                if self.assign(g["env"], g["slot"], "ai", name):
-                    return name
+        name = None
+        if result is not None:
+            name = result(g["tag"])                      # matched by job id inside the AI link
+        else:                                            # a link without tags: a NEW file with exactly our prompt
+            want = (g["prompt"] + GEN_SUFFIX)[:80]
+            for d in ai_status.get("done") or []:
+                if d.get("name") and d["name"] not in g["known"] and str(d.get("prompt") or "")[:80] == want:
+                    name = d["name"]
+        if name:
+            self.gen, self.gen_note = None, ""
+            if self.slots[g["env"]][g["slot"]]["src"] != g["src0"]:
+                self.gen_note = f"{name} is in the library; the slot was changed meanwhile, so it was left alone"
                 return None
+            return name if self.assign(g["env"], g["slot"], "ai", name) else None
         if now - g["t"] > GEN_TIMEOUT_S:
-            self.gen, self.gen_note = None, "the AI worker did not answer"
+            self.gen_cancel("the AI worker did not answer")
         return None
 
     # ---- per frame
@@ -516,25 +598,26 @@ class SkinState:
                     out[f] = d[f]
                 out["tint"][0], out["tint"][1], out["tint"][2] = d["tint"]
         if source is not None and self._modded:
-            for key, t in self._modded:
+            for key, t, target in self._modded:
                 if t is None:
                     continue
                 env, s, f = t
-                out = self.frame.get(env, {}).get(s)
+                fe = self.frame.get(env)
+                out = fe.get(s) if fe else None
                 if out is None:
                     continue
                 lo, hi = NUM[f][:2]
                 m = 0.0
                 for n, sl in enumerate(self.mods[key]):
                     if sl:
-                        m += sl["amt"] * source(sl, f"skin:{key}", n)
+                        m += sl["amt"] * source(sl, target, n)
                 out[f] = min(max(out[f] + m * (hi - lo), lo), hi)
         return self.frame
 
     def state(self):
         """For the panel: only what differs from the defaults (the state JSON has a size budget)."""
         j = self.to_json()
-        out = dict(slots=j["slots"], mods=j["mods"], edits=self.edits)
+        out = dict(on=self.on, slots=j["slots"], mods=j["mods"], edits=self.edits)
         if self.gen is not None or self.gen_note:
             out["gen"] = dict(env=self.gen["env"], slot=self.gen["slot"], prompt=self.gen["prompt"][:80],
                               note=self.gen_note) if self.gen is not None else dict(note=self.gen_note)
@@ -591,14 +674,16 @@ vec3 skTri(int s, vec3 p, vec3 n, float f){
 vec3 skMix(int s, vec3 proc, vec3 S, float lines, float shade){
   float l = dot(S, vec3(0.299, 0.587, 0.114));
   if (skB[s].w > 0.001) S = mix(S, %(pal)s(l*0.85 + 0.08)*l*1.7, skB[s].w);
-  S = min(S*skE[s].rgb*(skD[s].w*smoothstep(0.05, 0.36, l)), 1.25);   // dark paint stays black (black = no light)
+  S = min(S*skE[s].rgb*(skD[s].w*smoothstep(0.08, 0.40, l)), 1.25);   // dark paint stays black (black = no light)
   vec3 pc = min(proc, 1.0), o;
   float m = skB[s].y;
-  if (m < 0.5) o = S*shade + proc*lines*0.12;
+  if (m < 0.5) o = S*(shade*1.3) + proc*lines*0.12;
   else if (m < 1.5) o = proc*S*2.2;
   else if (m < 2.5) o = 1.0 - (1.0 - pc)*(1.0 - min(S*shade, 1.0));
   else if (m < 3.5) o = mix(2.0*pc*S, 1.0 - 2.0*(1.0 - pc)*(1.0 - min(S, 1.0)), step(0.5, pc))*1.15;
   else o = S*lines*1.45 + proc*(1.0 - lines)*0.10;
+  vec3 k = max(o - 0.8, 0.0);                          // soft knee: a bright skin rolls off, it never clips to white
+  o = min(o, 0.8) + k/(1.0 + 4.0*k);
   return mix(proc, o, skA[s].w);
 }
 """ % dict(n=nslots, pal=pal)
@@ -609,22 +694,50 @@ GLSL = glsl()
 
 # ------------------------------------------------------------------ library (GL)
 
+MAX_PIXELS = 60_000_000
+
+
+def mip_chain(level0):
+    """(s, s, 4) uint8 -> [level 0, level 1, ... 1 x 1] by 2 x 2 box filtering (numpy; used when a loader only returns
+    the base image)."""
+    out = [np.ascontiguousarray(level0)]
+    a = out[0]
+    while a.shape[0] > 1:
+        b = a.astype("u2")
+        a = ((b[0::2, 0::2] + b[1::2, 0::2] + b[0::2, 1::2] + b[1::2, 1::2] + 2) >> 2).astype("u1")
+        out.append(np.ascontiguousarray(a))
+    return out
+
 
 def load_image(path, size):
-    """Decode + resize to size x size RGBA8 (worker thread). Returns (bytes, aspect) or raises."""
+    """Decode, resize to size x size RGBA8 AND build the whole mip chain (worker thread: the render thread never
+    generates mips). Returns ([level 0, level 1, ...] as uint8 arrays, aspect) or raises."""
     from PIL import Image
-    Image.MAX_IMAGE_PIXELS = 60_000_000
     with Image.open(path) as im:
-        im.draft("RGB", (size * 2, size * 2))
         w, h = im.size
-        if im.mode in ("RGBA", "LA", "P"):
+        if w * h > MAX_PIXELS:
+            raise ValueError("image too large")
+        im.draft("RGB", (size * 2, size * 2))
+        if im.mode == "P":
+            im = im.convert("RGBA")
+        f = min(im.size) // (size * 2)
+        if f >= 2:                                       # shrink BEFORE compositing / filtering at full resolution (RAM)
+            im = im.reduce(f)
+        if im.mode in ("RGBA", "LA"):
             im = im.convert("RGBA")
             im = Image.alpha_composite(Image.new("RGBA", im.size, (0, 0, 0, 255)), im)
         im = im.convert("RGB").resize((size, size), Image.LANCZOS)
-        a = np.empty((size, size, 4), dtype="u1")
-        a[..., :3] = np.asarray(im)
-        a[..., 3] = 255
-    return a.tobytes(), w / max(h, 1)
+        levels, s = [], size
+        while True:
+            a = np.empty((s, s, 4), dtype="u1")
+            a[..., :3] = np.asarray(im)
+            a[..., 3] = 255
+            levels.append(a)
+            if s == 1:
+                break
+            s //= 2
+            im = im.resize((s, s), Image.BOX)
+    return levels, w / max(h, 1)
 
 
 def vram_bytes(size, layers=MAX_LAYERS):
@@ -636,63 +749,146 @@ def vram_bytes(size, layers=MAX_LAYERS):
     return total
 
 
-class SkinLibrary:
-    """Up to MAX_LAYERS resident skins in ONE texture array. All GL work happens in tick() on the render thread, in
-    small steps (one strip of one image, or one mip build), and never on a frame the caller reports as late."""
+class RawGL:
+    """glTexImage3D / glTexSubImage3D on the CURRENT context through ctypes: moderngl 5.13 cannot write one mip level
+    of one layer of a texture array, and glGenerateMipmap would redo all 8 layers. Create it on the render thread."""
 
-    STRIP_BYTES = 1 << 20            # upload at most ~1 MB per frame (256 rows at 1024, the whole image at 512)
+    T2A, RGBA, RGBA8, UBYTE, UNPACK_ALIGN, UNPACK_PBO = 0x8C1A, 0x1908, 0x8058, 0x1401, 0x0CF5, 0x88EF
+
+    def __init__(self):
+        import ctypes
+        import sys
+        if sys.platform != "win32":
+            raise OSError("raw GL uploads are only wired up for Windows")
+        C = ctypes
+        gl = C.windll.opengl32
+        get = gl.wglGetProcAddress
+        get.restype, get.argtypes = C.c_void_p, [C.c_char_p]
+
+        def proc(name, *args):
+            addr = get(name)
+            if not addr:
+                raise OSError(f"{name.decode()} is not available")
+            return C.WINFUNCTYPE(None, *args)(addr)
+
+        i, u, p = C.c_int, C.c_uint, C.c_void_p
+        self._sub = proc(b"glTexSubImage3D", u, i, i, i, i, i, i, i, u, u, p)
+        self._img = proc(b"glTexImage3D", u, i, i, i, i, i, i, u, u, p)
+        self._bind = gl.glBindTexture
+        self._bind.restype, self._bind.argtypes = None, [u, u]
+        self._store = gl.glPixelStorei
+        self._store.restype, self._store.argtypes = None, [u, i]
+        self._geti = gl.glGetIntegerv
+        self._geti.restype, self._geti.argtypes = None, [u, p]
+        self._err = gl.glGetError
+        self._err.restype, self._err.argtypes = u, []
+        self._c = C
+
+    def _ready(self, glo):
+        v = self._c.c_int(0)
+        self._geti(self.UNPACK_PBO, self._c.byref(v))
+        if v.value:                                      # somebody left a pixel-unpack buffer bound: not ours to touch
+            return False
+        self._bind(self.T2A, glo)                        # 2D-array target of the active unit: nothing else uses it
+        self._store(self.UNPACK_ALIGN, 1)
+        return True
+
+    def alloc_levels(self, glo, size, layers):
+        """Storage for mip levels 1.. (level 0 exists). False = could not (the caller falls back)."""
+        if not self._ready(glo):
+            return False
+        while self._err():
+            pass
+        lvl, s = 1, size // 2
+        while s >= 1:
+            self._img(self.T2A, lvl, self.RGBA8, s, s, layers, 0, self.RGBA, self.UBYTE, None)
+            lvl, s = lvl + 1, s // 2
+        return self._err() == 0
+
+    def sub(self, glo, level, y, layer, width, rows, arr, offset):
+        """Rows y .. y + rows of one layer of one level, from arr (uint8, C order) at byte `offset`."""
+        if not self._ready(glo):
+            raise OSError("a pixel-unpack buffer is bound")
+        self._sub(self.T2A, level, 0, y, layer, width, rows, 1, self.RGBA, self.UBYTE, arr.ctypes.data + offset)
+
+
+class SkinLibrary:
+    """Up to MAX_LAYERS resident skins in ONE texture array, allocated on first use (no skin = no VRAM). The loader
+    thread decodes, resizes and builds the mip chain; the render thread only copies bytes: tick() uploads at most
+    STRIP_BYTES per frame (level 0 in strips, then the smaller levels), never regenerates mips, and does nothing on
+    a frame the caller reports as late."""
+
+    STRIP_BYTES = 1 << 20            # upload at most ~1 MB per frame (256 rows at 1024)
     STARVE_S = 2.0                   # a show that is ALWAYS late still gets its skin after this long
 
-    def __init__(self, ctx, roots, size=1024, layers=MAX_LAYERS, aniso=4.0, loader=load_image, sync=False):
+    def __init__(self, ctx, roots, size=1024, layers=MAX_LAYERS, aniso=4.0, loader=load_image, sync=False, raw=None):
         self.ctx, self.roots = ctx, {k: Path(v) for k, v in roots.items()}
         self.layers, self.aniso, self._loader, self.sync = int(layers), float(aniso), loader, bool(sync)
-        self.size = 0
-        self.tex = None
+        self.size = min(SIZES, key=lambda s: abs(s - int(size)))
+        self.tex = None                  # allocated by the first tick() that has something to upload
+        self._raw_arg, self.raw = raw, None      # raw: None = detect, False = moderngl only, else a RawGL-like object
         self.gen = 0                 # bumps whenever layer indices stop being valid (resize / release)
-        self.uploads = self.mips = self.evictions = self.deferred = self.binds = 0
+        self.uploads = self.mips = self.evictions = self.deferred = self.binds = self.skipped = self.allocs = 0
         self.upload_ms = 0.0
         self._key = [None] * self.layers         # layer -> key
         self._used = [0] * self.layers           # layer -> last tick it was needed
         self._where = {}                         # key -> layer (ready)
         self._aspect = {}
-        self._pending = {}                       # key -> requested at
-        self._failed = {}                        # key -> (mtime or None, retry after)
-        self._job = None                         # the upload in progress: dict(key, layer, data, row)
+        self._pending = {}                       # key -> (size, gen) the decode was asked for
+        self._failed = {}                        # key -> retry after (monotonic)
+        self._job = None                         # the upload in progress: dict(key, layer, levels, steps, i)
         self._tick = 0
         self._late_since = None
         self._q_in, self._q_out = queue.Queue(), queue.Queue()
         self._stop = threading.Event()
         self._thread = None
-        self._alloc(size)
 
     # ---- allocation
-    def _alloc(self, size):
-        size = min(SIZES, key=lambda s: abs(s - int(size)))
-        if self.tex is not None:
-            self.tex.release()
-        self.size = size
+    def _alloc(self):
+        import moderngl
+        size = self.size
         self.tex = self.ctx.texture_array((size, size, self.layers), 4, dtype="f1")
         self.tex.repeat_x = self.tex.repeat_y = True
-        self.tex.build_mipmaps()
-        import moderngl
+        self.raw = None
+        glo = getattr(self.tex, "glo", None)
+        if self._raw_arg is not None and self._raw_arg is not False:
+            self.raw = self._raw_arg
+        elif self._raw_arg is None and isinstance(glo, int):
+            try:
+                self.raw = RawGL()
+            except Exception:
+                self.raw = None
+        if self.raw is not None:
+            try:
+                if not self.raw.alloc_levels(glo, size, self.layers):
+                    self.raw = None
+            except Exception:
+                self.raw = None
+        if self.raw is None:                             # fallback: let GL make the (empty) chain once
+            self.tex.build_mipmaps()
         self.tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
         try:
             self.tex.anisotropy = self.aniso
         except Exception:
             pass
+        self.allocs += 1
+
+    def _drop(self):
+        if self.tex is not None:
+            self.tex.release()
+            self.tex = None
         self._key = [None] * self.layers
         self._where.clear()
-        self._pending.clear()
         self._job = None
-        self.gen += 1
-        while not self._q_out.empty():
-            self._q_out.get_nowait()
+        self.gen += 1                                    # pending decodes of the old size are recognised and dropped
 
     def set_size(self, size):
-        """Reallocate at another resolution (governor / battery). Every layer has to be loaded again."""
+        """Another resolution (governor / battery). The array is freed; every skin is decoded and uploaded again."""
         size = min(SIZES, key=lambda s: abs(s - int(size)))
         if size != self.size:
-            self._alloc(size)
+            self.size = size
+            self._drop()
+            self._pending.clear()
         return self.size
 
     def vram_bytes(self):
@@ -701,11 +897,7 @@ class SkinLibrary:
     def release(self):
         self._stop.set()
         self._q_in.put(None)
-        if self.tex is not None:
-            self.tex.release()
-            self.tex = None
-        self._where.clear()
-        self.gen += 1
+        self._drop()
 
     # ---- lookups (render thread)
     def path(self, key):
@@ -721,7 +913,7 @@ class SkinLibrary:
         return p
 
     def request(self, key):
-        """-> layer index, or -1 while the image is not resident yet (it is then queued for loading)."""
+        """-> layer index, or -1 while the image is not resident yet (it is then queued for loading). No GL here."""
         lay = self._where.get(key)
         if lay is not None:
             self._used[lay] = self._tick
@@ -731,7 +923,7 @@ class SkinLibrary:
         bad = self._failed.get(key)
         if bad is not None and time.monotonic() < bad:
             return -1
-        self._pending[key] = time.monotonic()
+        self._pending[key] = (self.size, self.gen)
         if self.sync:
             self._decode(key, self.size, self.gen)
         else:
@@ -750,6 +942,8 @@ class SkinLibrary:
             if p is None or not p.is_file():
                 raise FileNotFoundError(str(key[1]))
             data, asp = self._loader(p, size)
+            if isinstance(data, (bytes, bytearray, memoryview)):         # a loader that only gives the base image
+                data = mip_chain(np.frombuffer(data, dtype="u1").reshape(size, size, 4))
             self._q_out.put((key, size, gen, data, asp, None))
         except Exception as ex:
             self._q_out.put((key, size, gen, None, 1.0, f"{type(ex).__name__}: {ex}"))
@@ -767,18 +961,37 @@ class SkinLibrary:
             self._decode(*item)
 
     # ---- uploads (render thread)
-    def _victim(self, pinned):
-        free = [i for i, k in enumerate(self._key) if k is None]
-        if free:
-            return free[0]
-        cand = [i for i, k in enumerate(self._key) if k not in pinned]
-        if not cand:
-            return None
-        return min(cand, key=lambda i: self._used[i])
+    def busy(self):
+        return self._job is not None or bool(self._pending) or not self._q_out.empty()
 
-    def tick(self, late=False, pinned=()):
-        """Do at most ONE small piece of GL work. `late`: this frame is already over budget -> do nothing (unless the
-        show has been late for STARVE_S). `pinned`: keys in use right now, never evicted. Returns True if it worked."""
+    def _victim(self, pinned):
+        for i, k in enumerate(self._key):
+            if k is None:
+                return i
+        best = None
+        for i, k in enumerate(self._key):
+            if k not in pinned and (best is None or self._used[i] < self._used[best]):
+                best = i
+        return best
+
+    def _plan(self, levels):
+        """Upload steps (level, first row, rows): level 0 in strips of at most STRIP_BYTES, then each smaller level."""
+        steps = []
+        for lvl, a in enumerate(levels):
+            s = a.shape[0]
+            rows = max(1, self.STRIP_BYTES // (s * 4))
+            y = 0
+            while y < s:
+                n = min(rows, s - y)
+                steps.append((lvl, y, n, n * s * 4))
+                y += n
+        return steps
+
+    def tick(self, late=False, pinned=(), wanted=None):
+        """Do at most ONE small piece of GL work (about STRIP_BYTES of texture upload). `late`: this frame is already
+        over budget -> do nothing (unless the show has been late for STARVE_S). `pinned`: keys on screen, never
+        evicted. `wanted`: keys some slot still asks for; a decoded image nobody wants any more is dropped without an
+        upload. Returns True if it uploaded something."""
         self._tick += 1
         if self._job is None and self._q_out.empty():
             return False
@@ -793,15 +1006,28 @@ class SkinLibrary:
             self._late_since = None
         t0 = time.perf_counter()
         job = self._job
+        if job is not None and wanted is not None and job["key"] not in wanted:
+            self._job = job = None                         # half uploaded and no longer wanted: its layer stays free
+            self.skipped += 1
+            if self._q_out.empty():
+                return False
         if job is None:
             key, size, gen, data, asp, err = self._q_out.get_nowait()
-            self._pending.pop(key, None)
+            if self._pending.get(key) == (size, gen):      # only the decode that was asked for clears the request
+                del self._pending[key]
             if gen != self.gen or size != self.size:
                 return False                               # decoded for an array that no longer exists
             if err is not None:
                 self._failed[key] = time.monotonic() + 5.0
                 self.last_error = err
                 return False
+            if key in self._where:
+                return False                               # already resident (a duplicate decode)
+            if wanted is not None and key not in wanted:
+                self.skipped += 1                          # tapped past it: no upload, no eviction
+                return False
+            if self.tex is None:
+                self._alloc()
             lay = self._victim(pinned)
             if lay is None:
                 self._failed[key] = time.monotonic() + 1.0  # every layer is on screen: try again in a moment
@@ -812,17 +1038,26 @@ class SkinLibrary:
                 self.evictions += 1
             self._key[lay] = None
             self._aspect[key] = asp
-            self._job = job = dict(key=key, layer=lay, data=memoryview(data), row=0)
-        s = self.size
-        if job["row"] < s:
-            rows = max(1, min(s - job["row"], self.STRIP_BYTES // (s * 4)))
-            a, b = job["row"] * s * 4, (job["row"] + rows) * s * 4
-            self.tex.write(job["data"][a:b], viewport=(0, job["row"], job["layer"], s, rows, 1))
-            job["row"] += rows
+            levels = data if self.raw is not None else data[:1]
+            self._job = job = dict(key=key, layer=lay, levels=levels, steps=self._plan(levels), i=0)
+        s, steps, budget = self.size, job["steps"], self.STRIP_BYTES
+        while job["i"] < len(steps):
+            lvl, y, rows, nbytes = steps[job["i"]]
+            if nbytes > budget and budget < self.STRIP_BYTES:
+                break                                      # the next piece goes on the next frame
+            a = job["levels"][lvl]
+            w = a.shape[1]
+            if self.raw is not None:
+                self.raw.sub(getattr(self.tex, "glo", 0), lvl, y, job["layer"], w, rows, a, y * w * 4)
+            else:
+                self.tex.write(memoryview(a).cast("B")[y * w * 4:(y + rows) * w * 4], viewport=(0, y, job["layer"], w, rows, 1))
             self.uploads += 1
-        else:
-            self.tex.build_mipmaps()
-            self.mips += 1
+            budget -= nbytes
+            job["i"] += 1
+        if job["i"] >= len(steps):
+            if self.raw is None:                           # fallback path only: GL builds the mips (all layers)
+                self.tex.build_mipmaps()
+                self.mips += 1
             self._key[job["layer"]] = job["key"]
             self._where[job["key"]] = job["layer"]
             self._used[job["layer"]] = self._tick
@@ -835,7 +1070,7 @@ class SkinLibrary:
     def flush(self, pinned=(), timeout=10.0):
         """Tests / stills: finish every pending load now."""
         end = time.monotonic() + timeout
-        while (self._pending or self._job is not None or not self._q_out.empty()) and time.monotonic() < end:
+        while self.busy() and time.monotonic() < end:
             if not self.tick(False, pinned):
                 time.sleep(0.002)
 
@@ -850,6 +1085,8 @@ class SkinLibrary:
 
 
 # ------------------------------------------------------------------ engine side
+
+UPSIZE_CALM_S = 60.0             # back to the big array only after the governor has had nothing applied for this long
 
 
 class _Slot:
@@ -866,25 +1103,28 @@ class _Slot:
 
 class SkinEngine:
     """Crossfades, phases and uniforms for every skinned slot. One per GL context (the engine shares it between the
-    LandPass and the scene shader).
+    LandPass and the scene shader). Per frame, in this order:
 
-        sk.update(frame, dt, clock, late, level)     once per frame; frame = SkinState.frame
-        sk.active(env)                               -> bool: does this world need its skinned shader this frame?
+        sk.update(frame, dt, clock, eff, snap)       logic only, NO GL (safe inside a guard); frame = SkinState.frame
+        sk.gl_step(late)                             the GL part: at most one upload piece / a resize (call unguarded)
         sk.advance(env, dz)                          the host's travel this frame (keeps the skin on its wall)
-        sk.bind(prog, env)                           writes the uniform block + binds the array (only when active)
+        sk.active(env)                               -> bool: does this world need its skinned shader this frame?
+        sk.bind(prog, env)                           writes the uniform block (with this frame's phases) + binds the array
     """
 
-    def __init__(self, ctx, roots, size=1024, aniso=4.0, sync=False, loader=load_image, lib=None):
+    def __init__(self, ctx, roots, size=1024, aniso=4.0, sync=False, loader=load_image, lib=None, clock=time.monotonic):
         self.lib = lib if lib is not None else SkinLibrary(ctx, roots, size=size, aniso=aniso, sync=sync, loader=loader)
         self.want_size = self.lib.size
         self.base_size = self.lib.size
         self.level = 0
-        self.suppress = False                       # governor critical: everything procedural
+        self.suppress = False                       # the governor's last-resort step is applied: everything procedural
+        self._clock = clock
+        self._calm_since = clock()
         self._slots = {env: [_Slot() for _ in e["slots"]] for env, e in ENVS.items()}
         self._u = {env: np.zeros((5, MAX_SLOTS, 4), dtype="f4") for env in ENVS}       # preallocated uniform blocks
         self._on = {env: False for env in ENVS}
-        self._eff = {env: 0 for env in ENVS}
-        self._pinned = set()
+        self._pinned, self._wanted = set(), set()
+        self.enabled = True                         # the engine mirrors SkinState.on here (off = free the array)
         self.fade_s = FADE_S
         self.binds = 0
 
@@ -900,12 +1140,24 @@ class SkinEngine:
                 return True
         return False
 
-    def govern(self, level):
-        """Resource governor: 0 calm -> the configured size; 1 strained -> 512 px; 2 critical -> procedural only (and
-        the array stays small). Changes are made while nothing is on screen (every slot fades out first)."""
-        self.level = int(level)
-        self.suppress = self.level >= 2
-        self.want_size = self.base_size if self.level <= 0 else SIZES[0]
+    def govern(self, quality):
+        """What the resource governor has DECIDED (governor.skin_quality(): its applied reductions, which already
+        carry its mode, its 3 s sustain and its 15 s recovery), never the raw strain level:
+        0 nothing applied -> the configured size (grown back only after UPSIZE_CALM_S of calm);
+        1 something applied -> 512 px; 2 its last-resort step -> every slot procedural until it is restored.
+        Changes are made while nothing is on screen (every slot fades out first)."""
+        q = min(max(int(quality), 0), 2)
+        now = self._clock()
+        if q > 0:
+            self._calm_since = None
+        elif self._calm_since is None:
+            self._calm_since = now
+        self.level = q
+        self.suppress = q >= 2
+        if q >= 1:
+            self.want_size = SIZES[0]
+        elif self.want_size != self.base_size and now - self._calm_since >= UPSIZE_CALM_S:
+            self.want_size = self.base_size
 
     def vram_bytes(self):
         return self.lib.vram_bytes()
@@ -921,21 +1173,25 @@ class SkinEngine:
                 sl.pu = (sl.pu + sl.m[1] * dz * sl.follow) % PH_WRAP
                 sl.pv = (sl.pv + sl.m[3] * dz * sl.follow) % PH_WRAP
 
-    def update(self, frame, dt, clock=None, late=False, eff=None):
-        """frame: SkinState.frame ({} = nothing skinned: returns after one dict check). eff: {env: effective mapping}
-        from the host (the tunnel's "follow the travel mode")."""
+    def idle(self):
+        return not self._pinned and not self.lib.busy() and (self.enabled or self.lib.tex is None)
+
+    def update(self, frame, dt, clock=None, late=False, eff=None, snap=False, gl=True):
+        """Logic only. frame: SkinState.frame ({} = nothing skinned: returns after one check). eff: {env: effective
+        mapping} from the host (the tunnel's "follow the travel mode"). snap: no fades this frame (PANIC cuts).
+        gl=True also runs gl_step(late) (tests, stills); the engine passes gl=False and calls gl_step itself."""
         lib = self.lib
-        if not frame and not self._pinned and lib._job is None and not lib._pending:
-            if lib.size != self.want_size and not self.any_active():
-                lib.set_size(self.want_size)
+        if not frame and self.idle():
+            if gl:
+                self.gl_step(late)
             return
         dt = min(max(float(dt), 0.0), 0.1)
         bpm = float(clock.get("bpm", 120.0)) if clock else 120.0
-        k = min(1.0, dt / self.fade_s) if self.fade_s > 0 else 1.0
-        resizing = lib.size != self.want_size
-        hold = self.suppress or resizing
-        pinned = self._pinned
+        k = 1.0 if snap or self.fade_s <= 0 else min(1.0, dt / self.fade_s)
+        hold = self.suppress or lib.size != self.want_size
+        pinned, wanted = self._pinned, self._wanted
         pinned.clear()
+        wanted.clear()
         for env, slots in self._slots.items():
             fe = frame.get(env) if frame else None
             names = ENVS[env]["slots"]
@@ -952,6 +1208,7 @@ class SkinEngine:
                 if v is not None and not hold:
                     src = v["src"]
                     want = (src["kind"], src["name"])
+                    wanted.add(want)
                 target = 0.0
                 if want is not None:
                     if sl.cur_key == want and sl.nxt_key is None:
@@ -971,11 +1228,8 @@ class SkinEngine:
                                 if sl.xf <= 0.0:
                                     sl.nxt, sl.nxt_key = -1, None
                             elif lay >= 0:
-                                if sl.nxt_key != want:
-                                    if sl.xf > 0.0:           # mid-fade to something else: finish that first
-                                        pass
-                                    else:
-                                        sl.nxt, sl.nxt_key = lay, want
+                                if sl.nxt_key != want and sl.xf <= 0.0:      # (mid-fade to something else: finish that first)
+                                    sl.nxt, sl.nxt_key = lay, want
                                 if sl.nxt_key is not None:
                                     sl.xf = min(1.0, sl.xf + k)
                                     if sl.xf >= 1.0:
@@ -988,9 +1242,11 @@ class SkinEngine:
                     continue
                 if sl.cur_key is not None:
                     pinned.add(sl.cur_key)
+                    wanted.add(sl.cur_key)
                     lib.request(sl.cur_key)
                 if sl.nxt_key is not None:
                     pinned.add(sl.nxt_key)
+                    wanted.add(sl.nxt_key)
                 if v is None:                                 # fading out after a clear: keep the last look
                     u[0, i, 3] = sl.amt * u[4, i, 3]
                     on = on or sl.amt > 0.0
@@ -1013,21 +1269,37 @@ class SkinEngine:
                 u[0, i, 0], u[0, i, 1], u[0, i, 2], u[0, i, 3] = max(sl.cur, 0), max(sl.nxt, 0), sl.xf if sl.nxt >= 0 else 0.0, amt
                 u[1, i, 0], u[1, i, 1], u[1, i, 2], u[1, i, 3] = e, v["mix"], tile, v["pal"]
                 u[2, i, 0], u[2, i, 1], u[2, i, 2], u[2, i, 3] = sl.m[0], sl.m[2], sl.m[1], sl.m[3]     # column major
-                u[3, i, 0], u[3, i, 1], u[3, i, 2], u[3, i, 3] = sl.pu, sl.pv, 0.5 / lib.size, v["bright"]
+                u[3, i, 2], u[3, i, 3] = 0.5 / lib.size, v["bright"]     # the phases (u[3, i, 0:2]) are written in bind()
                 u[4, i, 0], u[4, i, 1], u[4, i, 2] = v["tint"]
                 u[4, i, 3] = v["amount"]
                 on = on or amt > 0.0005
             self._on[env] = on
-        if resizing and not self.any_active():
+        if gl:
+            self.gl_step(late)
+
+    def gl_step(self, late=False):
+        """The GL part of the frame: a pending resize (only while nothing is on screen) and at most one upload piece.
+        GL errors raised here are real context trouble: the engine does NOT swallow them."""
+        lib = self.lib
+        if not self.enabled and lib.tex is not None and not self.any_active():
+            lib._drop()                                  # skins were switched off: the VRAM goes back
+            lib._pending.clear()
+        if lib.size != self.want_size and not self.any_active():
             lib.set_size(self.want_size)
-        lib.tick(late, pinned)
+        if lib._job is not None or not lib._q_out.empty():
+            lib.tick(late, self._pinned, self._wanted)
+        else:
+            lib._tick += 1
 
     def effective(self, env, slot_i=0):
         return int(self._u[env][1, slot_i, 0])
 
     def bind(self, prog, env):
-        """Uniform block + the array on its unit. Call only while active(env)."""
+        """Uniform block + the array on its unit. Call only while active(env), AFTER this frame's advance(): the
+        phases are read here, so the skin moves with the geometry of the same frame."""
         u = self._u[env]
+        for i, sl in enumerate(self._slots[env]):
+            u[3, i, 0], u[3, i, 1] = sl.pu, sl.pv
         n = prog["skA"].array_length
         for j, name in enumerate(("skA", "skB", "skC", "skD", "skE")):
             if name in prog:
@@ -1058,6 +1330,7 @@ def _images(root, skip=("kene",)):
 
 def gallery(out=None, size=(640, 400), picks=None):
     """Every 3D world: procedural + three skins -> test_frames/skins/*.png + contact_sheet.png."""
+    import sys
     import fx_stack as fx
     from PIL import Image, ImageDraw
     here = Path(__file__).parent
@@ -1066,7 +1339,7 @@ def gallery(out=None, size=(640, 400), picks=None):
     names = _images(here / "textures")
     if not names:
         raise SystemExit("no images in textures/")
-    picks = picks or [names[i % len(names)] for i in (0, 4, 7, 2, 5, 9, 3, 6, 8, 1, 4, 7)]
+    picks = picks or [names[i % len(names)] for i in (6, 3, 5, 9, 4, 7, 8, 2, 6, 5, 3, 9)]
     ctx, _win = fx.hidden_context()
     lp = fx.LandPass(ctx, size)
     lp.settle_s = 0.0
@@ -1098,14 +1371,41 @@ def gallery(out=None, size=(640, 400), picks=None):
             ImageDraw.Draw(im).text((8, 6), label, fill=(255, 255, 255))
             row.append(im)
         cells.append(row)
+    lp.release()
+    eng.release()
+    # the travel tunnel lives in the main scene shader: rendered by the real engine, headless (one short run per shot)
+    import json
+    import subprocess
+    import tempfile
+    tun = [("tunnel: procedural", None, dict(travel_mode=0)),
+           ("tunnel: replace (log-polar)", dict(src=dict(kind="ai", name=picks[0]), mix=0), dict(travel_mode=0)),
+           ("tunnel: screen (tube)", dict(src=dict(kind="ai", name=picks[1]), mix=2, scale=1.0), dict(travel_mode=1)),
+           ("tunnel: lines reveal (Droste)", dict(src=dict(kind="ai", name=picks[4]), mix=4, bright=1.6), dict(travel_mode=3))]
+    row = []
+    with tempfile.TemporaryDirectory() as td:
+        for i, (label, slot, sets) in enumerate(tun):
+            cmd = [sys.executable, str(here / "live_visuals.py"), "--test", "40", "--out", str(Path(td) / str(i)), "--render",
+                   f"{size[0]}x{size[1]}", "--set", "travel=0.6"] + [x for k, v in sets.items() for x in ("--set", f"{k}={v}")]
+            if slot:
+                (Path(td) / f"s{i}.json").write_text(json.dumps(dict(slots={"tunnel:walls": slot})))
+                cmd += ["--skins", str(Path(td) / f"s{i}.json")]
+            r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(here))
+            shots = sorted((Path(td) / str(i)).glob("frame_*.png"))
+            if r.returncode or not shots:
+                print("[skins] tunnel shot failed:", (r.stdout + r.stderr)[-300:])
+                break
+            im = Image.open(shots[-1]).convert("RGB").resize(size, Image.LANCZOS)
+            im.save(out / f"tunnel_{i}.png")
+            ImageDraw.Draw(im).text((8, 6), label, fill=(255, 255, 255))
+            row.append(im)
+    if len(row) == len(tun):
+        cells.append(row)
     w, h = size[0] // 2, size[1] // 2
     sheet = Image.new("RGB", (w * len(cells[0]), h * len(cells)))
     for r, row in enumerate(cells):
         for c, im in enumerate(row):
             sheet.paste(im.resize((w, h), Image.LANCZOS), (c * w, r * h))
     sheet.save(out / "contact_sheet.png")
-    lp.release()
-    eng.release()
     print(f"[skins] gallery -> {out}")
     return out
 

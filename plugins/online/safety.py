@@ -14,6 +14,8 @@ Hard rules (photosensitive + show safety), none of them configurable from the pa
   * the light chase: sweeps a second x how often each point lights up per sweep (chase_mode 0 = 1, 1 = 2,
     2 = up to 4) stays at or under MAX_FLASH_HZ. Checked against the chase_mode the batch leaves behind and against
     the BPM at the moment of APPLY (`finalize`), not only when the reply arrived.
+    A recalled scene is applied at once (never queued to the next bar, where it would fire after the clamps), and
+    selector values are snapped the way the shader reads them (floor(v + 0.5)); switching the chase on counts too.
   * no blackout by the back door: a batch whose net effect leaves no layer visible (every l_* under LAYER_MIN or
     switched off) is refused as a whole.
   * GPU load: the assistant may lower but never raise render scales / detail / counts (COST), and may not switch on
@@ -34,7 +36,7 @@ from params import PARAMS, TRIGGERS
 
 ALLOWED = ("set", "nudge", "palette", "morph", "scene_recall", "scene_save", "bypass", "art_pick", "text", "gen")
 MAX_FLASH_HZ = 2.5          # WCAG 2.3.1 / ITU-R BT.1702 allow at most 3 flashes a second; a dark room with a
-                            # wall-sized picture is harsher than a monitor, so stay under it (research/gemini_neon_support.md)
+                            # wall-sized picture is harsher than a monitor, so stay under it (WCAG 2.2 SC 2.3.1)
 MASTER_MIN = 0.15
 MIN_FADE_S = 0.35           # shortest layer on / off fade the assistant may cause
 MIN_MORPH_S = 0.5           # shortest scene morph the assistant may cause
@@ -110,8 +112,13 @@ def _param(c):
 def max_chase_rate(bpm, mode=0):
     """Largest |chase_rate| (sweeps per bar) at which no point of the picture lights up more than MAX_FLASH_HZ
     times a second at this tempo: chase_mode 1 lights each point twice per sweep, mode 2 up to four times."""
-    mult = CHASE_MULT.get(int(round(float(mode))), 4.0)
+    mult = CHASE_MULT.get(snap(mode), 4.0)
     return MAX_FLASH_HZ * 240.0 / max(1.0, float(bpm)) / mult
+
+
+def snap(v):
+    """A selector value as the SHADER reads it: floor(v + 0.5). (Python's round() sends 0.5 to 0, the shader to 1.)"""
+    return int(math.floor(float(v) + 0.5))
 
 
 def is_cost(name):
@@ -150,6 +157,13 @@ def finalize(cmds, ctx):
     """Whole-batch rules, run when the reply arrives AND again at the moment of apply (the tempo, the faders and the
     governor may have moved in between). -> (commands, notes, refusal): refusal != "" means apply nothing."""
     cmds, notes = [dict(c) for c in cmds], []
+    # ---- order: a recalled scene first (it rewrites every fader), then the batch's own moves on top of it. That is
+    #      the order _after() assumes, so a clamp appended below really is the last word.
+    first = [c for c in cmds if c["cmd"] == "morph"] + [c for c in cmds if c["cmd"] == "scene_recall"]
+    cmds = first + [c for c in cmds if c["cmd"] not in ("morph", "scene_recall")]
+    for c in cmds:
+        if c["cmd"] == "scene_recall":
+            c["now"] = True          # never queued to the next bar: a queued recall would fire AFTER our clamps
     # ---- GPU cost: never raise render scale / detail / counts
     keep = []
     for c in cmds:
@@ -177,8 +191,9 @@ def finalize(cmds, ctx):
         notes.append(f"{victim} left off: too many heavy layers at once"
                      + (" (the governor is already reducing load)" if ctx.get("strained") else ""))
     # ---- light chase: flashes per second = sweeps per second x multiplicity of the mode the batch leaves behind
-    touches = any((c["cmd"] == "set" and c["name"] in ("chase_rate", "chase_mode")) or c["cmd"] == "scene_recall"
-                  for c in cmds)
+    touches = any((c["cmd"] == "set" and c["name"].startswith("chase")) or c["cmd"] == "scene_recall"
+                  or (c["cmd"] == "bypass" and not c["on"] and "chase" in control.BYPASS_COVER.get(c["key"], ()))
+                  for c in cmds)       # switching the chase ON (fader or bypass) counts as much as changing its rate
     base, byp = _after(cmds, ctx)
     if touches and "chase_rate" in PARAMS:
         lim = max_chase_rate(ctx["bpm"], base.get("chase_mode", 0.0))
@@ -188,8 +203,14 @@ def finalize(cmds, ctx):
             cmds = [c for c in cmds if not (c["cmd"] == "set" and c["name"] == "chase_rate")]
             cmds.append({"cmd": "set", "name": "chase_rate", "v": v})
             notes.append(f"chase_rate clamped {rate:g} -> {v:.3g} (at most {MAX_FLASH_HZ:g} flashes a second in chase "
-                         f"mode {int(round(base.get('chase_mode', 0.0)))} at {ctx['bpm']:.0f} BPM)")
+                         f"mode {snap(base.get('chase_mode', 0.0))} at {ctx['bpm']:.0f} BPM)")
             base, byp = _after(cmds, ctx)
+    # ---- a recalled scene may carry a master below the floor: lift it
+    if any(c["cmd"] == "scene_recall" for c in cmds) and base.get("master", 1.0) < MASTER_MIN - 1e-9:
+        cmds = [c for c in cmds if not (c["cmd"] == "set" and c["name"] == "master")]
+        cmds.append({"cmd": "set", "name": "master", "v": MASTER_MIN})
+        notes.append(f"master lifted to {MASTER_MIN:g} (the recalled scene is darker than the assistant may go)")
+        base, byp = _after(cmds, ctx)
     # ---- net effect: never leave the room dark
     if _visible(ctx["base"], ctx["bypass"]) and not _visible(base, byp):
         return [], notes, "this would switch every layer off (a blackout is the performer's call)"
@@ -206,6 +227,8 @@ def _set(name, v, ctx, notes):
         lim = max_chase_rate(ctx["bpm"])
         lo, hi = max(lo, -lim), min(hi, lim)
     out = min(hi, max(lo, float(v)))
+    if name in control.DISCRETE:
+        out = float(min(math.floor(hi + 0.5), max(math.floor(lo + 0.5), snap(out))))    # selectors: whole steps only
     if abs(out - float(v)) > 1e-9:
         notes.append(f"{name} clamped {float(v):g} -> {out:g}")
     return {"cmd": "set", "name": name, "v": out}

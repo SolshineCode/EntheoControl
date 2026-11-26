@@ -484,3 +484,47 @@ def test_worker_http_auth_still_gating_and_quit():
 
 def test_shader_guards_the_vanishing_line_and_respects_the_edge():
     assert "c.z > 1e-4" in cl.SCENE_GLSL and "float edge" in cl.SCENE_GLSL
+
+
+# ---------------------------------------------------------------- PR-2 review regressions (camera side)
+
+def test_b12_keystone_extremes_never_make_a_singular_alignment(tmp_path):
+    for kx in (-1.0, 1.0):
+        for ky in (-1.0, 1.0):
+            s = cl.clean_settings({"key_x": kx, "key_y": ky})
+            assert abs(s["key_x"]) + abs(s["key_y"]) <= cl.KEY_SUM_MAX + 1e-9
+            H = cl.align_matrix(s)
+            assert np.isfinite(np.linalg.inv(H)).all()
+    bad = dict(cl.clean_settings({}), key_x=1.0, key_y=1.0)       # a hand-edited live_state.json
+    H, Hi = cl.safe_align(bad)
+    assert np.isfinite(Hi).all()
+
+    class Ctl(FakeCtl):
+        pass
+    ctl = Ctl()
+    ctl.ext = {"camera": {"key_x": 1.0, "key_y": 1.0}}
+    lay = cl.CameraLayer(None, ctl, here=tmp_path)                 # never a startup crash loop
+    assert np.isfinite(lay.Hinv).all()
+
+
+def test_b13_stop_during_start_never_orphans_a_worker_or_uses_port_none(tmp_path):
+    if not cl.available()[0]:
+        pytest.skip("cv2 missing")
+    (tmp_path / "camera_worker.py").write_text("#")
+    gate, procs = threading.Event(), []
+
+    def spawn(p, s, h, t=None):
+        gate.wait(5)                                              # the start thread is slow; OFF arrives meanwhile
+        procs.append(FakeProc())
+        return procs[-1]
+    lay = cl.CameraLayer(None, FakeCtl(), here=tmp_path, spawn=spawn, link_factory=FakeLink)
+    lay.command({"op": "on"})
+    time.sleep(0.05)
+    lay.command({"op": "off"})
+    gate.set()
+    time.sleep(0.3)
+    assert not lay.on and lay.link is None and lay.proc is None
+    assert procs and procs[0].returncode == 0                     # the late worker was stopped, not adopted
+    assert FakeLink.instances[-1].quitted
+    with pytest.raises(RuntimeError):
+        lay.still(1)                                              # never HTTPConnection("127.0.0.1", None)

@@ -49,7 +49,7 @@ def show_json(d, slug):
 
 def listing(c, kind):
     c.state()                                         # the blobs are refreshed when the state is published
-    return json.loads(control.blob(kind)[1])
+    return json.loads(c.blob_cache[kind][1])          # THIS controller's (control.blob() serves whichever published last)
 
 
 # ------------------------------------------------------------------ shows
@@ -449,3 +449,118 @@ def test_n34_partial_open_keeps_the_open_show(tmp_path):
     assert c.shows.current == "a"
     do(c, cmd="show", op="open", slug="b", parts=["timeline"])
     assert c.shows.current == "a" and c.shows.dirty
+
+
+
+# ------------------------------------------------------------------ PR2 review (research/neon_pr2_review.md) B16-B19
+
+
+def test_b16_listing_never_serves_a_stale_summary_after_a_quick_rewrite(tmp_path):
+    c = make(tmp_path)
+    for i in range(5):                                # save + star + rename inside one file-clock tick, five times
+        do(c, cmd="preset", op="save", kind="mod", name=f"Quick {i}")
+        do(c, cmd="preset", op="set", ref=f"mod/quick-{i}", fav=True, tags=["x"], name=f"Q{i}")
+        p = [x for x in listing(c, "presets")["presets"] if x["ref"] == f"mod/quick-{i}"][0]
+        assert p["fav"] and p["tags"] == ["x"] and p["name"] == f"Q{i}"
+
+
+def test_b17_invalid_utf8_is_corrupt_not_a_crash(tmp_path):
+    c = make(tmp_path)
+    do(c, cmd="preset", op="save", kind="mod", name="Good")
+    (tmp_path / "presets" / "mod" / "bad.json").write_bytes(b'{"name": "\xff\xfe"}')
+    d = tmp_path / "shows" / "broken"
+    d.mkdir(parents=True)
+    (d / "show.json").write_bytes(b"\xff\xfe\x00{")
+    do(c, cmd="preset", op="rescan")
+    do(c, cmd="show", op="rescan")
+    assert [x["ref"] for x in listing(c, "presets")["presets"]] == ["mod/good"]
+    assert list((tmp_path / "presets" / "mod").glob("bad.json.*.bad"))
+    assert [s["broken"] for s in listing(c, "shows")["shows"] if s["slug"] == "broken"] == [True]
+    do(c, cmd="show", op="open", slug="broken")
+    assert c.shows.notice[1] == "error" and list(d.glob("show.json.*.bad"))
+    assert S.read_json(d / "nope.json", 100) == (None, "missing")
+
+
+def test_b19_advertised_rev_matches_the_served_blob(tmp_path):
+    c = make(tmp_path)
+    st = c.state()
+    m = c.shows
+    m.rev["presets"] += 7                            # the worker moved on after state() took its blobs
+    st2 = c.state()
+    m.blobs["presets"] = (m.rev["presets"], m.blobs["presets"][1])
+    for s_ in (st, st2):
+        for k in ("shows", "presets"):
+            assert s_["show"]["rev"][k] == c.blob_cache[k][0] or s_ is st
+    assert st2["show"]["rev"]["presets"] == control.blob("presets")[0]
+
+
+
+# ------------------------------------------------------------------ B16 hardening (parked test from the Phase 0/1 agent, adopted)
+
+
+def test_preset_listing_sees_a_rewrite_inside_one_mtime_tick(tmp_path, monkeypatch):
+    """Regression (the old flake): NTFS keeps the same mtime_ns for rewrites inside one clock tick (~15 ms), so a
+    listing cache keyed on mtime alone showed the summary from before `preset set`. It only failed when the save and
+    the set landed in the same tick. Forced here: every rewrite keeps the file's previous mtime."""
+    import os
+    real = S.write_atomic
+
+    def same_tick(path, data):
+        path = Path(path)
+        old = path.stat().st_mtime_ns if path.exists() else None
+        ok = real(path, data)
+        if old is not None:
+            os.utime(path, ns=(old, old))
+        return ok
+    monkeypatch.setattr(S, "write_atomic", same_tick)
+    c = make(tmp_path)
+    do(c, cmd="preset", op="save", kind="mod", name="Wobble")
+    assert listing(c, "presets")["presets"][0]["fav"] is False
+    do(c, cmd="preset", op="set", ref="mod/wobble", fav=True)
+    assert listing(c, "presets")["presets"][0]["fav"] is True
+    f = tmp_path / "presets" / "mod" / "wobble.json"
+    raw = json.loads(f.read_text())                   # an edit by another process, same tick again
+    raw["fav"] = False
+    same_tick(f, json.dumps(raw).encode())
+    do(c, cmd="preset", op="rescan")
+    assert listing(c, "presets")["presets"][0]["fav"] is False
+
+
+
+
+def test_b16_stress_200_rapid_rewrites_never_list_stale(tmp_path):
+    c = make(tmp_path)
+    do(c, cmd="preset", op="save", kind="mod", name="Spin")
+    f = tmp_path / "presets" / "mod" / "spin.json"
+    mt0 = f.stat().st_mtime_ns
+    for i in range(200):
+        do(c, cmd="preset", op="set", ref="mod/spin", tags=[f"t{i}"], fav=bool(i % 2))
+        p = listing(c, "presets")["presets"][0]
+        assert p["tags"] == [f"t{i}"] and p["fav"] == bool(i % 2), i
+        if i % 25 == 0:                               # and an outside edit that keeps the old mtime and size
+            raw = json.loads(f.read_text())
+            raw["name"] = "Spin" if raw["name"] != "Spin" else "Spun"
+            data = json.dumps(raw).encode()
+            m = f.stat().st_mtime_ns
+            f.write_bytes(data)
+            import os
+            os.utime(f, ns=(m, m))
+            do(c, cmd="preset", op="rescan")
+            assert listing(c, "presets")["presets"][0]["name"] == raw["name"], i
+    assert mt0                                        # (the file existed throughout)
+
+
+def test_b16_file_hash_is_content_based(tmp_path):
+    import os
+    f = tmp_path / "a.png"
+    f.write_bytes(b"one")
+    h1 = S.file_hash(f)
+    m = f.stat().st_mtime_ns
+    f.write_bytes(b"two")                             # same size, same mtime, written in place by someone else
+    os.utime(f, ns=(m, m))
+    assert S.file_hash(f) != h1
+    big = tmp_path / "big.wav"
+    big.write_bytes(b"\0" * S.HASH_CACHE_MIN)
+    hb = S.file_hash(big)
+    S.write_atomic(big, b"\1" * S.HASH_CACHE_MIN)    # our own rewrite: the write generation misses the cache
+    assert S.file_hash(big) != hb

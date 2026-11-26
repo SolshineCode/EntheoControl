@@ -1,3 +1,22 @@
+# EntheoControl is AGPL-3.0 (see LICENSE). The 2D signed-distance helpers and the sine hashes in FS below (smin, sdSeg,
+# sdCone, sdEll, sdBox, sdVes, sdPoly8, sdTri, h11, h21) are adapted from Inigo Quilez's articles and shaders
+# (https://iquilezles.org/articles/distfunctions2d/, https://iquilezles.org/articles/smin/), which carry this notice:
+#
+#   The MIT License
+#   Copyright (c) 2013-2024 Inigo Quilez
+#
+#   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+#   documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+#   the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#   permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+#   The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+#   the Software.
+#
+#   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+#   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+#   OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+#   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """Beings layer: living and supernatural creatures drawn as luminous line-art (GLSL 330, signed-distance silhouettes
 with beadwork / labyrinth ornament inside), moving like living things and reacting to the music.
 
@@ -92,6 +111,9 @@ vec3 gC; float gA, gD, gPx, gLW;       // accumulated light, silhouette, nearest
 vec3 cL, cP, cQ;                       // line / pattern / accent colour of this being
 float gG, gHueSeed;                    // 0 head / top .. 1 tail / bottom of this being; its own hue offset
 
+// h11 / h21 and the 2D SDF helpers below (smin, sdSeg, sdCone, sdEll, sdBox, sdVes, sdPoly8, and sdTri further down)
+// follow Inigo Quilez's articles and shaders: Copyright (c) 2013-2024 Inigo Quilez, MIT License (see the notice at
+// the top of beings.py and THIRD_PARTY_NOTICES.md)
 float h11(float n){ return fract(sin(n*127.1)*43758.5453); }
 float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7)))*43758.5453); }
 mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }

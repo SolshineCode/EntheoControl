@@ -279,6 +279,8 @@ def restore(ctl, b):
         bars = max(safety.MIN_MORPH_S * max(1.0, float(ctl.bpm)) / 240.0, 1e-3)
         ctl._morph = dict(src={n: ctl.base[n] for n in target}, to=dict(target), names=set(target),
                           start=ctl.beat, dur=bars * 4.0, old=[], t=0.0)
+    if full and ctl.pending is not None and ctl.pending[0] == full["slot"] and ctl.cur != full["slot"]:
+        ctl.pending = None                               # the batch's own recall, still waiting for its bar: cancel it
     if full and not foreign:
         if ctl.cur == full["slot"]:
             ctl.cur = full["cur"]

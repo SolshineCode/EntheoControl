@@ -1,100 +1,153 @@
-# Walkthrough: your first session, step by step
+# Walkthrough: your first hour
 
-This walkthrough takes you from a dark room to a performance you can play live. It takes about 45 minutes.
-For installation and the full reference, see [QUICKSTART.md](QUICKSTART.md).
+This takes you from a box with a projector in it to a short recorded show, in about 60 minutes. Each step is "do this, and you should see that". If something does not match, the [reference manual](QUICKSTART.md) has the details and a troubleshooting table.
 
-## 0. Before you start (2 min)
-- **Power and position:** keep the laptop on its charger. Raise the back of the laptop so the vents breathe, since the GPU works hard.
-- **Projector:** in the projector's menu, turn Auto Keystone OFF. Use the native resolution (for example 1280x800). On the laptop, press **Win+P** and choose **Extend**.
-- **Windows tweaks for shows (optional, they cut heat):**
-  - Set Power Options > Processor maximum state to **99%** (turbo off).
-  - In the NVIDIA Control Panel, set **Threaded optimization = Off** for `python.exe`.
+You will need: the laptop with EntheoControl installed (see the [README](README.md)), a projector and HDMI cable, some music, a wall, and a cardboard box. A phone is handy for step 9.
 
-## 1. Start the show (1 min)
-```
+---
+
+## 1. Set up (5 min)
+
+1. Put the projector square to a blank wall and plug it into the laptop. Plug the laptop into its **stock charger**, directly, not through a dock.
+2. Press **Win + P** and choose **Extend**.
+   You should see the projector light up with your desktop wallpaper, not a copy of your screen.
+3. In the projector's menu, turn **Auto Keystone off** and set keystone to 0. In Windows display settings, set the projector to its native resolution.
+4. Focus it:
+   ```powershell
+   cd C:\path\to\EntheoControl
+   .\.venv\Scripts\python.exe test_pattern.py --monitor 1
+   ```
+   You should see a grid, three circles and a crosshair. Turn the focus ring until the fine line pairs in the corners are crisp, then press Esc.
+5. Optional, but worth it for any show longer than an hour: set **Maximum processor state to 99 %** (Power Options) and, in the NVIDIA Control Panel for `python.exe`, **Max Frame Rate 60**, **WhisperMode off** and **Threaded optimization off**.
+
+## 2. Start the show (2 min)
+
+```powershell
 powershell -ExecutionPolicy Bypass -File run_show.ps1
 ```
-- **What opens:**
-  - the visuals, on the projector
-  - the **control panel**, in your browser
-  - the AI worker, which loads only when you first ask for an image
-- **Quitting:** use **Shift+Esc**. A single Esc never quits.
-- **Crashes:** if anything crashes, the show restarts within a second with the same look.
+You should see the mandala appear on the wall and the **control panel** open in your browser. Play some music on the laptop: the picture breathes with the bass, and the three meters in the panel's top bar move.
 
-Play some music on the laptop. The visuals breathe with the bass, mids and highs.
+Two things to know right away:
+- **Quit** with **Shift+Esc** in the projector window. A single Esc never ends a show.
+- If anything crashes, the show restarts within a second with the same look.
 
-## 2. Learn the panel (5 min)
-- **Top bar:**
-  - MASTER fader
-  - **BLACKOUT**, and **PANIC** (hold for half a second to reach the safe look)
-  - **BPM / TAP**
-  - the **health meter**: fps, GPU, temperature, battery
-  - **REC**
-  - **PREVIEW**, off by default to save the GPU
-  - **ONLINE**, off by default
-- **Tabs:** each tab that changes the picture has a **power icon** that turns it fully off. Turning it back on restores exactly the same settings. **ALL FX** does this for everything at once.
-- **Faders:**
-  - drag to set, Shift-drag for fine control, scroll wheel to nudge
-  - double-click to reset
-  - **MOD** makes the fader follow the bass, mids, highs, a beat-synced LFO or a random walk
+## 3. Learn PERFORM (8 min)
 
-## 3. Shape the pattern (10 min)
-1. **PERFORM** (everything on one screen): in **Macros** move **Zoom**, **Spin**, **Symmetry** (flat vs mandala) and **Speed**, tap the palette swatches, tap the **ripple pad**. **MORE CONTROLS…** has Rotate speed, Swim, Hue and the rest.
-2. **SHAPE:** **Twirl**, **Bulge**, **Wave**. Click the XY pad to drop **ripples**.
-3. **COLOR:** turn up the **light chase**, the TAS-style sweep of a hue window across the pattern.
-4. **MOTION:**
-   - Pick a **travel mode** (zoom tunnel, 3D tube, ground plane, depth layers) and push **Travel** to fly into the visual.
-   - Add **Spin** to barrel-roll, and **Corkscrew** to make the far end spin faster.
-5. **BEINGS (on MOTION):**
-   - Raise the **Beings** layer and pick a creature: anaconda spirit, jaguar, jellyfish, all-seeing eyes, whale, kitten and others.
-   - **Variety** mixes forms. **Colour mode** recolours them and the serpents.
+PERFORM is the screen you play from. Everything fits on one laptop screen.
 
-## 4. Add your art and AI images (10 min)
-1. **ART:** upload a painting or photo. A depth map is made automatically.
-2. **Pick it:** click its thumbnail in **Sources**. If its layer was off, it fades in.
-3. **Choose how it's used:**
-   - **Relief**: fly around a 3D version with Yaw, Pitch and Dolly
-   - **Stencil**: seen through the pattern lines
-   - **Kaleidoscope**
-   - **Tunnel walls**
-   - **Displace**: the art warps the pattern
-   - **Melt**
-4. **AI DREAM:** type a prompt such as *"glowing jade buddha, sacred geometry, black background"*. About 2.5 s later the new image appears in Sources.
+1. **Top bar**: find **Master**, **BLACKOUT**, **PANIC**, **TAP** and the BPM. Tap TAP in time with the music four times.
+   You should see the BPM change and the beat lights follow the music.
+2. **PANIC**: press and hold it for half a second.
+   You should see the picture jump straight to the safe look. Remember this: holding **Esc** does the same from anywhere.
+3. **Macros**: drag **Zoom**, **Speed**, **Spin** and **Symmetry**. Symmetry at 0 turns the mandala into a flat field that crawls across the whole wall.
+4. Tap the **palette swatches**, then tap and drag on the **ripple pad**.
+   You should see ripples spread from where you touched.
+5. **Trigger row** at the bottom: hold **FLASH**, then **STROBE**, then **FREEZE**.
+6. Click **MOD** under Zoom, pick **bass** and an amount.
+   You should see Zoom pulse with the kick, and a teal line on the fader showing the live value.
 
-## 5. Layer it up (5 min)
-- **Live layers** (PERFORM): only the layers that are showing; **EYE** shows or hides a layer on the wall, the fader sets its strength, "+ N OFF" brings another one in. The full **Layers card** is on LAYERS, the next tab: with PREVIEW on, **SOLO** previews a layer in the panel only, without the audience seeing it.
-- **3D DECKS:** two raymarched worlds (corridor, torus wormhole, stained-glass vortex, honeycomb domes) with a crossfader and blend modes, plus a particle **swarm**.
-- **TEXT:** type words and pick a font. Then choose movement (drift, orbit, wave, spiral into the tunnel) and how they weave in (on top, engraved into the pattern, mask, knockout, warp, melt with the scene).
+## 4. Shape the look (7 min)
 
-## 6. Map real objects (10 min)
-1. **One rectangle:** tape a rectangle on the wall. In **MAPPING**, drag the 4 corners onto it while watching the wall. The magnifier and arrow keys give pixel precision. Each corner shows its angle and each edge its length.
-2. **A box:** click **+ ADD** for each visible face, and turn on **TEST GRID** to see the numbered outlines on the wall. Drag each face's corners; neighbouring corners snap together. Then try **EDGE GLOW**, **SPANNED** (one picture wrapping the box) or **WHOLE FRAME** for each face.
-3. Everything outside your surfaces stays black.
+1. **SHAPE** tab: try **Twirl**, **Bulge / pinch** and **Wave**. Tap the ripple pad here too.
+2. **COLOR** tab: raise **Light chase**.
+   You should see a window of light sweep across the pattern in time with the bar.
+3. **MOTION** tab: pick a **Travel mode** (zoom tunnel, tube, depth layers, Droste) and push **Travel into**.
+   You should feel like you are flying into the picture. Add **Spin** to barrel-roll.
 
-## 7. Save looks and perform (5 min)
-- **SCENES:**
-  - Shift-click a slot to **save** the current look, and click to **recall** it. Recall morphs over the chosen bars and lands on the beat.
-  - Use **Deck A / B + crossfader** to blend two scenes by hand.
-- **Autopilot** steps through your saved scenes on its own. It runs locally and calls no AI.
-- **MIDI:** click **MIDI LEARN**, click any control, then move a knob or hit a pad. Default maps exist for the APC mini mk2 and Launch Control XL.
-- **Record:** press **REC**. Choose clean program or the mapped wall, with or without laptop audio. Files go to `recordings\`.
+## 5. Layers and power buttons (5 min)
 
-## 7b. Save your show, keep presets, build a timeline (10 min)
-- **Save everything:** top bar **SHOW** > type a name > **SAVE AS**. From then on **Ctrl+S**. If the laptop crashes, open SHOW and press **RECOVER**.
-- **Keep a look for later:** top bar **PRESETS** > name it > **SAVE PRESET**. Click its card any time to bring it back, or tick only COLOR first to take just its colours.
-- **Make a timeline:** open **TIMELINE**. Double-click the *Sections* row to mark "intro", "build", "drop". Double-click *Cues* and type a scene number. Add a lane with **+ AUTOMATION LANE** (try Zoom) and double-click it to set points; drag them.
-- **Or record it live:** press **REC**, then **PLAY**, and perform: fader moves, scene pads, triggers and layer switches are written in. Press PLAY again to stop; **UNDO** removes the whole take.
-- **Play it back:** **PLAY**. Grab a fader at any moment and it is yours; let go and the timeline takes it back (or press **RELEASE**). **PANIC** always stops it.
+1. Back on **PERFORM**, look at **Live layers**: Folding Blocks, Beadwork, Sacred lines, AI textures, Echo and Math stack are showing.
+2. Click a layer's **EYE**.
+   You should see that layer fade off the wall. Click again and it comes back exactly as it was.
+3. Click **+ N OFF** and bring in **Math fractals**.
+4. Look at the tab strip: tabs that change the picture have a **power icon**. Click the one on **COLOR**.
+   You should see the colour effects switch off and the tab struck through. Click again to restore them.
+5. **ALL FX** switches every effect off at once. Try it, then switch it back.
 
-## 8. Optional: the online assistant
-Turn **ONLINE** on and open **ASSISTANT**, then describe what you want, for example *"slower and deeper, emerald palette, bring in the jaguar"*.
-- **Modes:** in **SUGGEST** mode it proposes changes for you to **Apply**. **AUTOPILOT** applies them, and each batch can be undone.
-- **Cost:** it only calls the AI when you press SEND.
-- **Limits:** it can never strobe, flash, black out or touch your mapping.
-- **Nano Banana images:** paste your own Gemini API key in AI DREAM.
+Nothing you switch off is lost. Power buttons never edit your faders.
 
-## When the laptop struggles
-The health meter turns amber or red and suggests a fix, such as lowering a heavy layer's resolution, with **Apply** and **Ignore** buttons. On battery it warns you, and below 10% it shows a red bar. For long shows, stay plugged in.
+## 6. Art, AI and skins (8 min)
 
-## Respect
-The kene-style patterns are generative and *inspired by* Shipibo-Konibo, Huni Kuin and Yawanawá traditions. Credit them, and collaborate with Indigenous artists where you can. Use only artwork you own or have rights to.
+1. **ART** tab: drop a picture you own into the **Art library**.
+   You should see its thumbnail appear. A depth map is made in the background.
+2. Click its thumbnail in **Sources**. Try the **Art use** buttons: Fly-through relief, Inside the lines, Kaleidoscope, Tunnel walls, Displace pattern, Full frame melt. Drag the **Fly pad** to fly around the relief.
+3. **AI DREAM** tab: type *glowing jade lotus, sacred geometry, black background* and press **GENERATE**.
+   You should see a new image appear in the results after a few seconds.
+4. Press the small **DREAM** button on any thumbnail, pick **Eyes** and **DREAM IT**. It runs in the background (up to a minute or so), and a new dreamified copy appears in Sources.
+5. **3D DECKS** tab: raise **3D landscapes**. In the **SKINS** card press **SKINS: OFF** to switch skins on, then drag your AI image onto **Sacred corridor: walls**.
+   You should see your image become the walls of the corridor you are flying through.
+
+## 7. Beings, kené study and text (6 min)
+
+1. **MOTION** tab, **Beings** card: raise **Beings**, pick **Whale**, then **Jellyfish**. Raise **Variety** to mix forms and try a **Colour mode**.
+2. **KENÉ STUDY** tab: raise **Kené study (Shipibo-Konibo inspired)**, set **Pen** to *Draw in: 8 bars* and press **NEW DESIGN**.
+   You should see a design drawn line by line over eight bars. Read the credit card on this tab: these are generative studies, not authentic kené, and public shows should credit the originating communities.
+3. **TEXT** tab: type a word, press **SHOW**, raise **Text**. Try **Movement** = Tunnel spiral and **Integration** = Woven.
+
+## 8. Camera fun (4 min)
+
+1. **CAMERA** tab: press **CAMERA OFF (click = ON)**.
+   You should see a red blinking **CAMERA ON** in the top bar.
+2. Raise **Crowd camera**, choose **Glow outline**, and stand in front of the wall. Adjust **Position** and **Scale** until the outline sits on you.
+3. Raise **Hand ripples** and wave.
+   You should see ripples come off your hands.
+4. Switch the camera **off** again (click the red CAMERA ON). Frames never leave the laptop and are never recorded.
+
+## 9. Map a box (8 min)
+
+**By hand first.**
+1. Put a cardboard box in front of the wall so the projector sees its front, one side and the top.
+2. **MAPPING** tab: click **+ ADD** until you have three surfaces, and name them ("front", "side", "top").
+3. Set "Show on the projector" to **ALL** and switch **TEST GRID** on.
+   You should see three numbered outlines in different colours on the wall.
+4. For each surface, drag its four corners on the canvas onto that face's corners, watching the wall. Corners snap to each other so the faces share edges. Use the arrow keys for single pixels.
+5. Overlay **OFF**. Try **EDGE GLOW** on all three, then **SPANNED** on all three.
+   You should see the visuals only on the box, black everywhere else, with one continuous picture wrapping round it.
+
+**Then let the camera do it (optional).** Turn the laptop lid toward the wall (or use a USB webcam), switch the camera on, open the panel on your phone, and in the **AUTO MAP** card pick **BUILT-IN WEBCAM**, press **LIVE FRAMING** and follow the hints. Then **1 CHECK CAMERA**, **2 CALIBRATE**, **3 DETECT SURFACES**, **CREATE SURFACES**, **4 VERIFY & REFINE**. Buttons that flash patterns on the wall need a second tap. **UNDO** puts your hand-made surfaces back.
+
+## 10. Scenes (4 min)
+
+1. Make a look you like. On **SCENES**, choose **SAVE TO…** and click pad 9. Make a different look and save it to pad 10.
+2. Set **Morph** to 4 bars and **Quantize** to BAR, then click pad 9.
+   You should see the look glide back over four bars, starting on the next bar.
+3. Click **SET SAFE…** and then pad 9: that is now where PANIC goes.
+4. Switch **AUTOPILOT** on (top bar) and watch it step through your scenes. Switch it off again.
+
+<!-- TODO(themes+sound-tags): add a short "pick a theme, tag a scene with a sound" step here once themes and sound tags land. -->
+*Themes and sound tags are coming soon; this step will grow when they land.*
+
+## 11. Timeline (5 min)
+
+1. Open **TIMELINE**. Double-click the **Sections** row to mark "intro", "build" and "drop".
+2. Double-click the **Cues** row near "build" and choose scene 10.
+3. Add an automation lane for **Zoom** and double-click it to set two points.
+4. Press **PLAY**.
+   You should see the playhead move in bars, scene 10 arrive at the cue and Zoom follow the lane.
+5. Grab the Zoom fader while it plays: it is yours until you let go, then the timeline takes it back (or press **RELEASE**). **PANIC** always stops the timeline.
+
+## 12. Record (3 min)
+
+1. **CONTROLLERS > Record**: Source **PROGRAM**, Audio **LAPTOP AUDIO**.
+2. Press **REC** in the top bar, press **PLAY** on the timeline, and perform for a minute: a scene change, a strobe, a ripple.
+3. Press **REC** again.
+   You should see the file in `recordings\` a few seconds later (**OPEN FOLDER** opens it).
+
+## 13. Save the show (2 min)
+
+1. Top bar **SHOW** > type a name > **SAVE AS**. From now on, **Ctrl+S** saves.
+2. Save a look you like as a preset: **PRESETS** > type a name > **SAVE PRESET**.
+3. For a backup on a USB stick: SHOW > **EXPORT** with "collect media" ticked gives you one `.entheo` file.
+
+If the laptop ever crashes, open **SHOW** and press **RECOVER**.
+
+## 14. Before a real gig (3 min)
+
+Open **CONTROLLERS** and look at three cards:
+- **Health > Power**: pick **BALANCED**, and on battery set the **Show length**. The checklist under it repeats the Windows and NVIDIA settings from step 1.
+- **Health**: governor on **SUGGEST** (or AUTO if you will not be watching the laptop).
+- **Flash guard**: green. Leave it on.
+
+Then print [docs/SHOW_DAY_CHECKLIST.md](docs/SHOW_DAY_CHECKLIST.md) and run through it at the venue. Practise holding PANIC until it is muscle memory.
+
+You are ready. Quit with **Shift+Esc**.

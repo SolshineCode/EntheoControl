@@ -457,7 +457,8 @@ uniform float u_mix, u_wA, u_wB, u_asp, u_t;
 uniform float u_twirl, u_fold, u_folds, u_foldrot, u_droste, u_dls, u_dzoom, u_feather;
 const float PI = 3.14159265, TAU = 6.2831853;
 
-float hash21(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+// hash21 = hash12 of "Hash without Sine", Copyright (c) 2014 David Hoskins, MIT License (THIRD_PARTY_NOTICES.md)
+float hash21(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
 float vnoise(vec2 p){
   vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
   return mix(mix(hash21(i), hash21(i+vec2(1,0)), f.x), mix(hash21(i+vec2(0,1)), hash21(i+vec2(1,1)), f.x), f.y);

@@ -297,6 +297,9 @@ class Worker:
                 if self.path == "/cancel":
                     worker.cancel()
                     return self._send(200, {"ok": True})
+                if self.path == "/offload":              # governor.py power balance: idle model -> system RAM
+                    worker.q.put(("offload", None, worker.cancel_gen))
+                    return self._send(200, {"ok": True})
                 self._send(404, {"error": "not found"})
 
         self._srv = ThreadingHTTPServer(("127.0.0.1", self.port), H)
@@ -337,6 +340,8 @@ class Worker:
             s = dict(self.st)
             s["dream"] = dict(self.st["dream"]) if self.st["dream"] else None
             s["done"] = list(self.st["done"][-20:])
+            p = getattr(self, "_pipes", None)
+            s["on_gpu"] = bool(getattr(p, "on_gpu", True)) if p is not None else False
             s["queue"] = [dict(id=j, prompt=job["prompt"][:80], n=job["n"], kind=job.get("kind", "gen"))
                           for j, job in self.pending]
         return s
@@ -351,6 +356,7 @@ class Worker:
         t = time.time()
         pipes = self.pipes_factory()
         self._set(loading=False, loaded=True, base=getattr(pipes, "base", "fake"))
+        self._pipes = pipes                          # status() reports whether the weights sit on the GPU
         print(f"[ai] model ready in {time.time() - t:.1f}s", flush=True)
         return pipes
 
@@ -373,6 +379,14 @@ class Worker:
                 break
             jid, job, gen = item[:3]
             dgen = item[3] if len(item) > 3 else self.dream_cancel_gen
+            if jid == "offload":                         # on this thread: never races a running job
+                if pipes is not None and getattr(pipes, "on_gpu", False) and hasattr(pipes, "offload"):
+                    try:
+                        pipes.offload()
+                        print("[ai] idle: model moved to system RAM (back on the next image)", flush=True)
+                    except Exception as ex:
+                        print(f"[ai] offload failed: {ex}", flush=True)
+                continue
             if jid == "warmup":
                 if pipes is None:
                     try:

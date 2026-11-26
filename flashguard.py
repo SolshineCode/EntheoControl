@@ -1,17 +1,22 @@
 """Engine-wide photosensitive limiter ("FLASH GUARD").
 
-One hook at the very end of the picture chain (after filters, limiter, master and blackout; before Spout, the panel
-monitor, snapshots, the recorder and the mapping / surfaces pass), so everything the projector shows went through it.
+Two stages, the same rules in both:
+  1. the PICTURE (`process(disp, t)`, after filters, limiter, master and blackout): so Spout, the panel preview,
+     snapshots and the recorder's "program" source are guarded;
+  2. the MAPPED PROJECTOR FRAME (`output_begin` / `output_end`, the very last thing before the projector), whenever the
+     output pass does more than a plain corner pin of the guarded picture: several surfaces (brightness up to 2,
+     opacity, on / off, solid fills, edge glow), the calibration grid, AUTO MAP patterns. A plain corner pin only
+     moves guarded pixels around, so it goes straight to the projector as before.
 
-Limits (WCAG 2.3.1 / ITU-R BT.1702 / Harding; research/gemini_neon_support.md section 3):
+Limits (WCAG 2.2 SC 2.3.1 Three Flashes or Below Threshold / ITU-R BT.1702 / the Harding flash and pattern test):
   no more than 3 general flashes and no more than 3 red flashes in any 1 s, over more than 25 % of the picture.
   A flash is a PAIR of opposing transitions. A general transition is a change of relative luminance (sRGB -> linear,
   Rec.709 weights) of at least 0.10 where the darker state is below 0.80. A red transition is a change of the
   saturated-red energy max(0, R - G - B) (linear) of at least 20 / 320, counted on pixels with R / (R + G + B) >= 0.8.
 
 How it works
-  measure   every frame one pass folds the frame into 4 x 4 pixel blocks (every pixel is counted: mean and maximum of
-            luminance and red energy), a second tiny one folds the blocks into an 8 x 5 grid. The grid is read back
+  measure   every frame one pass folds the frame into 4 x 4 pixel blocks (every pixel is counted: mean luminance and
+            mean saturated-red energy), a second tiny one folds the blocks into an 8 x 5 grid. The grid is read back
             through a pixel buffer TWO FRAMES LATER (never a synchronous stall), with the timestamp of the frame it
             belongs to, so a variable frame rate is exact.
   decide    (CPU, `GuardLogic`) opposing transitions per tile in a sliding 1 s window. A tile is "hot" when it is
@@ -21,20 +26,24 @@ How it works
             threshold and a stricter rate (above about 2.5 Hz, or 6 in the window). A tile MEAN has to move 0.05
             (red: 0.03) to count: that is half of a tile changing by the standards' 0.10.
   attenuate (GPU, zero latency) while engaged every pixel may fall at once but may only RISE at a capped rate above
-            the brightest pixel its own 4 x 4 block showed on the previous OUTPUT frame: 0.10 of luminance per 0.4 s
-            (so a visible transition needs 0.4 s: 2.5 flashes / s at the very most, whatever comes in) and 20 / 320
-            of red energy per 0.5 s. The picture never stops: a strobe turns into its own dark phase, and everything
-            that is steadily lit is left alone bit for bit. The gain is at most 1: the guard never brightens a pixel.
-  idle      nothing flashing above the limit: only the two measuring passes run and the frame is not written at all
-            (the projector gets the very texture the engine rendered).
+            what THAT SAME PIXEL showed on the previous output frame (a full-size copy, kept from the second
+            transition on): 0.10 of luminance per 0.4 s (so a visible transition needs 0.4 s: 2.5 flashes / s at
+            the very most, whatever comes in) and, while red is engaged, 20 / 320 of saturated-red energy per 0.5 s
+            (gated by the same R share as the measurement). The picture never stops: a strobe turns into its own
+            dark phase, and every steadily lit pixel is left alone bit for bit. The gain is at most 1: the guard
+            never brightens a pixel.
+  idle      nothing flashing: only the two measuring passes run and the frame is not written at all.
 
-Override: "I know what I'm doing, the audience was warned". Armed in the panel with a 2 s hold plus a confirm, checked
-here on the laptop's own clock (`arm_begin` ... at least 2 s ... `arm_confirm`). Never saved: a restart is guarded
-again. While armed the guard still measures and the panel shows a red badge.
+Override: "I know what I'm doing, the audience was warned". Armed with a 2 s hold plus a confirm, timed here on the
+laptop's own clock (`arm_begin` ... at least 2 s ... `arm_confirm`), and ONLY from the panel opened on the laptop
+itself at a loopback address (`is_local_request` / `mark_local`): a phone or any other LAN client can switch the guard
+back on but never off. Never saved: a restart is guarded again, and PANIC disarms it (`note_panics`). While armed the
+guard still measures and the panel shows a red badge.
 
     fg = FlashGuard(ctx, (w, h))
-    fg.process(disp, t)        # once per frame, in place; True while it is attenuating
-    fg.state()                 # for the panel
+    fg.process(disp, t)                         # once per frame, in place; True while it is attenuating
+    fbo = fg.output_begin((fw, fh)); ...draw the mapped frame into fbo...; fg.output_end(projector, (fw, fh), t)
+    fg.state()                                  # for the panel
     fg.command({"cmd": "flashguard", "op": ...})
 
 Standalone: `python flashguard.py --bench` (cost), `python flashguard.py --demo` (before / after flash counts).
@@ -64,6 +73,10 @@ ARM_HOLD_S, ARM_EXPIRE_S = 2.0, 15.0
 HIST_DIV = 4                        # block history: 1 / 4 resolution, block maximum
 LAG = 2                             # frames between a measurement and its readback
 OPS = ("arm_begin", "arm_confirm", "arm_cancel", "disarm")
+LOCAL_OPS = ("arm_begin", "arm_confirm")   # honoured only from the laptop itself (see mark_local)
+LOCAL = object()                    # what remote_control puts on a command that came from 127.0.0.1
+LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+WATCH_N = 2                         # keep the previous output frame from this many transitions on
 
 
 # ------------------------------------------------------------------------------------------------ pure logic
@@ -147,6 +160,8 @@ class GuardLogic:
         self.tr = FlashTracker(4 * n1, rep(DETECT, RED_DETECT), rep(DARK_MAX, np.inf), 4, rep(0.48, 0.60), rep(7, 6))
         self._v = np.zeros((4, n1))
         self.general = self.red = False
+        self.watching = False
+        self.refused = None
         self.release_until = -1.0e30
         self.armed = False
         self.arm_t0 = None
@@ -179,6 +194,8 @@ class GuardLogic:
         hot_l = float(np.count_nonzero(hot[:TILES])) / TILES
         hot_s = float(np.count_nonzero(hot[n1:n1 + TILES])) / TILES
         self._hot = (hot_l, hot_s)
+        busy = np.count_nonzero(n[:TILES] >= WATCH_N) + np.count_nonzero(n[n1:n1 + TILES] >= WATCH_N)
+        self.watching = busy >= AREA_OFF * TILES
         was = self.general or self.red
         self.general = hot_l >= (AREA_OFF if self.general else AREA_ON)
         self.red = hot_s >= (AREA_OFF if self.red else AREA_ON)
@@ -205,12 +222,15 @@ class GuardLogic:
     def engaged(self):
         return self.general or self.red
 
+    def watch(self, t):
+        return self.watching or self.general or self.red or t < self.release_until
+
     def slew(self, t):
         """None = leave the frame alone; else (luminance, red energy) rise limits per second."""
         if self.armed:
             return None
         if self.general or self.red:
-            return (SLEW_L if self.general else FREE, SLEW_S if self.red else FREE)
+            return (SLEW_L, SLEW_S if self.red else FREE)
         if t < self.release_until:
             return (RELEASE_RATE, RELEASE_RATE)
         return None
@@ -220,6 +240,9 @@ class GuardLogic:
         """arm_begin -> (2 s hold, timed here) -> arm_confirm; arm_cancel; disarm. Returns a short status word."""
         wall = time.monotonic() if wall is None else wall
         op = c.get("op") if isinstance(c, dict) else None
+        if op in LOCAL_OPS and c.get("_local") is not LOCAL:      # a phone / LAN client can never switch it off
+            self.arm_t0, self.refused = None, wall
+            return "refused_remote"
         if op == "arm_begin":
             if not self.armed:
                 self.arm_t0 = wall
@@ -255,7 +278,30 @@ class GuardLogic:
         return dict(on=True, mode=self.mode(t), armed=self.armed, pending=self.arm_t0 is not None,
                     would=bool(self.armed and self.engaged()), red=bool(self.red), events=int(self.events),
                     att_s=round(self.att_s, 1), limit=MAX_FLASHES, hold_s=ARM_HOLD_S,
+                    refused=bool(self.refused is not None and wall - self.refused < 6.0),
                     **{k: round(float(v), 2) for k, v in self.meter.items()})
+
+
+def is_local_request(client_addr, host_header):
+    """True for a request that came over loopback AND was addressed to a loopback name. The second half matters:
+    a web page on some other site, opened in a browser on this laptop, also connects from 127.0.0.1. It cannot
+    know the panel token, remote_control refuses cross-site and DNS-rebinding POSTs (Origin / Host /
+    Sec-Fetch-Site), and a rebinding name or the laptop's LAN address in Host never counts as local here."""
+    if not isinstance(client_addr, str) or client_addr not in LOOPBACK:
+        return False
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):                           # [::1]:8765
+        name = host[1:].split("]", 1)[0]
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    return name in ("127.0.0.1", "localhost", "::1")
+
+
+def mark_local(c):
+    """remote_control calls this for a validated command that arrived from this laptop itself (127.0.0.1)."""
+    if isinstance(c, dict) and c.get("cmd") == "flashguard":
+        c["_local"] = LOCAL
+    return c
 
 
 def validate_command(c):
@@ -280,27 +326,27 @@ vec3 clean(vec3 c){                       // NaN -> 0, then what the display wou
 }
 vec3 toLin(vec3 c){ return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
 vec3 toSrgb(vec3 l){ return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l)); }
-float redE(vec3 l){ return max(0.0, l.r - l.g - l.b); }
-"""
+float redS(vec3 l){                       // saturated-red energy: only where R / (R + G + B) >= RED_RATIO
+  return max(0.0, l.r - l.g - l.b) * step(%s * (l.r + l.g + l.b), l.r) * step(1e-4, l.r);
+}
+""" % RED_RATIO
 
 _BLOCK_FS = """
 #version 330
 uniform sampler2D src;
 out vec4 f;
 """ + _COMMON + """
-void main(){                              // every pixel of a %(div)d x %(div)d block: mean and maximum of luminance and red energy
+void main(){                              // every pixel of a %(div)d x %(div)d block: mean luminance, mean saturated-red energy
   ivec2 b = ivec2(gl_FragCoord.xy) * %(div)d, top = textureSize(src, 0) - 1;
-  float L = 0.0, S = 0.0, mL = 0.0, mS = 0.0;
+  float L = 0.0, S = 0.0;
   for (int j = 0; j < %(div)d; j++) for (int i = 0; i < %(div)d; i++) {
     vec3 l = toLin(clean(texelFetch(src, min(b + ivec2(i, j), top), 0).rgb));
-    float y = dot(l, LW);
-    float s = redE(l) * step(%(ratio)s * (l.r + l.g + l.b), l.r);
-    L += y; S += s;
-    mL = max(mL, y); mS = max(mS, redE(l));
+    L += dot(l, LW);
+    S += redS(l);
   }
-  f = vec4(L / %(n)d.0, S / %(n)d.0, mL, mS);
+  f = vec4(L, S, 0.0, %(n)d.0) / %(n)d.0;
 }
-""" % dict(div=HIST_DIV, n=HIST_DIV * HIST_DIV, ratio=RED_RATIO)
+""" % dict(div=HIST_DIV, n=HIST_DIV * HIST_DIV)
 
 _TILE_FS = """
 #version 330
@@ -322,22 +368,30 @@ void main(){
 _APPLY_FS = """
 #version 330
 uniform sampler2D src;
-uniform sampler2D hist;                   // block texture of the previous OUTPUT frame
-uniform vec2 rise;                        // allowed rise this frame: luminance, red energy
+uniform sampler2D hist;                   // the previous OUTPUT frame, pixel for pixel
+uniform vec2 rise;                        // allowed rise this frame: luminance, saturated-red energy
 out vec4 f;
 """ + _COMMON + """
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec4 c = texelFetch(src, p, 0);
   vec3 l = toLin(clean(c.rgb));
-  float L = dot(l, LW), S = redE(l);
-  vec2 cap = max(texelFetch(hist, p / %(div)d, 0).ba, vec2(0.0)) + rise;
+  vec3 h = toLin(clean(texelFetch(hist, p, 0).rgb));
+  float L = dot(l, LW), S = redS(l);
+  vec2 cap = vec2(dot(h, LW), redS(h)) + rise;      // this very pixel, last frame: no neighbour can unlock it
   float g = 1.0;
   if (L > cap.x) g = cap.x / L;
   if (S > cap.y) g = min(g, cap.y / S);
-  f = g < 1.0 ? vec4(toSrgb(l * g), c.a) : c;     // untouched pixels pass through bit for bit
+  f = g < 1.0 ? vec4(toSrgb(l * g), c.a) : c;       // untouched pixels pass through bit for bit
 }
-""" % dict(div=HIST_DIV)
+"""
+
+_COPY_FS = """
+#version 330
+uniform sampler2D src;
+out vec4 f;
+void main(){ f = texelFetch(src, ivec2(gl_FragCoord.xy), 0); }
+"""
 
 UNIT_SRC, UNIT_HIST = 24, 25              # private texture units (0-16 belong to the scene and its passes)
 
@@ -359,12 +413,12 @@ class FlashGuard:
         self.f_tile = [ctx.framebuffer([t]) for t in self.t_tile]
         w, h = self.size
         bsize = ((w + HIST_DIV - 1) // HIST_DIV, (h + HIST_DIV - 1) // HIST_DIV)
-        self.t_blk = [ctx.texture(bsize, 4, dtype="f2") for _ in range(2)]            # this frame / the previous output
-        for t in self.t_blk:
-            t.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.f_blk = [ctx.framebuffer([t]) for t in self.t_blk]
-        self.k = 0
-        self.t_tmp = self.f_tmp = None                                              # full-size scratch, on first use
+        self.t_blk = ctx.texture(bsize, 4, dtype="f2")
+        self.t_blk.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.f_blk = ctx.framebuffer([self.t_blk])
+        self.t_hist = self.f_hist = None                                            # full-size, made on first use:
+        self.t_tmp = self.f_tmp = None                                              # previous output frame / scratch
+        self.hist_ok = False
         self._dst = {}                                                              # texture glo -> framebuffer on it
         nbytes = TILES * 4 * 4
         self._ring = [dict(frame=None, t=0.0, out=False, a=ctx.buffer(reserve=nbytes), b=ctx.buffer(reserve=nbytes))
@@ -374,10 +428,8 @@ class FlashGuard:
         self.attenuating = False
         self.passes = 0                     # frames it rewrote so far (tests: 0 on calm content)
         self.peak = dict(rate_in=0.0, rate_out=0.0, red_in=0.0, red_out=0.0)
-
-    @property
-    def t_hist(self):                       # block texture of the last output frame (after process())
-        return self.t_blk[1 - self.k]
+        self.stage = None                   # OutputStage: second guard on the mapped projector frame (see below)
+        self._panics = None
 
     # -- internals ----------------------------------------------------------------------------------------
     def _collect(self):
@@ -396,13 +448,13 @@ class FlashGuard:
 
     def _measure(self, tex, which, buf):
         """Fold the frame into 4 x 4 blocks (every pixel counted), then the blocks into the 8 x 5 grid."""
-        self.f_blk[self.k].use()
+        self.f_blk.use()
         tex.use(UNIT_SRC)
         self.p_block["src"].value = UNIT_SRC
         self.v_block.render(self._mgl.TRIANGLE_STRIP)
         fbo = self.f_tile[which]
         fbo.use()
-        self.t_blk[self.k].use(UNIT_SRC)
+        self.t_blk.use(UNIT_SRC)
         self.p_tile["src"].value = UNIT_SRC
         self.v_tile.render(self._mgl.TRIANGLE_STRIP)
         fbo.read_into(buf, components=4, dtype="f4")          # into a pixel buffer: collected `lag` frames later
@@ -417,14 +469,25 @@ class FlashGuard:
             fbo = self._dst[tex.glo] = self.ctx.framebuffer([tex])
         return fbo
 
-    def _attenuate(self, tex, rise):
+    def _full(self):
         if self.t_tmp is None:
-            self.t_tmp = self.ctx.texture(tex.size, 4, dtype="f2")
-            self.t_tmp.filter = (self._mgl.NEAREST, self._mgl.NEAREST)
-            self.f_tmp = self.ctx.framebuffer([self.t_tmp])
+            mk = lambda: self.ctx.texture(self.size, 4, dtype="f2")                 # noqa: E731
+            self.t_tmp, self.t_hist = mk(), mk()
+            for t in (self.t_tmp, self.t_hist):
+                t.filter = (self._mgl.NEAREST, self._mgl.NEAREST)
+            self.f_tmp, self.f_hist = self.ctx.framebuffer([self.t_tmp]), self.ctx.framebuffer([self.t_hist])
+
+    def _keep(self, tex):
+        """Remember what goes out, pixel for pixel: next frame's ceiling."""
+        self._full()
+        self.ctx.copy_framebuffer(self.f_hist, self._target(tex))
+        self.hist_ok = True
+
+    def _attenuate(self, tex, rise):
+        self._full()
         self.f_tmp.use()
         tex.use(UNIT_SRC)
-        self.t_blk[1 - self.k].use(UNIT_HIST)
+        self.t_hist.use(UNIT_HIST)
         self.p_apply["src"].value = UNIT_SRC
         self.p_apply["hist"].value = UNIT_HIST
         self.p_apply["rise"].value = rise
@@ -434,7 +497,7 @@ class FlashGuard:
 
     # -- the hook -----------------------------------------------------------------------------------------
     def process(self, tex, t):
-        """Guard `tex` (the finished frame) in place. `t` = this frame's time in seconds. True while attenuating."""
+        """Guard `tex` (a finished frame) in place. `t` = this frame's time in seconds. True while attenuating."""
         ctx = self.ctx
         if tuple(tex.size) != self.size:
             return False
@@ -452,14 +515,17 @@ class FlashGuard:
             slot.update(frame=self.frame, t=t, out=False)
             self._measure(tex, 0, slot["a"])                  # what came in
             self.attenuating = False
-            if slew is not None and self.frame > 0:
+            if slew is not None and self.hist_ok:
                 self._attenuate(tex, (min(slew[0] * dt, FREE), min(slew[1] * dt, FREE)))
                 self.attenuating = True
                 if lg.engaged():
                     lg.att_s += dt
-                self._measure(tex, 1, slot["b"])              # what goes out: the meters, and next frame's ceiling
+                self._measure(tex, 1, slot["b"])              # what goes out (the meters)
                 slot["out"] = True
-            self.k ^= 1                                       # this frame's blocks are the next frame's history
+            if slew is not None or lg.watch(t):
+                self._keep(tex)                               # from the second transition on, so it is there in time
+            else:
+                self.hist_ok = False
         finally:
             self.frame += 1
             try:                              # hand the caller's framebuffer and viewport back
@@ -472,20 +538,65 @@ class FlashGuard:
                 pass
         return self.attenuating
 
+    # -- the mapped projector frame (second stage) ---------------------------------------------------------
+    def wants_output_stage(self, multi, overlay=False, amap=None):
+        """True when the projector frame is MORE than a plain corner pin of the guarded picture: several surfaces
+        (brightness up to 2, opacity, on / off, solid fills, edge glow), the calibration grid, AUTO MAP patterns."""
+        if multi or overlay:
+            return True
+        ov = getattr(amap, "overlay", None)
+        return ov is not None and bool(getattr(ov, "_active", False) or getattr(ov, "_pending", None) is not None)
+
+    def output_begin(self, size):
+        """Framebuffer to draw the mapped frame into instead of the projector (None: draw straight to it)."""
+        if self.stage is None:
+            self.stage = OutputStage(self.ctx, self)
+        return self.stage.begin(size)
+
+    def output_end(self, target, size, t):
+        """Guard what was drawn since output_begin() and put it on `target` (the projector). Always puts it there."""
+        return self.stage.end(target, size, t)
+
+    def note_panics(self, n):
+        """PANIC always brings the guard back: call every frame with the controller's panic counter."""
+        if self._panics is not None and n != self._panics:
+            self.logic.command({"op": "disarm"})
+        self._panics = n
+
     def command(self, c):
         return self.logic.command(c)
 
     def state(self):
-        return self.logic.state(self.t_prev)
+        s = self.logic.state(self.t_prev)
+        st = self.stage
+        if st is not None and st.fg is not None and st.live(self.frame):       # the mapped frame's guard, folded in
+            o = st.fg.logic.state(st.fg.t_prev)
+            rank = ("idle", "releasing", "attenuating", "override")
+            s["mode"] = max(s["mode"], o["mode"], key=rank.index)
+            s["events"] += o["events"]
+            s["att_s"] = round(s["att_s"] + o["att_s"], 1)
+            for k in ("rate_in", "rate_out", "red_in", "red_out", "area"):
+                s[k] = max(s[k], o[k])
+            s["red"], s["would"] = s["red"] or o["red"], s["would"] or o["would"]
+            s["mapped"] = True
+        return s
 
     def summary(self):
         """Worst flash rates seen since the start (flashes / s over the area): what came in, what went out."""
-        return dict(events=self.logic.events, att_s=round(self.logic.att_s, 2), frames=self.frame, passes=self.passes,
-                    **{k: round(v, 1) for k, v in self.peak.items()})
+        d = dict(events=self.logic.events, att_s=round(self.logic.att_s, 2), frames=self.frame, passes=self.passes,
+                 **{k: round(v, 1) for k, v in self.peak.items()})
+        if self.stage is not None and self.stage.fg is not None:
+            o = self.stage.fg
+            d.update(map_frames=o.frame, map_events=o.logic.events, map_passes=o.passes,
+                     map_rate_in=round(o.peak["rate_in"], 1), map_rate_out=round(o.peak["rate_out"], 1))
+        return d
 
     def release(self):
-        objs = [self.t_tmp, self.f_tmp, self._quad, *self.t_tile, *self.f_tile, *self.t_blk, *self.f_blk,
-                *self._dst.values(), *(s[k] for s in self._ring for k in "ab"),
+        if self.stage is not None:
+            self.stage.release()
+            self.stage = None
+        objs = [self.t_tmp, self.f_tmp, self.t_hist, self.f_hist, self._quad, *self.t_tile, *self.f_tile, self.t_blk,
+                self.f_blk, *self._dst.values(), *(s[k] for s in self._ring for k in "ab"),
                 self.v_tile, self.v_apply, self.v_block, self.p_tile, self.p_apply, self.p_block]
         for o in objs:
             try:
@@ -496,6 +607,76 @@ class FlashGuard:
         self._dst.clear()
 
     close = release
+
+
+class OutputStage:
+    """The mapped projector frame goes through a guard of its own, as the very last thing before the projector.
+
+    The first guard works on the picture (so Spout, the panel preview, snapshots and the recorder's "program" source
+    are guarded). Whatever the output pass adds after it (surface brightness / opacity / on-off / fills / edge glow,
+    the calibration grid, AUTO MAP patterns) is drawn into this stage's texture instead of the projector, guarded by
+    the same rules, then copied to the projector texel for texel. The override is shared with the first guard."""
+
+    def __init__(self, ctx, parent):
+        self.ctx, self.parent = ctx, parent
+        self.size = None
+        self.tex = self.fbo = self.fg = None
+        self.prog = ctx.program(vertex_shader=_VS, fragment_shader=_COPY_FS)
+        self.quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4"))
+        self.vao = ctx.vertex_array(self.prog, [(self.quad, "2f", "in_pos")])
+        self.used = -10
+
+    def live(self, frame):
+        return frame - self.used <= 2
+
+    def _drop(self):
+        for o in (self.fg, self.fbo, self.tex):
+            try:
+                if o is not None:
+                    o.release()
+            except Exception:
+                pass
+        self.tex = self.fbo = self.fg = None
+
+    def begin(self, size):
+        size = (int(size[0]), int(size[1]))
+        if size[0] <= 0 or size[1] <= 0:
+            return None
+        if size != self.size:
+            self._drop()
+            import moderngl
+            self.tex = self.ctx.texture(size, 4, dtype="f1")
+            self.tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self.tex.repeat_x = self.tex.repeat_y = False
+            self.fbo = self.ctx.framebuffer([self.tex])
+            self.fg = FlashGuard(self.ctx, size)
+            self.size = size
+        self.fbo.use()
+        self.fbo.clear(0.0, 0.0, 0.0, 1.0)
+        return self.fbo
+
+    def end(self, target, size, t):
+        import moderngl
+        att = False
+        try:
+            self.fg.logic.armed = self.parent.logic.armed
+            att = self.fg.process(self.tex, t)
+            self.used = self.parent.frame
+        finally:                              # whatever happened above, the projector gets this frame
+            target.use()
+            self.ctx.viewport = (0, 0, int(size[0]), int(size[1]))
+            self.tex.use(UNIT_SRC)
+            self.prog["src"].value = UNIT_SRC
+            self.vao.render(moderngl.TRIANGLE_STRIP)
+        return att
+
+    def release(self):
+        self._drop()
+        for o in (self.vao, self.quad, self.prog):
+            try:
+                o.release()
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------------------------------------ reference counter

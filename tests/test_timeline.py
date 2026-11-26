@@ -466,3 +466,21 @@ def test_n23_bad_preset_refs_are_rejected_at_the_door():
         with pytest.raises(ValueError):
             T.preset_ref(bad)
     assert T.preset_ref("look/deep-blue") == "look/deep-blue"
+
+
+
+def test_b20_a_latch_take_plays_back_next_time_without_reenable(tmp_path):
+    c = make(tmp_path)
+    tl(c, op="ovr_mode", mode="latch")
+    tl(c, op="rec", on=True)
+    tl(c, op="play")
+    c.set("zoom", 0.7)
+    run(c, 1.0)
+    tl(c, op="stop")                                  # pause: the take ends
+    tl(c, op="rec", on=False)
+    assert "zoom" not in c._tl_ovr
+    c.base["zoom"] = -0.5                             # the fader sits elsewhere (no performer move: that would latch again)
+    tl(c, op="stop")                                  # home
+    tl(c, op="play")
+    run(c, 0.5)
+    assert c.values["zoom"] == pytest.approx(0.7, abs=0.02)   # the recorded lane drives it, no RE-ENABLE needed

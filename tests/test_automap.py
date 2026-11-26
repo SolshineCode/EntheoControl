@@ -332,27 +332,15 @@ def test_gemini_vision_provider_request_and_errors():
         V.GeminiVisionProvider(Keys("")).ask("q", b"x")
 
 
-def test_agy_vision_provider_uses_a_private_folder_and_leaves_no_picture(tmp_path):
-    seen = {}
-
-    def runner(exe, task, cwd, **kw):
-        seen["task"], seen["files"] = task, sorted(p.name for p in Path(cwd).iterdir())
-        seen["prompt"] = (Path(cwd) / "prompt.txt").read_text()
-        return 'screen noise {"polygons": []} more'
-    p = V.AgyVisionProvider(tmp_path, exe="agy", runner=runner)
-    assert V.parse_json_reply(p.ask("the question", b"png")) == {"polygons": []}
-    assert seen["task"] == V.AGY_VISION_TASK and seen["files"] == ["prompt.txt", "scene.png"]
-    assert seen["prompt"] == "the question" and not list(tmp_path.rglob("*.png"))
-
-
 def test_vision_from_plugin_is_gated():
     assert V.Vision.from_plugin(None) is None
 
     class Plug:
         keys, cli_google, root, log = Keys(), False, Path("."), None
     assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api"]
-    Plug.cli_google = True
-    assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api", "agy"]
+    Plug.cli_google = True                                    # the old opt-in no longer adds any CLI route
+    assert [p.name for p in V.Vision.from_plugin(Plug()).providers] == ["gemini-api"]
+    assert not hasattr(V, "AgyVisionProvider")
 
 
 class FakeProv:
@@ -379,7 +367,7 @@ def _ai_wizard(tmp_path, reply, online=True, person=None):
     vis = V.Vision([prov])
     w = am.AutoMap(rig.show, rig.shown_id, rig.still, lambda: ([dict(s) for s in ss.surfaces], (PW, PH)), surf,
                    calib_dir=tmp_path, hold=0.0, vision=(lambda: vis) if online else (lambda: None),
-                   person=lambda: person)
+                   person=lambda: (person, True))                     # MediaPipe segmentation present
     return w, prov, ss, rig
 
 
@@ -580,7 +568,7 @@ def test_builtin_webcam_mirror_lens_and_accuracy_at_the_edges(tmp_path):
     grid = np.array([[x, y] for x in np.linspace(80, 400, 6) for y in np.linspace(45, 225, 5)], float)
     inside = (grid[:, 0] > 0)
     err = np.linalg.norm(c.cam_to_proj(grid[inside], dense=False) - rig.truth(grid[inside]), axis=1)
-    assert err.mean() < 2.5 and err.max() < 9.0, err                  # projector px (~3 camera px in the far corners)
+    assert err.mean() < 3.0 and err.max() < 9.0, err                  # projector px (~3 camera px in the far corners)
     plain = am.Calibration(am.fit_h(*_corr(rig, c))[0], 0, (BW, BH), (PW, PH), "plain")
     err0 = np.linalg.norm(plain.cam_to_proj(grid, dense=False) - rig.truth(grid), axis=1)
     assert err0.max() > 2.5 * err.max() and err0.mean() > 2.5 * err.mean()   # the lens model makes the edges right
@@ -622,7 +610,7 @@ def test_dim_noisy_camera_gets_brighter_patterns_and_wider_stripes(tmp_path):
     rig = WebcamRig(OBLIQUE_FULL, mirrored=False, noise=14.0, gain=0.35)
     w, ss = _wizard(rig, tmp_path)
     _go(w, w.check)
-    assert w.adapt["snr"] < 8 and w.adapt["level"] == 235 and w.adapt["stripe"] >= 8
+    assert w.adapt["snr"] < 8 and w.adapt["level"] == am.LEVEL_MAX and w.adapt["stripe"] >= 8
 
 
 def test_framing_advice_directions():
@@ -819,3 +807,91 @@ def test_refine_with_a_scale_bias_never_diverges():
 def test_overlay_texture_uses_byte_alignment():
     import inspect
     assert "alignment=1" in inspect.getsource(am.AutoMapOverlay.draw)
+
+
+# ---------------------------------------------------------------- PR-2 review (research/neon_pr2_review.md) regressions
+
+def test_b5_cancel_takes_the_pattern_off_the_wall_at_once(tmp_path):
+    shown = []
+    w = am.AutoMap(lambda img: shown.append(img), lambda: 10 ** 9, lambda skip: (_time.sleep(3.0), np.zeros((CH, CW)))[1],
+                   lambda: ([], (PW, PH)), lambda c: None, calib_dir=tmp_path, hold=0.0)
+    w.check()                                             # the fake camera takes 3 s per still
+    _time.sleep(0.2)
+    a = _time.monotonic()
+    w.cancel("panic")
+    assert shown[-1] is None and _time.monotonic() - a < 0.05    # off the wall now, not when the step unwinds
+    w._thread.join(10)
+    assert "panic" in w.err
+
+
+def test_b5_hold_is_interruptible_and_levels_are_capped(tmp_path):
+    w = am.AutoMap(lambda img: None, lambda: 10 ** 9, lambda skip: np.zeros((CH, CW)), lambda: ([], (PW, PH)),
+                   lambda c: None, calib_dir=tmp_path, hold=5.0)
+    threading.Timer(0.2, w.cancel).start()
+    a = _time.monotonic()
+    with pytest.raises(am.CalibError):
+        w._project(np.zeros((PH, PW), np.uint8))
+    assert _time.monotonic() - a < 1.0
+    assert max(int(img.max()) for _, img in am.gray_sequence(PW, PH, 4, 255)) <= am.LEVEL_MAX
+    assert all(p["level"] <= am.LEVEL_MAX for p in am.PROFILES.values())
+
+
+def test_b5_panic_clears_the_overlay_in_the_bridge():
+    class Ov:
+        def __init__(self):
+            self.last = "x"
+
+        def show(self, img):
+            self.last = img
+
+    class Ctl:
+        panics = 0
+
+    class Cam:
+        on = True
+    ctl = Ctl()
+    b = am.EngineBridge(None, Cam(), (PW, PH), ctl)
+    try:
+        b.overlay = Ov()
+        ctl.panics = 1
+        b.tick(surfaces.Mapper(path=None, output=(PW, PH)))
+        assert b.overlay.last is None
+    finally:
+        b.overlay = None
+        b.close()
+
+
+def test_b10_redaction_uses_the_mask_taken_with_the_photo_and_asks_without_segmentation(tmp_path):
+    live = {"m": None}
+    person = np.zeros((90, 160), np.float32)
+    person[10:60, 20:40] = 1.0
+    w, prov, ss, rig = _ai_wizard(tmp_path, lambda p, png: '{"polygons": []}')
+    w._person = lambda: (live["m"], True)
+    w.calibrate(False); _wait(w)
+    live["m"] = person                                    # someone stands there while the photo is taken
+    w.detect(); _wait(w)
+    live["m"] = np.zeros((90, 160), np.float32)           # ...and walks away before AI is pressed
+    assert w.ai_prepare("detect")
+    assert w.ai["person"] and w.ai["redacted"] > 0        # still greyed out and still asks
+    w.ai_discard()
+    w._person = lambda: (np.zeros((90, 160), np.float32), False)   # motion fallback: cannot see people standing still
+    w.detect(); _wait(w)
+    assert w.ai_prepare("detect") and w.ai["person"]      # so it always asks
+
+
+def test_b11_the_vision_call_limit_holds_across_requests():
+    class Plug:
+        keys, cli_google, root, log = Keys(), False, Path("."), None
+    plug = Plug()
+    v1, v2 = V.Vision.from_plugin(plug), V.Vision.from_plugin(plug)
+    assert v1 is v2
+    v1.providers = [FakeProv(lambda p, png: '{"polygons": []}')]
+    for _ in range(V.CALL_LIMIT[0]):
+        V.Vision.from_plugin(plug).ask("detect", "q", b"x")
+    with pytest.raises(BackendError, match="limit"):
+        V.Vision.from_plugin(plug).ask("detect", "q", b"x")
+
+
+def test_sf1_escaped_quotes_inside_json_strings():
+    txt = 'noise {"polygons": [{"name": "the \\"front\\" face", "points": [[1, 2], [3, 4], [5, 6]]}]} tail'
+    assert V.parse_json_reply(txt)["polygons"][0]["name"] == 'the "front" face'

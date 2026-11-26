@@ -18,6 +18,11 @@ STROBE_8 = 175.0 / 60.0 * 2.0
 
 
 # ------------------------------------------------------------------------------------------------ helpers
+def ARM(op):
+    """An arming command the way remote_control hands it over when it came from the laptop itself."""
+    return FG.mark_local({"cmd": "flashguard", "op": op})
+
+
 def base(level=0.10, checker=0.10):
     y, x = np.mgrid[0:H, 0:W]
     img = np.zeros((H, W, 4), dtype="f4")
@@ -143,7 +148,7 @@ def test_logic_lets_go_after_the_flashing_stops():
 def test_logic_red_is_caught_below_the_luminance_threshold_and_is_stricter():
     red = FG.GuardLogic()                                      # dim red: luminance swing 0.045, red energy swing 0.21
     feed(red, lambda t: tiles(0.045 if (t * 4) % 1 < 0.5 else 0.0, 0.21 if (t * 4) % 1 < 0.5 else 0.0), clock(2.0))
-    assert red.red and not red.general and red.slew(2.0) == (FG.FREE, FG.SLEW_S)
+    assert red.red and not red.general and red.slew(2.0) == (FG.SLEW_L, FG.SLEW_S)
     edge = FG.GuardLogic()                                     # 2.8 Hz: legal for white, too fast for red here
     feed(edge, lambda t: tiles(0.045 if (t * 2.8) % 1 < 0.5 else 0.0, 0.21 if (t * 2.8) % 1 < 0.5 else 0.0), clock(3.0))
     assert edge.red
@@ -176,17 +181,17 @@ def test_override_needs_a_two_second_hold_and_never_survives_a_restart():
     lg = FG.GuardLogic()
     feed(lg, lambda t: tiles(0.5 if (t * STROBE_16) % 1 < 0.5 else 0.05), clock(1.0))
     assert lg.slew(1.0) is not None and lg.state(1.0)["mode"] == "attenuating"
-    assert lg.command({"op": "arm_confirm"}, wall=100.0) == "refused"                 # no hold at all
-    lg.command({"op": "arm_begin"}, wall=100.0)
+    assert lg.command(ARM("arm_confirm"), wall=100.0) == "refused"                 # no hold at all
+    lg.command(ARM("arm_begin"), wall=100.0)
     assert lg.state(1.0, wall=100.5)["pending"]
-    assert lg.command({"op": "arm_confirm"}, wall=101.0) == "refused" and not lg.armed  # 1 s is not a hold
-    lg.command({"op": "arm_begin"}, wall=200.0)
-    assert lg.command({"op": "arm_confirm"}, wall=230.0) == "refused"                 # went stale
-    lg.command({"op": "arm_begin"}, wall=300.0)
+    assert lg.command(ARM("arm_confirm"), wall=101.0) == "refused" and not lg.armed  # 1 s is not a hold
+    lg.command(ARM("arm_begin"), wall=200.0)
+    assert lg.command(ARM("arm_confirm"), wall=230.0) == "refused"                 # went stale
+    lg.command(ARM("arm_begin"), wall=300.0)
     lg.command({"op": "arm_cancel"}, wall=301.0)
-    assert lg.command({"op": "arm_confirm"}, wall=303.0) == "refused"
-    lg.command({"op": "arm_begin"}, wall=400.0)
-    assert lg.command({"op": "arm_confirm"}, wall=402.1) == "armed" and lg.armed
+    assert lg.command(ARM("arm_confirm"), wall=303.0) == "refused"
+    lg.command(ARM("arm_begin"), wall=400.0)
+    assert lg.command(ARM("arm_confirm"), wall=402.1) == "armed" and lg.armed
     s = lg.state(1.0)
     assert lg.slew(1.0) is None and s["mode"] == "override" and s["armed"] and s["would"]
     assert lg.command({"op": "disarm"}) == "disarmed" and lg.slew(1.0) is not None
@@ -301,8 +306,6 @@ def test_nan_frames_do_not_poison_the_guard(gl):
     assert flashes(times, clean)[0] <= 3
     assert np.isfinite(outs[-1][100:, 100:]).all() and float(outs[-1][100:, 100:].mean()) > 0.05
     json.dumps(fg.state(), allow_nan=False)
-    hist = np.frombuffer(fg.t_hist.read(), dtype="f2")
-    assert np.isfinite(hist).all()
     fg.release()
 
 
@@ -359,8 +362,8 @@ def test_override_passes_the_strobe_and_says_so(gl):
     tex = gl.texture((W, H), 4, dtype="f2")
     fbo = gl.framebuffer([tex])
     fg = FG.FlashGuard(gl, (W, H))
-    fg.logic.command({"op": "arm_begin"}, wall=0.0)
-    assert fg.logic.command({"op": "arm_confirm"}, wall=2.5) == "armed"
+    fg.logic.command(ARM("arm_begin"), wall=0.0)
+    assert fg.logic.command(ARM("arm_confirm"), wall=2.5) == "armed"
     outs = []
     for img, t in zip(frames, times):
         tex.write(img.astype("f2").tobytes())
@@ -406,6 +409,11 @@ def test_engine_hook_sits_after_the_filters_and_before_every_tap():
     for later in ("spout.sendTexture(disp.glo", "preview.service, remote, disp", "fbos[dst].read(components=3, attachment=0",
                   "surf_draw.render(mapper.set, disp", "out_vao.render(moderngl.TRIANGLE_STRIP)", "recorder.frame,"):
         assert hook < src.index(later), later
+    # B3: the mapped frame (surfaces, grid, AUTO MAP patterns) is drawn into the guard's stage and guarded LAST
+    begin, end = src.index("fguard.output_begin"), src.index("fguard.output_end")
+    assert begin < src.index("surf_draw.render(mapper.set, disp") < src.index('guarded("automap", amap.draw, target') < end
+    assert src.index("out_vao.render(moderngl.TRIANGLE_STRIP)") < end < src.index("recorder.frame,")
+    assert "fguard.note_panics(" in src
     assert re.search(r'state\["flashguard"\]\s*=\s*fguard\.state\(\)', src)
 
 
@@ -524,3 +532,166 @@ def test_engine_strobe_and_blackout_hammering_come_out_under_the_limit(tmp_path)
     bright = ("--set", "symmetry=0", "--set", "l_ai=1", "--set", "density=1", "--set", "l_beads=1", "--set", "l_lines=1")
     _, black = _engine(tmp_path, "blackout", "--flashguard", *bright, driver=("blackout", 6.0))
     assert black["rate_in"] > 3 and black["rate_out"] <= 3 and black["events"] >= 1
+
+
+# ------------------------------------------------------------------------------------------------ review round (Neon B1-B4)
+def test_b1_one_steady_bright_pixel_per_block_does_not_unlock_the_strobe(gl):
+    times = clock(3.0)
+    dots = np.zeros((H, W), bool)
+    dots[::4, ::4] = True                                      # 1 pixel in 16, lit all the time
+
+    def fn(t):
+        img = strobe(t, STROBE_16)
+        img[dots, :3] = 1.0
+        return img
+    frames, outs, fg = run(gl, fn, times)
+    assert flashes(times, frames)[0] > 3 and flashes(times, outs)[0] <= 3
+    late = [o for t, o in zip(times, outs) if t > 1.0]
+    assert flashes([t for t in times if t > 1.0], late)[0] == 0
+    assert max(float(o[~dots].mean()) for o in late) < 0.2       # the strobe itself is held at its dark phase
+    assert all(np.array_equal(o[dots], np.ones_like(o[dots])) for o in late)      # the steady dots are untouched
+    never_brighter(frames, outs)
+    fg.release()
+
+
+def test_b2_red_to_orange_flashing_is_held_by_the_red_gate(gl):
+    times = clock(3.0)
+
+    def fn(t):
+        img = np.zeros((H, W, 4), dtype="f4")
+        img[..., 3] = 1.0
+        img[..., 0] = 1.0
+        img[..., 1] = 0.0 if (t * 6.0) % 1 < 0.5 else 0.55     # saturated red <-> orange (R share 0.79: not "red")
+        return img
+    frames, outs, fg = run(gl, fn, times)
+    assert flashes(times, frames)[1] > 3
+    g, r = flashes(times, outs)
+    assert r <= 3 and g <= 3
+    never_brighter(frames, outs)
+    fg.release()
+
+
+def test_b3_mapped_output_stage_guards_what_the_output_pass_adds(gl):
+    """What the surfaces / overlays draw AFTER the picture guard goes through a second guard, then to the projector."""
+    size = (W, H)
+    target = gl.simple_framebuffer(size)
+    fg = FG.FlashGuard(gl, size)
+    assert not fg.wants_output_stage(False, False, None) and fg.wants_output_stage(True) and fg.wants_output_stage(False, True)
+
+    class Ov:
+        _active, _pending = False, None
+    amap = type("A", (), {"overlay": Ov()})()
+    assert not fg.wants_output_stage(False, False, amap)
+    amap.overlay._pending = (None,)
+    assert fg.wants_output_stage(False, False, amap)
+    times = clock(3.0)
+    for name, level in (("flash", lambda t: 0.9 if (t * 8.0) % 1 < 0.5 else 0.1), ("calm", lambda t: 0.4)):
+        fg = FG.FlashGuard(gl, size)
+        ins, outs = [], []
+        for t in times:
+            v = level(t)
+            fbo = fg.output_begin(size)                        # the engine draws surfaces / grid / patterns here
+            fbo.clear(v, v, v, 1.0)
+            ins.append(np.full((H, W, 3), round(v * 255) / 255, "f4"))
+            fg.output_end(target, size, t)
+            assert gl.fbo is target
+            outs.append(np.frombuffer(target.read(components=3, dtype="f4"), dtype="f4").reshape(H, W, 3).copy())
+        if name == "flash":
+            assert flashes(times, ins)[0] > 3 and flashes(times, outs)[0] <= 3
+            assert fg.state()["mode"] == "attenuating" and fg.state()["mapped"] and fg.summary()["map_events"] == 1
+        else:
+            assert all(np.array_equal(a, b) for a, b in zip(ins, outs)) and fg.summary()["map_passes"] == 0
+        never_brighter(ins, outs)
+        fg.release()
+
+
+def test_b4_override_only_from_the_laptop_and_panic_brings_the_guard_back(gl):
+    lg = FG.GuardLogic()
+    assert lg.command({"cmd": "flashguard", "op": "arm_begin"}, wall=0.0) == "refused_remote"      # phone / LAN client
+    assert lg.command({"cmd": "flashguard", "op": "arm_confirm"}, wall=2.5) == "refused_remote" and not lg.armed
+    assert lg.state(0.0, wall=3.0)["refused"] and not lg.state(0.0, wall=20.0)["refused"]
+    lg.command(ARM("arm_begin"), wall=10.0)                    # a LAN confirm cannot finish a local hold either
+    assert lg.command({"op": "arm_confirm"}, wall=12.5) == "refused_remote" and not lg.armed
+    assert lg.command(ARM("arm_confirm"), wall=13.0) == "refused"
+    forged = FG.validate_command({"cmd": "flashguard", "op": "arm_begin", "_local": True, "local": 1})
+    assert forged == {"cmd": "flashguard", "op": "arm_begin"}  # nothing a client sends can carry the marker
+    assert FG.mark_local({"cmd": "rec", "op": "start"}) == {"cmd": "rec", "op": "start"}
+    src = (ROOT / "remote_control.py").read_text(encoding="utf-8")
+    i = src.index("if flashguard.is_local_request(self.client_address[0]")
+    assert src.index("cmds = [validate_command(c) for c in cmds]") < i < src.index("self.server.rc._q.put_nowait(c)")
+    assert "0.0.0.0" not in FG.LOOPBACK and "127.0.0.1" in FG.LOOPBACK
+
+    fg = FG.FlashGuard(gl, (W, H))
+    fg.note_panics(0)
+    fg.command(ARM("arm_begin"))
+    fg.logic.arm_t0 -= 3.0
+    assert fg.command(ARM("arm_confirm")) == "armed" and fg.logic.armed
+    fg.note_panics(0)
+    assert fg.logic.armed
+    fg.note_panics(1)                                          # PANIC: guarded again, at once
+    assert not fg.logic.armed and fg.state()["mode"] != "override"
+    assert fg.command({"cmd": "flashguard", "op": "disarm"}) == "disarmed"     # switching it back ON works from anywhere
+    fg.release()
+
+
+def test_b3_engine_multi_surface_output_goes_through_the_second_guard(tmp_path):
+    pytest.importorskip("moderngl")
+    surf = tmp_path / "surfaces.json"
+    quad = lambda x0, x1: [[x0, 80], [x1, 80], [x1, 720], [x0, 720]]                       # noqa: E731
+    mk = lambda i, x0, x1, b: dict(id=i, name=f"S{i}", order=i - 1, enabled=True, shape="quad", corners=quad(x0, x1),   # noqa: E731
+                                   source=dict(mode="full", rect=[0, 0, 1, 1]), content="main", color=[1, 1, 1],
+                                   opacity=1.0, brightness=b, glow=0.0, feather=0)
+    surf.write_text(json.dumps(dict(version=1, output=[1280, 800], sel=1, surfaces=[mk(1, 40, 620, 2.0), mk(2, 660, 1240, 1.0)])))
+    plain, none = _engine(tmp_path, "m_plain", "--surfaces", surf)
+    guard, stats = _engine(tmp_path, "m_guard", "--surfaces", surf, "--flashguard")
+    assert none is None and stats["map_frames"] == 300 and stats["map_passes"] == 0 and stats["passes"] == 0
+    files = sorted(f.name for f in plain.glob("frame_*.png"))
+    assert files and all((plain / f).read_bytes() == (guard / f).read_bytes() for f in files)     # calm: bit-identical
+    _, st = _engine(tmp_path, "m_strobe", "--surfaces", surf, "--flashguard", driver=("strobe", STROBE_16))
+    assert st["rate_in"] > 3 and st["rate_out"] <= 3 and st["map_rate_out"] <= 3
+
+
+def test_b4_arming_over_http_needs_loopback_a_loopback_host_and_a_same_site_post(tmp_path):
+    assert FG.is_local_request("127.0.0.1", "127.0.0.1:8765") and FG.is_local_request("::1", "[::1]:8765")
+    assert FG.is_local_request("127.0.0.1", "localhost:8765")
+    for addr, host in (("192.168.1.20", "192.168.1.5:8765"), ("192.168.1.20", "127.0.0.1:8765"), ("127.0.0.1", "192.168.1.5:8765"),
+                       ("127.0.0.1", "evil.example:8765"), ("127.0.0.1", "127.0.0.1.evil.example"), ("127.0.0.1", None), (None, "localhost")):
+        assert not FG.is_local_request(addr, host), (addr, host)
+
+    import http.client
+    import socket
+    from remote_control import RemoteControl
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    rc = RemoteControl(port=port, token="tok", quiet=True, host="127.0.0.1", art_dir=tmp_path / "art", tex_dir=tmp_path / "tex")
+    rc.start()
+
+    def post(op, **headers):
+        con = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        con.putrequest("POST", "/cmd", skip_host=True)
+        body = json.dumps({"cmd": "flashguard", "op": op}).encode()
+        base = {"Host": f"127.0.0.1:{port}", "Content-Type": "application/json", "X-Token": "tok", "Content-Length": str(len(body))}
+        for k, v in {**base, **headers}.items():
+            con.putheader(k, v)
+        con.endheaders(body)
+        code = con.getresponse().status
+        con.close()
+        return code, [c for c in rc.drain() if c.get("cmd") == "flashguard"]
+    try:
+        lg = FG.GuardLogic()
+        code, cmds = post("arm_begin", Origin=f"http://127.0.0.1:{port}")           # the panel on the laptop itself
+        assert code == 200 and len(cmds) == 1 and lg.command(cmds[0], wall=0.0) == "pending"
+        code, cmds = post("arm_begin", Host=f"192.168.1.5:{port}")                  # asked for the LAN address
+        assert code == 200 and lg.command(cmds[0], wall=1.0) == "refused_remote"
+        code, cmds = post("arm_confirm", Host=f"evil.example:{port}", Origin=f"http://evil.example:{port}")   # DNS rebinding
+        assert code == 403 and cmds == []
+        code, cmds = post("arm_confirm", Origin="http://evil.example")              # another site's page, on this laptop
+        assert code == 403 and cmds == []
+        code, cmds = post("arm_confirm", **{"Sec-Fetch-Site": "cross-site"})
+        assert code == 403 and cmds == []
+        code, cmds = post("arm_begin", **{"X-Token": "wrong"})
+        assert code in (401, 403) and cmds == [] and not lg.armed
+    finally:
+        rc.stop()
