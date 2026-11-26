@@ -1,0 +1,6 @@
+{
+  "fps": 175,
+  "frames": 400,
+  "floor": 0.5,
+  "note": "headless --test 400, default look, 1280x800, GTX 1650 Ti, 2026-11-26 after the prog_names fix (snapshot 4 code: ~85-150, regressed: ~67-99 under the same CPU load)"
+}

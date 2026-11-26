@@ -1,0 +1,64 @@
+# PUBLIC_MANIFEST.txt: what may go into the public AGPL-3.0 repo (github.com/SolshineCode/EntheoControl)
+# Written 2026-11-26 by the release-hygiene pass (Neon PR1 B13, PR2 B22). The coordinator publishes ONLY the research
+# files listed under PUBLISH. Everything under NEVER PUBLISH stays in the working folder. Re-check this list when a
+# new file appears in research/ (default for a new file: internal until someone adds it here).
+
+## PUBLISH: research/ (scrubbed of local paths, machine model and personal details on 2026-11-26)
+research/kene_reference/README.md          # grammar, ethics, artist collectives; read by tests/test_kene_real.py
+research/pro_vj_software_survey.md         # survey of pro VJ / mapping software
+research/pro_redesign_plan.md              # design plan cited by clips.py and tests/test_clips.py (no personal data;
+                                           #   mentions of the AI agents that build the project are left as they are)
+research/automap_spec.md                   # AUTO MAP spec cited by automap.py
+research/inspiration_techniques.md         # publicly documented artist techniques -> GLSL notes
+research/gemini_effect_techniques.md       # realtime GLSL technique research (GPU named generically)
+research/td_audio_mapping.md               # TouchDesigner audio + Spout recipes (QUICKSTART.md links it)
+research/resolume_spout_mapping.md         # Resolume + Spout recipes (QUICKSTART.md links it)
+research/lora_dataset.md                   # legal dataset + low-VRAM LoRA plan (QUICKSTART.md links it)
+research/hardware_next.md                  # projector / cable / controller upgrades (QUICKSTART.md links it)
+research/streamdiffusion_lowvram.md        # StreamDiffusion on 4 GB notes
+research/PUBLIC_MANIFEST.txt               # this file
+
+## NEVER PUBLISH: research/ (internal: AI review transcripts, agent scratch notes, hardware profile, CLI recipes)
+research/kene_reference/user_refs/          # user-supplied private study references (copyrighted)
+research/kene_reference/images/            # study photos (already in .gitignore); licences listed in README 5.1
+research/neon_pr1_review.md
+research/neon_pr2_review.md
+research/neon_review_camera_automap.md
+research/neon_review_filters_dreamify.md
+research/opus_review_bypass_online.md
+research/opus_review_kene_real.md
+research/opus_review_mapping_text_recorder.md
+research/opus_review_perform_stack.md
+research/opus_review_skins.md
+research/timeline_review_neon.md
+research/timeline_design_neon.md           # design critique written for the agents
+research/code_review_notes.md
+research/gemini_review_polish_governor.md
+research/gemini_neon_support.md            # personal laptop model/specs, Antigravity ToS quote + CLI automation recipes
+research/optimization_ideas.md             # agent scratchpad (battery, OneDrive, local folders)
+research/visual_critique.md                # obsolete v1 critique with a local Downloads path
+research/touchvdmx_inventory.md            # internal merge checklist for the Gemini prototype
+research/effects_spec_videos.md            # the owner's private descriptions of reference videos
+research/mapping_geometry_unapplied_patch.py.txt
+
+## NEVER PUBLISH: the rest of the working folder
+tools/agy_neon_runner.py                   # local dev helper (drives agy for Neon reviews)
+HANDOFF.md                                 # agent coordination log (local paths, hardware, session notes)
+NotesTowardsStartingProjectionMappingPsychedelicArt.txt   # the owner's private notes
+touchvdmx_explorer.html                    # owner-supplied, Gemini-generated prototype (see THIRD_PARTY_NOTICES.md 1.4)
+incoming/                                  # drop zone for outside code
+SWITCH_TO_STABLE.cmd                       # local helper that starts show_stable/
+show_stable/  show_preview/  show_preview2/  show_preview3/   # local snapshots
+.remote_token  live_state.json  logs/  recordings/  test_frames/  models/  calibration/  shows/  presets/
+.locks/  .venv/  __pycache__/  .pytest_cache/  .claude/
+textures/*.png  art/*  fonts/*  video/  loras/  lora_data/  online_keys.json  online_keys.tmp
+scenes.json  midi_map.json  surfaces.json  mapping.json  *.entheo  *.bad
+
+## Publish from the working folder (new or changed in this pass)
+README.md (the working copy is now the source; it was only in the publish clone before)
+THIRD_PARTY_NOTICES.md  models.md  requirements.txt  QUICKSTART.md
+LICENSE stays as it is in the publish clone (not present in the working folder).
+
+## Leftover mentions to know about (comments only, harmless if the files are not published)
+tests/test_online.py, tests/test_polish.py, tests/test_timeline.py, tests/test_shows.py, tests/test_automap.py name
+internal review files in section comments ("regressions from research/<review>.md").

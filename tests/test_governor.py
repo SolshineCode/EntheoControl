@@ -1,5 +1,6 @@
 """Resource governor (governor.py): pure policy, fake sensors + fake clock, no GL."""
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ class Clock:
 
 class FakeSensors:
     def __init__(self, **kw):
-        self.d = dict(gpu_util=40.0, vram_mb=2000.0, vram_total_mb=4096.0, gpu_temp=65.0, cpu=20.0, ram=40.0,
+        self.d = dict(gpu_util=97.0, vram_mb=2000.0, vram_total_mb=4096.0, gpu_temp=65.0, cpu=20.0, ram=40.0,
                       batt_pct=None, plugged=None, batt_secs=None)
         self.d.update(kw)
 
@@ -648,6 +649,14 @@ def test_panel_meter_toast_and_health_card_in_a_real_browser(tmp_path):
             page.click(".govc #govmode button:has-text('AUTO')")
             page.wait_for_function("document.querySelector('#govmode button.on').textContent==='AUTO'", timeout=5000)
             assert ctl.ext["governor"]["mode"] == "auto"
+            page.click(".govc #govprof button:has-text('BATTERY SAVER')")
+            page.wait_for_function("document.querySelector('#govprof button.on') && document.querySelector('#govprof button.on').textContent==='BATTERY SAVER'", timeout=5000)
+            assert ctl.ext["governor"]["power_profile"] == "saver"
+            page.fill("#govshow", "4")
+            page.click(".govc button:has-text('SET')")
+            page.wait_for_function("document.querySelector('#govpow').textContent.indexOf('show:')>=0", timeout=5000)
+            assert "cap 30 fps" in page.inner_text("#govpow")
+            page.locator(".govc").screenshot(path=str(ROOT / "test_frames" / "governor_power_card.png"))
             assert not errs, errs
             br.close()
     finally:
@@ -864,3 +873,442 @@ def test_r13_low_power_on_must_be_a_bool():
     with pytest.raises(ValueError):
         gv.validate_command({"cmd": "gov", "op": "low_power", "on": "false"})
     assert gv.validate_command({"cmd": "gov", "op": "low_power", "on": False})["on"] is False
+
+
+# ------------------------------------------------------------------ PR1 B9: refresh-aware strain, vsync hiccups, cheap passes
+
+def feed_pattern(g, clk, seconds, pattern, vals=None):
+    vals = vals if vals is not None else look()
+    t_end = clk.t + seconds
+    i = 0
+    while clk.t < t_end:
+        clk.t += pattern[i % len(pattern)] / 1000.0
+        g.frame(dict(vals), dict(vals))
+        i += 1
+
+
+def test_b9_a_few_missed_vsyncs_with_an_idle_gpu_are_not_strain():
+    g, clk, *_ = make("suggest", sensors=FakeSensors(gpu_util=40.0))
+    g.pass_ms.update(scene=5.9, l_fractal=0.3, l_beings=0.2)
+    pattern = [16.7] * 16 + [33.3]                        # ~6 % missed vblanks: p95 = 33 ms, mean ~17.6 ms
+    feed_pattern(g, clk, 40.0, pattern)
+    st = g.status()
+    assert st["p95"] >= 30.0
+    assert st["level"] == "ok" and st["suggestion"] is None and st["active"] == []
+
+
+def test_b9_fifty_hz_projector_is_not_strained():
+    g, clk, *_ = make("auto", sensors=FakeSensors(gpu_util=60.0))
+    g.refresh_hz = 50.0
+    g.pass_ms.update(scene=6.0, l_fractal=4.0)
+    feed_pattern(g, clk, 30.0, [20.0])
+    st = g.status()
+    assert st["level"] == "ok" and st["active"] == [] and g.headroom is True
+    assert st["refresh_hz"] == 50.0
+
+
+def test_b9_thirty_hz_display_with_busy_gpu_judged_against_its_own_budget():
+    g, clk, *_ = make("off", sensors=FakeSensors(gpu_util=97.0))
+    g.refresh_hz = 30.0
+    feed_pattern(g, clk, 5.0, [33.3])
+    assert g.status()["level"] == "ok"
+    feed_pattern(g, clk, 5.0, [45.0])                     # 22 fps of 30 Hz with a busy GPU
+    assert g.status()["level"] == "strained"
+
+
+def test_b9_sustained_fps_drop_with_a_busy_gpu_is_strain():
+    g, clk, *_ = make("off", sensors=FakeSensors(gpu_util=97.0))
+    feed_pattern(g, clk, 5.0, [22.0])
+    st = g.status()
+    assert st["level"] == "strained" and any("fps" in r for r in st["reasons"])
+
+
+def test_b9_fps_drop_without_gpu_pressure_is_reported_not_degraded():
+    g, clk, logs, *_ = make("auto", sensors=FakeSensors(gpu_util=30.0))
+    g.pass_ms.update(scene=4.0, l_fractal=2.0)
+    feed_pattern(g, clk, 30.0, [25.0])
+    st = g.status()
+    assert st["level"] == "ok" and st["active"] == []
+    assert "not the GPU" in st["note"]
+
+
+def test_b9_gpu_pass_time_is_strain_evidence_without_utilisation():
+    g, clk, *_ = make("off", sensors=FakeSensors(gpu_util=None))
+    g.pass_ms.update(scene=9.0, l_fractal=6.0)            # 15 ms of a 16.7 ms budget
+    feed_pattern(g, clk, 5.0, [22.0])
+    assert g.status()["level"] == "strained"
+
+
+def test_b9_passes_under_one_ms_are_never_degraded():
+    g, clk, *_ = make("auto", sensors=FakeSensors(gpu_util=97.0))
+    g.pass_ms.update(scene=15.0, l_fractal=0.3, l_beings=0.2)
+    out = None
+    for _ in range(80):                                   # 40 s strained
+        feed_pattern(g, clk, 0.5, [25.0])
+    out = dict(look())
+    g.frame(out, dict(look()))
+    assert out["fractal_res"] == 0.5 and out["fractal_detail"] == 0.6 and out["being_count"] == 6.0
+    assert g.status()["active"] == []
+    assert "960x600" in g.status()["advice"]
+
+
+def test_b9_refresh_rate_follows_the_display():
+    hz = [50.0]
+    g, clk, *_ = make("off")
+    g.refresh_source = lambda: hz[0]
+    feed_pattern(g, clk, 6.0, [20.0])
+    assert g.refresh_hz == 50.0
+    hz[0] = None                                          # unknown: keep the last good value
+    feed_pattern(g, clk, 6.0, [20.0])
+    assert g.refresh_hz == 50.0
+
+
+class _VM:
+    def __init__(self, w, h, hz):
+        self.size = type("S", (), dict(width=w, height=h))()
+        self.refresh_rate = hz
+
+
+class FakeGlfw:
+    def __init__(self, win_pos):
+        self.mons = {"laptop": ((0, 0), _VM(1920, 1080, 60)), "projector": ((1920, 0), _VM(1280, 800, 50))}
+        self.win_pos = win_pos
+
+    def get_window_monitor(self, w):
+        return None
+
+    def get_window_pos(self, w):
+        return self.win_pos
+
+    def get_window_size(self, w):
+        return (1280, 800)
+
+    def get_monitors(self):
+        return list(self.mons)
+
+    def get_monitor_pos(self, m):
+        return self.mons[m][0]
+
+    def get_video_mode(self, m):
+        return self.mons[m][1]
+
+    def get_primary_monitor(self):
+        return "laptop"
+
+
+def test_b9_display_refresh_reads_the_monitor_under_the_window():
+    assert gv.display_refresh(FakeGlfw((1920, 0)), "win") == 50.0
+    assert gv.display_refresh(FakeGlfw((100, 100)), "win") == 60.0
+    assert gv.display_refresh(FakeGlfw((-5000, -5000)), "win") == 60.0  # off every monitor: primary
+
+    class Broken(FakeGlfw):
+        def get_monitors(self):
+            raise RuntimeError("no glfw")
+    assert gv.display_refresh(Broken((0, 0)), "win") is None
+
+
+def test_b9_engine_publishes_refresh_source_and_gov_status_hook():
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert "gov.refresh_source" in src and "controller.gov_status = gov.status" in src
+
+
+# ------------------------------------------------------------------ POWER BALANCE (2026-11-26)
+
+class Batt:
+    """Fake battery: capacity integrates a net power (W, + = charging) over the fake clock."""
+
+    def __init__(self, sens, clk, mwh=20000.0, full=71920.0, plugged=True):
+        self.sens, self.clk, self.mwh, self.full, self.t = sens, clk, mwh, full, clk.t
+        self.sens.d.update(plugged=plugged, batt_full_mwh=full)
+        self.update(0.0)
+
+    def update(self, net_w):
+        dt = self.clk.t - self.t
+        self.t = self.clk.t
+        self.mwh = min(self.full, max(0.0, self.mwh + net_w * 1000.0 * dt / 3600.0))
+        q = math.floor(self.mwh / 200.0) * 200.0                  # firmware reports coarse capacity steps
+        self.sens.d.update(batt_mwh=q, batt_pct=100.0 * q / self.full, batt_rate_mw=None)
+
+
+def sim_power(g, clk, batt, seconds, net_for, vals=None, ms=16.7, chunk=1.0):
+    """Run frames for `seconds`; the battery's net power each chunk = net_for(governor)."""
+    vals = vals if vals is not None else look()
+    for _ in range(int(seconds / chunk)):
+        batt.update(net_for(g))
+        run(g, clk, chunk, ms, vals, dict(vals))
+
+
+def load_model(base_w):
+    """Net battery W for a load: each power step saves some watts (fps cap saves most)."""
+    def f(g):
+        cap = g.fps_cap or 60
+        saving = {60: 0.0, 50: 3.0, 45: 4.5, 30: 9.0}.get(cap, 0.0)
+        return base_w + saving + (1.0 if g.power_step >= 4 else 0.0) + (2.0 if g.power_step >= 5 else 0.0)
+    return f
+
+
+def test_power_net_watts_from_capacity_slope():
+    est = gv.NetPower()
+    for i in range(0, 300, 5):                                   # -6 W for 5 min, capacity in 200 mWh steps
+        mwh = 20000.0 - 6.0 * 1000.0 * i / 3600.0
+        est.add(float(i), math.floor(mwh / 200.0) * 200.0, None)
+    assert est.watts() == pytest.approx(-6.0, abs=1.5)
+    est2 = gv.NetPower()
+    est2.add(0.0, 20000.0, -8000.0)                              # firmware rate wins when it reports one
+    assert est2.watts() == pytest.approx(-8.0, abs=0.1)
+    assert gv.NetPower().watts() is None
+
+
+def test_power_battery_state_reader_never_raises():
+    d = gv.read_battery()
+    assert isinstance(d, dict)
+    if d:
+        assert "batt_pct" in d
+
+
+def test_power_on_ac_draining_steps_down_until_net_is_positive_then_recovers():
+    sens = FakeSensors(gpu_util=60.0)
+    g, clk, logs, *_ = make("auto", sensors=sens)
+    batt = Batt(sens, clk)
+    base = [-6.0]                                                # heavy show drains 6 W on the stock charger
+    model = load_model(0.0)
+    sim_power(g, clk, batt, 1500, lambda gg: base[0] + model(gg))
+    assert g.fps_cap is not None and g.fps_cap <= 45
+    net = g.status()["power"]["net_w"]
+    assert net is not None and net >= -0.5
+    steps_at_peak = g.power_step
+    base[0] = 4.0                                                # the show got lighter: plenty of surplus
+    sim_power(g, clk, batt, 3000, lambda gg: base[0] + model(gg))
+    assert g.power_step < steps_at_peak and g.fps_cap in (None, 50, 45)
+    assert any("[governor]" in m and "power" in m for m in logs)
+
+
+def test_power_charging_show_is_left_alone():
+    sens = FakeSensors(gpu_util=60.0)
+    g, clk, *_ = make("auto", sensors=sens)
+    batt = Batt(sens, clk)
+    sim_power(g, clk, batt, 900, lambda gg: 5.0)
+    assert g.power_step == 0 and g.fps_cap is None
+
+
+def test_power_suggest_mode_asks_first():
+    sens = FakeSensors(gpu_util=60.0)
+    g, clk, *_ = make("suggest", sensors=sens)
+    batt = Batt(sens, clk)
+    sim_power(g, clk, batt, 400, lambda gg: -6.0)
+    sug = g.status()["suggestion"]
+    assert sug and sug["id"] == "power:1" and "50 fps" in sug["text"] and g.fps_cap is None
+    g.command({"cmd": "gov", "op": "apply", "id": "power:1"})
+    assert g.fps_cap == 50
+
+
+def test_power_battery_only_meets_a_four_hour_target():
+    sens = FakeSensors(gpu_util=60.0)
+    g, clk, *_ = make("auto", sensors=sens)
+    batt = Batt(sens, clk, mwh=60000.0, plugged=False)          # 60 Wh left
+    g.command({"cmd": "gov", "op": "show_length", "hours": 4})
+    model = load_model(-22.0)                                    # 22 W draw: 2.7 h, needs <= 15 W for 4 h
+    sim_power(g, clk, batt, 2400, model)
+    p = g.status()["power"]
+    assert p["allowed_w"] == pytest.approx(batt.mwh / 1000.0 / p["show_left_h"], rel=0.15)
+    assert -p["net_w"] <= p["allowed_w"] * 1.1
+    assert g.power_step >= 3
+
+
+def test_power_performance_profile_never_steps_and_saver_starts_capped():
+    sens = FakeSensors(gpu_util=60.0)
+    g, clk, *_ = make("auto", sensors=sens, store={})
+    batt = Batt(sens, clk)
+    g.command({"cmd": "gov", "op": "power_profile", "profile": "performance"})
+    sim_power(g, clk, batt, 900, lambda gg: -8.0)
+    assert g.power_step == 0 and g.fps_cap is None
+    g.command({"cmd": "gov", "op": "power_profile", "profile": "saver"})
+    run(g, clk, 1.0, 16.7)
+    assert g.fps_cap == 30
+    assert g.store["governor"]["power_profile"] == "saver"
+
+
+def test_power_settings_persist():
+    store = {"governor": {"mode": "auto", "power_profile": "saver", "show_end": 2e9}}
+    g, *_ = make(None, store=store)
+    assert g.power_profile == "saver" and g.show_end == 2e9
+    g.command({"cmd": "gov", "op": "show_length", "hours": 0})
+    assert store["governor"]["show_end"] is None
+
+
+def test_standby_while_blacked_out_or_master_zero():
+    g, clk, *_ = make("suggest")
+    v = look(blackout=1.0)
+    run(g, clk, 1.0, 16.7, v, dict(v))
+    assert g.standby is True and g.fps_cap == gv.STANDBY_FPS
+    v = look(master=0.0)
+    run(g, clk, 0.2, 16.7, v, dict(v))
+    assert g.standby is True
+    v = look()
+    run(g, clk, 0.05, 16.7, v, dict(v))
+    assert g.standby is False and g.fps_cap is None
+
+
+def test_standby_frames_do_not_count_as_strain():
+    g, clk, *_ = make("auto")
+    v = look(blackout=1.0)
+    run(g, clk, 30.0, 100.0, v, dict(v))                         # 10 fps on purpose
+    assert g.status()["level"] == "ok" and g.status()["active"] == []
+
+
+def test_ai_model_is_offloaded_after_idle_minutes_and_not_while_busy():
+    offl = []
+    g, clk, *_ = make("suggest", ai_offload=lambda: offl.append(clk.t))
+    g.ai_source = lambda: dict(available=True, loaded=True, on_gpu=True, busy=False, queue=0, pending=0)
+    run(g, clk, 300.0, 50.0)
+    assert offl == []
+    run(g, clk, 320.0, 50.0)                                     # > 10 min idle (balanced)
+    assert len(offl) == 1
+    run(g, clk, 120.0, 50.0)
+    assert len(offl) == 1                                        # once per idle stretch
+    g.ai_source = lambda: dict(available=True, loaded=True, on_gpu=True, busy=True, queue=1, pending=0)
+    run(g, clk, 700.0, 50.0)
+    assert len(offl) == 1
+
+
+def test_frame_pacer_holds_the_cap():
+    t = [0.0]
+    slept = []
+    p = gv.FramePacer(clock=lambda: t[0], sleep=lambda s: (slept.append(s), t.__setitem__(0, t[0] + s)))
+    for _ in range(30):
+        t[0] += 0.004                                            # 4 ms of work per frame
+        p.wait(30)
+    assert t[0] == pytest.approx(1.0, abs=0.05)                  # 30 frames in ~1 s
+    n = len(slept)
+    p.wait(None)
+    assert len(slept) == n                                       # no cap: never sleeps
+
+
+def test_camera_strain_includes_the_power_step():
+    g, clk, *_ = make("auto")
+    assert g.camera_strain() == 0
+    g.power_step = 6
+    assert g.camera_strain() >= 1
+
+
+def test_power_commands_validate():
+    assert gv.validate_command({"cmd": "gov", "op": "power_profile", "profile": "balanced"})["profile"] == "balanced"
+    assert gv.validate_command({"cmd": "gov", "op": "show_length", "hours": 4.5})["hours"] == 4.5
+    for bad in ({"cmd": "gov", "op": "power_profile", "profile": "turbo"},
+                {"cmd": "gov", "op": "show_length", "hours": "4"}, {"cmd": "gov", "op": "show_length", "hours": 99}):
+        with pytest.raises(ValueError):
+            gv.validate_command(bad)
+
+
+def test_ai_link_offload_and_worker_status_reports_gpu_residency():
+    import ai_link
+    a = ai_link.AIClient([], start=False)
+    a.offload()
+    assert a._offload is True
+    import ai_worker
+    assert "on_gpu" in ai_worker.Worker.__init__.__code__.co_names or "on_gpu" in open(
+        ROOT / "ai_worker.py", encoding="utf-8").read()
+
+
+def test_engine_power_hooks_present():
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    for s in ("gov.pace(", "gov.standby", "dtK", "gov.camera_strain()", "--test-fps"):
+        assert s in src, s
+
+
+def test_worker_offload_endpoint_moves_the_idle_model_off_the_gpu_and_it_comes_back(tmp_path):
+    import urllib.request
+    from PIL import Image
+    import ai_worker as aw
+
+    class P:
+        base, on_gpu, offloads = "fake", True, 0
+
+        def offload(self):
+            self.on_gpu, self.offloads = False, self.offloads + 1
+
+        def txt2img(self, prompt, negative, seed, size):
+            self.on_gpu = True                      # RealPipes._ready() restores before every image
+            return Image.new("RGB", (size, size), (9, 9, 9))
+
+    p = P()
+    w = aw.Worker(out_dir=tmp_path / "t", snapshot=tmp_path / "s.png", token="tok", port=0, pipes_factory=lambda: p)
+    w.start()
+
+    def post(path, body):
+        r = urllib.request.Request(f"http://127.0.0.1:{w.port}{path}", data=json.dumps(body).encode(), method="POST",
+                                   headers={"X-Token": "tok", "Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=5) as resp:
+            return resp.status
+
+    def until(fn, timeout=10):
+        t = time.time()
+        while not fn() and time.time() - t < timeout:
+            time.sleep(0.05)
+        return fn()
+    try:
+        assert post("/job", {"prompt": "a"}) == 200
+        assert until(lambda: w.status()["done"] and not w.status()["busy"])
+        assert w.status()["on_gpu"] is True
+        assert post("/offload", {}) == 200
+        assert until(lambda: w.status()["on_gpu"] is False) and p.offloads == 1
+        assert post("/job", {"prompt": "b"}) == 200
+        assert until(lambda: len(w.status()["done"]) >= 2 and w.status()["on_gpu"] is True)
+    finally:
+        w.stop()
+
+
+def test_b9_slow_nvml_queries_run_only_every_fifth_poll():
+    calls = {"throttle": 0, "power": 0, "mem": 0}
+
+    class M:
+        used, total = 1 << 30, 4 << 30
+
+    class U:
+        gpu = 50
+
+    class N:
+        def nvmlDeviceGetMemoryInfo(self, h):
+            calls["mem"] += 1
+            return M()
+
+        def nvmlDeviceGetUtilizationRates(self, h):
+            return U()
+
+        def nvmlDeviceGetTemperature(self, h, s):
+            return 70
+
+        def nvmlDeviceGetCurrentClocksThrottleReasons(self, h):
+            calls["throttle"] += 1
+            return 0x20
+
+        def nvmlDeviceGetPowerUsage(self, h):
+            calls["power"] += 1
+            return 21500
+    rd = gv.make_nvml_reader(N(), "h")
+    out = [rd() for _ in range(10)]
+    assert calls["mem"] == 10 and calls["throttle"] == 2 and calls["power"] == 2
+    assert all(d["thermal"] is True and d["gpu_w"] == 21.5 for d in out)       # cached between slow reads
+
+
+def test_power_thirty_fps_echo_looks_like_sixty_fps_headless(tmp_path):
+    """GPU: run only under .locks/gpu_suite (the full suite). Measured 2026-11-26: diff 5.5 (dt-scaled) vs 15.0 (per-frame)."""
+    import os
+    import subprocess
+    import numpy as np
+    from PIL import Image
+    look_args = ["--set", "trails=0.94", "--set", "l_echo=0.9", "--set", "rotate=0.3", "--set", "zoom=0.2",
+                 "--test-audio", "silent"]
+
+    def render(name, frames, fps, env=None):
+        out = tmp_path / name
+        r = subprocess.run([sys.executable, str(ROOT / "live_visuals.py"), "--test", str(frames), "--test-fps", str(fps),
+                            "--out", str(out), *look_args], cwd=ROOT, capture_output=True, text=True, timeout=300,
+                           env=dict(os.environ, **(env or {})))
+        assert r.returncode == 0, r.stderr[-800:]
+        return np.asarray(Image.open(out / f"frame_{frames:04d}.png").convert("RGB"), dtype=np.float32)
+    a = render("a", 600, 60)
+    b = render("b", 300, 30)
+    c = render("c", 300, 30, {"LV_ECHO_PER_FRAME": "1"})
+    d_dt, d_pf = np.abs(a - b).mean(), np.abs(a - c).mean()
+    assert d_dt < 0.6 * d_pf and d_dt < 9.0, (d_dt, d_pf)

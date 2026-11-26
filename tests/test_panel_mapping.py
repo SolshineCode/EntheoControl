@@ -35,7 +35,7 @@ def served(tmp_path):
                 if c.get("cmd") == "surf":
                     mapper.command(c)
             ctl.update(1 / 60, [0.5, 0.3, 0.1])
-            rc.publish_state(dict(ctl.state(), corners=mapper.corners(), surfaces=mapper.set.state(), res=[1280, 800], fps=60))
+            rc.publish_state(dict(ctl.state(), corners=mapper.corners(), surfaces=mapper.state(), res=[1280, 800], fps=60))
             time.sleep(1 / 60)
 
     t = threading.Thread(target=loop, daemon=True)

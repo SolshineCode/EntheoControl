@@ -1,6 +1,6 @@
 # TouchDesigner 2025: Audio Loopback, `audioAnalysis`, Projection Mapping & Spout
 
-> Target setup: ThinkPad 20TK (Intel iGPU + NVIDIA GTX 1650 Ti Max-Q 4 GB), Windows, TouchDesigner 2025.33230 (Non-Commercial — 1280×1280 cap fits the BenQ MW632ST native **1280×800** 1:1 with zero downscaling).
+> Target setup: a hybrid-GPU laptop (Intel iGPU + NVIDIA GTX 1650 Ti Max-Q 4 GB), Windows, TouchDesigner 2025.33230 (Non-Commercial — 1280×1280 cap fits the BenQ MW632ST native **1280×800** 1:1 with zero downscaling).
 
 ---
 
@@ -104,12 +104,12 @@ Docs: [https://docs.derivative.ca/Syphon_Spout_In_TOP](https://docs.derivative.c
 4. Click the **Sender Name** dropdown and select **`PsyProjector`** (or type `PsyProjector` verbatim).
 5. Verify texture arrives at `1280 × 800` (middle-click the TOP to check resolution and pixel format). If vertically inverted, follow it with a **Flip TOP** (`Flip Y = On`).
 
-### Critical ThinkPad Hybrid-GPU (Optimus) Gotcha
+### Critical Hybrid-GPU (Optimus) Laptop Gotcha
 Derivative's docs explicitly note that Spout on Windows requires an **NVIDIA or AMD GPU** (Intel GPUs are not supported for Spout texture sharing), and **both sender and receiver MUST run on the same physical GPU**.
-On this ThinkPad 20TK (Intel UHD + NVIDIA GTX 1650 Ti Max-Q):
+On a hybrid-GPU laptop (tested: Intel UHD + NVIDIA GTX 1650 Ti Max-Q):
 1. Open **Windows Settings → System → Display → Graphics**.
 2. Add BOTH:
-   - `C:\path\to\EntheoControl\.venv\Scripts\python.exe`
+   - `<your EntheoControl folder>\.venv\Scripts\python.exe`
    - `C:\Program Files\Derivative\TouchDesigner.2025.33230\bin\TouchDesigner.exe`
 3. Set both to **High Performance (NVIDIA GeForce GTX 1650 Ti with Max-Q Design)**.
 4. Restart both apps if you changed this setting while either was running.

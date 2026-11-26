@@ -6,12 +6,15 @@ chunks, so live_visuals hot-loads it, the art picker lists it, and a "show when 
 
 Providers are tried in order:
   GeminiApiProvider    RECOMMENDED. Google's Gemini API (Interactions endpoint) with an API key the USER typed into the
-                       panel, kept in online_keys.json next to the code (see KeyStore). Uses the google-genai SDK when
-                       it is installed in the venv, plain HTTPS otherwise. NOT yet exercised against the live API.
-  GeminiNanoProvider   gemini CLI + its `nanobanana` extension (the user's nano-banana skill uses the same route)
-  AgyImageProvider     Antigravity CLI (`agy`), asked to use its image tool and save out.png
-The two CLI providers use the CLI's own login and exist only after the explicit opt-in (`cli_google`): Antigravity's
-terms may not allow other software to drive the CLI, and that is the user's call (plugin.CLI_NOTE).
+                       panel, kept in the user's app-data folder (see KeyStore). Uses the google-genai SDK when it is
+                       installed in the venv, plain HTTPS otherwise. NOT yet exercised against the live API.
+  AgyImageProvider     Antigravity CLI (`agy`), Nano Banana through the user's agy login. Only after the local
+                       "Allow Google CLI tools" opt-in. Confined like every agy call (backends.py): fresh sandbox
+                       folder under the system temp folder, deleted afterwards; constant command line; the image
+                       prompt in prompt.txt under the answer-only rules; read-only plan mode. Only an IMAGE FILE is
+                       collected (from the sandbox or from agy's own artifact folder) and re-encoded by save_texture;
+                       nothing agy prints is executed or followed.
+The gemini CLI + nanobanana extension is not used (it only works with every tool auto-approved).
 If every provider fails, is missing, or the rate limit is hit, the job goes to the local worker unchanged
 (`ctl.ai.submit`) and the panel says so.
 
@@ -34,7 +37,7 @@ from pathlib import Path
 
 import control
 
-from .backends import BackendError, agy_pty, fresh_dir, run_cli
+from .backends import AGY_MODE, BackendError, agy_pty, drop_sandbox, fresh_dir, sandbox, write_prompt
 
 MAX_N = 2                    # images per job on this engine (each one is a metered online call)
 IMG_LIMIT = (6, 60.0)        # online images per window; beyond it jobs fall back to the local engine
@@ -47,12 +50,14 @@ def clean_prompt(p):
     return p[:500]
 
 
-def newest_image(folder, skip=()):
+def newest_image(folder, skip=(), since=None):
     best, best_t = None, -1.0
     for f in Path(folder).rglob("*"):
         try:
             if f.is_file() and f.suffix.lower() in IMG_EXT and f.name not in skip and f.stat().st_size > 0:
                 t = f.stat().st_mtime
+                if since is not None and t < since:
+                    continue
                 if t > best_t:
                     best, best_t = f, t
         except OSError:
@@ -84,8 +89,9 @@ def save_texture(src, job, seed, tex_dir, provider="", max_side=MAX_SIDE):
 
 
 class KeyStore:
-    """The user's own Gemini API key, typed into the panel. One small JSON file next to the code, written
-    atomically, listed in .gitignore. The key is never logged and never part of any state sent to a panel."""
+    """The user's own Gemini API key, typed into the panel. One small JSON file in the user's app-data folder
+    (default_key_path: outside the project, so no copy / snapshot / git clone of the show carries it), written
+    atomically. The key is never logged and never part of any state sent to a panel."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -107,6 +113,7 @@ class KeyStore:
     def set(self, key):
         self._key = str(key or "")
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             if not self._key:
                 if self.path.exists():
                     self.path.unlink()
@@ -117,6 +124,11 @@ class KeyStore:
             return True
         except OSError:
             return False
+
+
+def default_key_path():
+    base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+    return Path(base) / "PsyProjector" / "online_keys.json"
 
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -197,45 +209,33 @@ class GeminiApiProvider:
         return out
 
 
-class GeminiNanoProvider:
-    name = "gemini"
+AGY_TASK = ("Read the file prompt.txt in the current folder. Follow the rules at the top of that file. Below the line it "
+            "holds an image description. Use your image generation tool to create exactly one image of it. "
+            "Reply with only the path of the saved image.")
+AGY_FRAME = " Use the file frame.png in the current folder as the input image and transform it."
 
-    def __init__(self, timeout=240.0, exe=None, ext_dir=None):
-        self.timeout, self._exe = float(timeout), exe
-        self.ext_dir = Path(ext_dir) if ext_dir else Path.home() / ".gemini" / "extensions" / "nanobanana"
 
-    def exe(self):
-        return self._exe or shutil.which("gemini")
-
-    def available(self):
-        return bool(self.exe()) and self.ext_dir.is_dir()
-
-    def generate(self, prompt, init, work, cancel=None):
-        # only the nanobanana extension is loaded (no mail / drive tools); the instruction rides on stdin, so no
-        # part of the prompt is ever parsed by a shell
-        argv = [self.exe(), "-e", "nanobanana", "--yolo", "--skip-trust", "-o", "text",
-                "-p", "Follow the instructions given above exactly."]
-        if init is not None:
-            shutil.copyfile(init, Path(work) / "frame.png")
-            task = ("Call the edit_image tool exactly once with file frame.png (it is in the current folder) and the "
-                    "prompt below.")
-        else:
-            task = "Call the generate_image tool exactly once with the prompt below and no other options."
-        stdin = (f"{task} Do not run shell commands, do not read or write any other file, do not call any other "
-                 f"tool. Afterwards reply with only the saved file path.\nPROMPT: {clean_prompt(prompt)}\n")
-        rc, out, err = run_cli(argv, stdin, cwd=work, timeout=self.timeout, cancel=cancel)
-        img = newest_image(work, skip=("frame.png",))
-        if img is None:
-            raise BackendError(f"gemini made no image (exit {rc}): {(err or out).strip()[-240:] or 'no output'}")
-        return img
+def is_image(path):
+    """True only for a file PIL can verify as an image: whatever else an agent leaves behind is never touched."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
 
 
 class AgyImageProvider:
     name = "agy"
 
-    def __init__(self, timeout=600.0, exe=None, model="gemini-4-hydrogen-low"):
+    def __init__(self, timeout=600.0, exe=None, model="gemini-4-hydrogen-low", artifacts=None, runner=None, make_sandbox=None):
         # the model here is only the AGENT that dispatches agy's built-in image tool (Nano Banana): the cheapest one
         self.timeout, self._exe, self.model = float(timeout), exe, model
+        # in plan mode agy cannot copy its picture into our folder: it stays in agy's own artifact folder
+        self.artifacts = Path(artifacts) if artifacts else Path.home() / ".gemini" / "antigravity-cli" / "brain"
+        self._run = runner or agy_pty
+        self._sandbox = make_sandbox or (lambda: sandbox("image"))
 
     def exe(self):
         return self._exe or shutil.which("agy")
@@ -244,24 +244,24 @@ class AgyImageProvider:
         return bool(self.exe())
 
     def generate(self, prompt, init, work, cancel=None):
-        work = Path(work)
-        src = ""
-        if init is not None:
-            shutil.copyfile(init, work / "frame.png")
-            src = " Use the file frame.png in the current folder as the input image and transform it."
-        text = (f"Use your image generation tool (Nano Banana) to create exactly one image and save it as out.png in "
-                f"the current folder.{src} Do not run other commands and do not touch any other file. "
-                f"Image prompt: {clean_prompt(prompt)}")
-        screen = agy_pty(self.exe(), text, work, timeout=self.timeout, done_file=work / "out.png", settle=2.0,
-                         idle_after=45.0, cancel=cancel, model=self.model, extra=("--effort", "low"))
-        img = newest_image(work, skip=("frame.png",))
-        if img is None:
-            raise BackendError(f"agy made no image: {screen[-240:] or 'no output'}")
-        return img
-
-
-def default_providers():
-    return [GeminiNanoProvider(), AgyImageProvider()]
+        d = self._sandbox()                              # NOT `work` (that is inside the project): a temp sandbox
+        try:
+            write_prompt(d, clean_prompt(prompt))        # never on the command line
+            task = AGY_TASK
+            if init is not None:
+                shutil.copyfile(init, d / "frame.png")
+                task += AGY_FRAME
+            t0 = time.time() - 2.0
+            screen = self._run(self.exe(), task, d, timeout=self.timeout, idle_after=60.0, cancel=cancel,
+                               model=self.model, extra=("--effort", "low"), mode=AGY_MODE)
+            img = newest_image(d, skip=("frame.png",)) or newest_image(self.artifacts, since=t0)
+            if img is None or not is_image(img):
+                raise BackendError(f"agy made no image: {str(screen)[-200:] or 'no output'}")
+            keep = Path(work) / ("agy_out" + img.suffix.lower())     # out of the sandbox before it is deleted
+            shutil.copyfile(img, keep)
+            return keep
+        finally:
+            drop_sandbox(d)
 
 
 class NanoBanana:
@@ -269,11 +269,11 @@ class NanoBanana:
 
     def __init__(self, tex_dir, snapshot, work_root, providers=None, log=None, clock=time.monotonic, sync=False):
         self.tex_dir, self.snapshot, self.work_root = Path(tex_dir), Path(snapshot), Path(work_root)
-        self.providers = list(default_providers() if providers is None else providers)
+        self.providers = list(providers or [])
         self.log, self.clock, self.sync = log, clock, bool(sync)
         self._jobs, self._out = queue.Queue(), queue.Queue()
-        self._cancel = threading.Event()
-        self._gen = 0
+        self._cancel = threading.Event()       # the event of the job that is running (each job has its own)
+        self._gen = 0                          # bumped by cancel / PANIC / OFF: older jobs and their results are dropped
         self._times = []
         self._thread = None
         self._stop = False
@@ -282,21 +282,27 @@ class NanoBanana:
         self.done = []               # last results for the panel
         self.note = ""
         self._avail = None
+        self.rescan = lambda: None       # plugin hook (worker thread): refresh the cached folder listings
 
     def set_providers(self, providers):
         self.providers = list(providers)
         self._avail = None
 
+    def refresh(self):
+        """Which providers can run (shutil.which, key file). Called off the render thread (plugin._scan)."""
+        out = []
+        for p in list(self.providers):
+            try:
+                if p.available():
+                    out.append(p.name)
+            except Exception:
+                pass
+        self._avail = out
+        return out
+
     def available(self):
-        if self._avail is None:
-            self._avail = []
-            for p in self.providers:
-                try:
-                    if p.available():
-                        self._avail.append(p.name)
-                except Exception:
-                    pass
-        return list(self._avail)
+        """Last known answer; never touches the disk (the render thread calls this every state())."""
+        return list(self._avail or [])
 
     def _log(self, kind, **kw):
         if self.log is not None:
@@ -314,14 +320,14 @@ class NanoBanana:
     def submit(self, job, delay=0.0):
         job = dict(job)
         n = max(1, min(MAX_N, int(job.get("n", 1))))
-        if not self.available():
-            self._out.put(("fallback", job, "no online image tool is installed"))
+        if self._avail is not None and not self._avail:
+            self._out.put(("fallback", job, "no online image route is set up", self._gen))
             return
         if not self._allow(n):
-            self._out.put(("fallback", job, f"limit of {IMG_LIMIT[0]} online images a minute"))
+            self._out.put(("fallback", job, f"limit of {IMG_LIMIT[0]} online images a minute", self._gen))
             return
         job["n"] = n
-        item = (job, time.monotonic() + max(0.0, delay), self._gen)
+        item = (job, time.monotonic() + max(0.0, delay), self._gen, threading.Event())
         self.pending += 1
         self._log("image_request", prompt=job.get("prompt", "")[:200], n=n, from_frame=job.get("init") == "snapshot")
         if self.sync:
@@ -335,16 +341,20 @@ class NanoBanana:
     def tick(self, ctl):
         while True:
             try:
-                kind, a, b = self._out.get_nowait()
+                kind, a, b, gen = self._out.get_nowait()
             except queue.Empty:
                 return
+            if kind == "end":
+                self.pending = max(0, self.pending - 1)
+                continue
+            if gen != self._gen:                     # cancelled / PANIC / OFF since: never shown, never re-queued locally
+                self._log("image_dropped", what=kind)
+                continue
             if kind == "done":
                 self.done = (self.done + [a])[-8:]
                 self.note = ""
                 if a.get("show"):
                     ctl._out.append(control.passthrough("show_texture", name=a["name"]))
-            elif kind == "end":
-                self.pending = max(0, self.pending - 1)
             elif kind == "fallback":
                 self.note = f"Nano Banana: {b}. Generated locally instead."
                 self._log("image_fallback", why=b, prompt=a.get("prompt", "")[:200])
@@ -355,8 +365,19 @@ class NanoBanana:
                     pass
 
     def cancel(self):
+        """Stop the job in flight (its CLI tree is killed), forget the queue, drop any result still on its way."""
         self._gen += 1
         self._cancel.set()
+        try:
+            while True:
+                item = self._jobs.get_nowait()
+                if item is None:
+                    self._jobs.put(None)
+                    break
+                item[3].set()
+                self.pending = max(0, self.pending - 1)
+        except queue.Empty:
+            pass
 
     def close(self):
         self._stop = True
@@ -380,60 +401,70 @@ class NanoBanana:
             self._run(item)
 
     def _run(self, item):
-        job, due, gen = item
+        job, due, gen, ev = item
+        self._cancel = ev                                # this job's own event: a cancel can never be wiped
         try:
-            while not self.sync and time.monotonic() < due and gen == self._gen:
-                time.sleep(0.05)
             if gen != self._gen:
+                ev.set()
+            while not self.sync and time.monotonic() < due and not ev.is_set():
+                time.sleep(0.05)
+            if ev.is_set() or gen != self._gen:
                 return
-            self._cancel.clear()
+            if self._avail is None:
+                self.refresh()
             init = None
             if job.get("init") == "snapshot":
                 if not self.snapshot.is_file():
-                    self._out.put(("fallback", job, "no snapshot of the current frame"))
+                    self._out.put(("fallback", job, "no snapshot of the current frame", gen))
                     return
                 init = self.snapshot
             seed0 = job["seed"] if isinstance(job.get("seed"), int) else random.randrange(2 ** 31 - 16)
             for i in range(job["n"]):
-                if gen != self._gen:
+                if ev.is_set() or gen != self._gen:
                     return
-                err = self._one(job, init, seed0 + i)
+                err = self._one(job, init, seed0 + i, gen, ev)
                 if err == "cancelled":
                     return
                 if err:
                     if i == 0:
-                        self._out.put(("fallback", dict(job), err))
+                        self._out.put(("fallback", dict(job), err, gen))
                     else:
                         self._log("image_error", error=err)
                     return
         except Exception as ex:                          # never let the worker thread die
-            self._out.put(("fallback", dict(job), f"{type(ex).__name__}: {ex}"[:200]))
+            self._out.put(("fallback", dict(job), f"{type(ex).__name__}: {ex}"[:200], gen))
         finally:
             self.busy = None
-            self._out.put(("end", None, None))
+            self._out.put(("end", None, None, gen))
 
-    def _one(self, job, init, seed):
+    def _one(self, job, init, seed, gen, ev):
         """One image through the first provider that works. Returns "" or the last error."""
         err = "no provider available"
         for p in self.providers:
-            if p.name not in self.available():
+            if p.name not in (self._avail or []):
                 continue
             work = fresh_dir(self.work_root, "nano")
             t0 = time.monotonic()
             self.busy = dict(prompt=job.get("prompt", ""), t0=t0, provider=p.name)
             try:
-                src = p.generate(job["prompt"], init, work, cancel=self._cancel)
+                src = p.generate(job["prompt"], init, work, cancel=ev)
+                if ev.is_set() or gen != self._gen:      # cancelled / PANIC / OFF while the call was in flight:
+                    return "cancelled"                   # nothing is written into textures/
                 name = save_texture(src, job, seed, self.tex_dir, provider=p.name)
                 secs = round(time.monotonic() - t0, 2)
                 self._out.put(("done", dict(name=name, prompt=job["prompt"][:80], secs=secs, provider=p.name,
-                                            show=bool(job.get("show", True))), None))
+                                            show=bool(job.get("show", True))), None, gen))
                 self._log("image", name=name, provider=p.name, secs=secs, prompt=job["prompt"][:200],
                           from_frame=init is not None)
+                try:
+                    self.rescan()
+                except Exception:
+                    pass
                 return ""
             except Exception as ex:
                 err = f"{p.name}: {type(ex).__name__}: {ex}"[:300]
                 self._log("image_error", provider=p.name, error=err, secs=round(time.monotonic() - t0, 2))
-                if self._cancel.is_set():
+                if ev.is_set():
                     return "cancelled"
             finally:
                 shutil.rmtree(work, ignore_errors=True)

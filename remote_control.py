@@ -22,6 +22,11 @@ HTTP API (every request needs the token: `?k=<token>` or header `X-Token`):
   GET  /art-thumb/<name>   small cached JPEG of one art piece
   POST /upload             raw image body (png / jpeg / webp, <= 25 MB), header X-Filename -> art/<name>.png
   POST /art-delete         {"name": ...}
+  POST /library            {op: fav|unfav|pick|unpick|title|import|delete, kind: art|ai, name, title?} (image_library.py)
+                           import = AI image -> new art piece (prompt as title, deduped, quota) + a depth map job
+  POST /dreamify           {name, source, preset, strength, octaves} -> proxied to ai_worker /dreamify (DREAMIFY)
+  POST /dream-cancel       -> ai_worker /dream-cancel
+  GET  /dream-status       -> {available, dream (progress or null), queue (dream jobs), done (dream results), error}
 
 Standalone demo without GL (real Controller, fake audio):  python remote_control.py --port 8799
 """
@@ -45,11 +50,23 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import control
 import governor
+import flashguard
 import recorder
 import surfaces
+import shows                                         # show / preset files (export, import, thumbnails)
+import image_library                                 # one library: art uploads + AI / dreamed images (flags, import)
+try:                                                 # crowd camera (pure python at import; the webcam is in camera_worker.py)
+    import camera_layer
+except Exception:
+    camera_layer = None
+try:                                                 # AUTO MAP wizard (numpy at import; cv2 only when a step runs)
+    import automap
+except Exception:
+    automap = None
 
 HERE = Path(__file__).resolve().parent
-MAX_BODY = 16384       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB
+MAX_BODY = 32768       # bytes; a 60 Hz fader batch is a few hundred bytes, an AI prompt up to ~1.5 kB, and a full
+                       # 24-surface mapping layout with 8-point masks (surf "replace") about 17 kB
 MAX_BATCH = 64         # commands per POST
 MAX_UPLOAD = 25 << 20  # bytes per uploaded art image
 MAX_ART_SIDE = 4096
@@ -113,16 +130,22 @@ def validate_command(c):
         return {"cmd": cmd}
     if cmd == "gov":                                 # resource governor (governor.py): validated there
         return governor.validate_command(c)
+    if cmd == "flashguard":                          # photosensitive limiter override (flashguard.py): validated there
+        return flashguard.validate_command(c)
     if cmd == "rec":                                 # show recorder (recorder.py): validated there
         return recorder.validate_cmd(c)
+    if cmd == "camera" and camera_layer is not None:   # crowd camera on / off / settings (camera_layer.py)
+        return camera_layer.validate_command(c)
+    if cmd == "automap" and automap is not None:      # AUTO MAP wizard steps (automap.py)
+        return automap.validate_command(c)
     if cmd == "next_video":                          # passed through to the render engine
         return control.passthrough(cmd)
     if cmd == "surf":                                # multi-surface mapping: {"cmd": "surf", "op": ...} (surfaces.py)
         return surfaces.validate_cmd(c)
     if cmd == "art_pick":                            # source picker -> engine (live_visuals.art_pick): choose by name
         out = {"source": c.get("source", "art")}
-        if out["source"] not in ("art", "ai"):
-            raise ValueError("'source' must be \"art\" or \"ai\"")
+        if out["source"] not in ("art", "ai", "any"):    # any: the art piece of that name, else the AI texture
+            raise ValueError("'source' must be \"art\", \"ai\" or \"any\"")
         if c.get("name") not in (None, ""):
             name = c["name"]
             # art files are hand-dropped too (spaces, unicode): the engine only ever matches the name against its own
@@ -136,9 +159,10 @@ def validate_command(c):
         if "use" in c and c["use"] is not None:
             out["use"] = _int(c, "use", 0, 15)
         return control.passthrough(cmd, **out)
-    if cmd == "show_texture":                        # source picker: cross-fade to this file in textures/
+    if cmd == "show_texture":                        # source picker: cross-fade to this file in textures/ (or art/<name>)
         name = c.get("name")
-        if not isinstance(name, str) or not TEX_NAME.match(name) or ".." in name:
+        bare = name[4:] if isinstance(name, str) and name.startswith("art/") else name
+        if not isinstance(name, str) or not isinstance(bare, str) or not TEX_NAME.match(bare) or ".." in name:
             raise ValueError("'name' must be a texture file name")
         return control.passthrough(cmd, name=name)
     if cmd == "fold":
@@ -397,6 +421,53 @@ def delete_art(art_dir, name):
     return names.index(name)
 
 
+DREAM_PRESETS = ("dogslugs", "eyes", "architecture", "psychedelic swirl")
+
+
+def validate_dream_request(c):
+    """Panel DREAMIFY request -> clean dict (the worker re-validates against its own library); ValueError if bad."""
+    if not isinstance(c, dict):
+        raise ValueError("body must be an object")
+    name, src = c.get("name"), c.get("source", "art")
+    if src not in ("art", "ai"):
+        raise ValueError("source must be art or ai")
+    if (not isinstance(name, str) or not 0 < len(name) <= 160 or Path(name).name != name or "/" in name
+            or "\\" in name or ":" in name or ".." in name or name.startswith(".")):
+        raise ValueError("bad image name")
+    out = {"name": name, "source": src}
+    if c.get("preset") is not None:
+        if c["preset"] not in DREAM_PRESETS:
+            raise ValueError("unknown preset")
+        out["preset"] = c["preset"]
+    for k, lo, hi in (("strength", 0.05, 1.0), ("octaves", 1, 10)):
+        if c.get(k) is not None:
+            v = c[k]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or not lo <= v <= hi:
+                raise ValueError(f"{k} out of range")
+            out[k] = int(v) if k == "octaves" else float(v)
+    return out
+
+
+def ai_call(url, token_paths, path, body=None, timeout=3.0):
+    """Synchronous JSON call to ai_worker.py -> (http code, dict). Never raises."""
+    try:
+        tok = next((t for t in (_read(p) for p in token_paths) if t), None)
+        if not tok:
+            return 503, {"ok": False, "error": "AI worker not running (no token)"}
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url.rstrip("/") + path, data=data,
+                                     headers={"X-Token": tok, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read(1 << 20).decode("utf-8"))
+    except urllib.error.HTTPError as ex:
+        try:
+            return ex.code, json.loads(ex.read(4096).decode("utf-8"))
+        except Exception:
+            return ex.code, {"ok": False, "error": f"worker said {ex.code}"}
+    except Exception as ex:
+        return 503, {"ok": False, "error": f"AI worker not reachable: {ex}"[:200]}
+
+
 def request_depth(name, url, token_paths, timeout=3.0):
     """Ask ai_worker.py for a depth map of art/<name> (fire and forget; the art layer falls back to luminance)."""
     def work():
@@ -566,11 +637,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, self.server.rc._state_bytes())
         elif path == "/params":
             self._send(200, control.meta())
+        elif path in ("/timeline", "/shows", "/presets", "/clips", "/themes"):    # big documents: fetched only when their rev changes
+            b = control.blob(path[1:])
+            self._send(200, b[1] if b else b"{}")
+        elif path.startswith(("/preset-thumb/", "/scene-thumb/", "/theme-thumb/", "/preset-export/", "/show-export/", "/media/",
+                              "/media-peaks/")):
+            self._library_get(path, parse_qs(urlsplit(self.path).query))
         elif path == "/art":
             self._send(200, {"ok": True, "art": art_listing(self.server.rc.art_dir)})
         elif path == "/sources":                     # source picker: uploaded art + AI / seed textures
             rc = self.server.rc
-            self._send(200, {"ok": True, "art": art_listing(rc.art_dir), "tex": tex_listing(rc.tex_dir)})
+            self._send(200, {"ok": True, "art": art_listing(rc.art_dir), "tex": tex_listing(rc.tex_dir),
+                             "items": image_library.listing(rc.art_dir, rc.tex_dir)})
         elif path == "/fonts":                       # text layer: installed fonts + the project's fonts/ folder
             try:
                 import text_layer
@@ -601,6 +679,25 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, data, "image/jpeg")
             else:
                 self._send(204, b"", "image/jpeg")
+        elif path == "/automap-image":               # AUTO MAP wizard picture (camera still + found faces), memory only
+            data = automap.image_jpeg() if automap is not None else None
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
+        elif path.startswith("/online-snap/"):       # ASSISTANT: the exact picture of the output it sends (memory only;
+            on = getattr(control, "_online", None)   # 204 while ONLINE is off or the picture is gone)
+            data = on.served_snap(path[13:]) if on is not None else None
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
+        elif path == "/camera-preview":              # CAMERA tab debug view: mask + skeleton only, never camera pixels
+            data = camera_layer.debug_jpeg() if camera_layer is not None else None
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
         elif path == "/preview":                     # panel monitor: latest small JPEG of the output, if any
             q = parse_qs(urlsplit(self.path).query)
             data = self.server.rc.preview_bytes(q["solo"][0].split(",") if "solo" in q else ())
@@ -612,8 +709,161 @@ class _Handler(BaseHTTPRequestHandler):
             self._image(self.server.rc.tex_dir, unquote(path[5:]), thumb=False)
         elif path.startswith("/art-thumb/"):
             self._image(self.server.rc.art_dir, unquote(path[11:]), thumb=True)
+        elif path == "/dream-status":                # DREAMIFY progress (the panel polls this only while dreaming)
+            rc = self.server.rc
+            code, st = ai_call(rc.ai_url, rc.token_paths, "/status", timeout=2.0)
+            if code != 200:
+                return self._send(200, {"ok": True, "available": False, "error": st.get("error", "")})
+            self._send(200, {"ok": True, "available": True, "dream": st.get("dream"), "error": st.get("error", ""),
+                             "busy": bool(st.get("busy")),
+                             "queue": [q for q in st.get("queue", []) if isinstance(q, dict) and q.get("kind") == "dream"],
+                             "done": [d for d in st.get("done", []) if isinstance(d, dict) and d.get("kind") == "dream"][-8:]})
         else:
             self._send(404, {"ok": False, "error": "not found"})
+
+    # -- shows / presets / timeline media (files under <state dir>/shows and /presets only; names are slugs)
+    def _library_get(self, path, q):
+        rc = self.server.rc
+        root = Path(rc.state_dir)
+        head, _, rest = path[1:].partition("/")
+        parts = [unquote(x) for x in rest.split("/")]
+        data, ctype, fname = None, "application/octet-stream", None
+        try:
+            if head == "preset-thumb" and len(parts) == 2:
+                f = root / "presets" / parts[0] / (shows.check_slug(parts[1]) + ".jpg")
+                if parts[0] in shows.KINDS and shows.inside(root / "presets", f) and f.is_file():
+                    data, ctype = f.read_bytes(), "image/jpeg"
+            elif head == "theme-thumb" and len(parts) == 1 and re.match(r"^[a-z0-9]{1,16}$", parts[0]):   # [themes]
+                f = root / "shows" / "_current" / "themes" / f"{parts[0]}.jpg"
+                if f.is_file():
+                    data, ctype = f.read_bytes(), "image/jpeg"
+            elif head == "scene-thumb" and len(parts) == 1 and parts[0].isdigit() and int(parts[0]) < control.N_SCENES:
+                f = root / "shows" / "_current" / "thumbs" / f"scene_{int(parts[0])}.jpg"
+                if f.is_file():
+                    data, ctype = f.read_bytes(), "image/jpeg"
+            elif head == "preset-export" and len(parts) == 2:
+                f = root / "presets" / parts[0] / (shows.check_slug(parts[1]) + ".json")
+                if parts[0] in shows.KINDS and shows.inside(root / "presets", f) and f.is_file():
+                    data, ctype, fname = f.read_bytes(), "application/json", f"{parts[0]}-{parts[1]}.json"
+            elif head == "show-export" and len(parts) == 1:
+                d = root / "shows" / shows.check_slug(parts[0])
+                if (d / "show.json").is_file() and shows.inside(root / "shows", d):
+                    data = shows.export_zip(d, media=q.get("media", ["1"])[0] != "0")
+                    ctype, fname = "application/zip", f"{parts[0]}.entheo"
+            elif head in ("media", "media-peaks") and len(parts) == 1 and shows.MEDIA_NAME.match(parts[0]):
+                f = root / "shows" / "_media" / parts[0]
+                if f.is_file() and shows.inside(root / "shows" / "_media", f) and f.suffix.lower() in shows.AUDIO_EXT:
+                    if head == "media":
+                        data = f.read_bytes()
+                        ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+                                 ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac"}[f.suffix.lower()]
+                    else:
+                        data, ctype = audio_peaks(f), "application/json"
+        except (OSError, ValueError):
+            data = None
+        if data is None:
+            return self._send(404 if head != "media-peaks" else 204, {"ok": False, "error": "not found"}
+                              if head != "media-peaks" else b"")
+        if fname:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self._send(200, data, ctype)
+
+    def _stream_body(self, limit, dest):
+        """Request body straight to the file `dest` (<= limit bytes, never all in memory). True if complete."""
+        try:
+            n = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._send(400, {"ok": False, "error": "Content-Length required"}, close=True)
+            return False
+        if n <= 0 or n > limit:
+            self._send(413, {"ok": False, "error": "file too big"}, close=True)
+            return False
+        left = n
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise OSError("short body")
+                    f.write(chunk)
+                    left -= len(chunk)
+        except OSError as ex:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            self._send(400, {"ok": False, "error": str(ex)[:120]}, close=True)
+            return False
+        return True
+
+    def _library_post(self, path):
+        rc = self.server.rc
+        root = Path(rc.state_dir)
+        if path == "/preset-import":
+            body = self._body(shows.MAX_PRESET_JSON)
+            if body is None:
+                return
+            try:
+                p = shows.clean_preset(json.loads(body.decode("utf-8")))
+                d = root / "presets" / p["kind"]
+                slug = shows.free_preset_slug(d, shows.slugify(p["name"]))
+                if not shows.write_atomic(d / f"{slug}.json", shows.dumps(p)):
+                    raise ValueError("could not write")
+            except (ValueError, RecursionError, UnicodeDecodeError) as ex:
+                return self._send(400, {"ok": False, "error": str(ex)[:200]})
+            self._queue({"cmd": "preset", "op": "rescan"})
+            return self._send(200, {"ok": True, "ref": f"{p['kind']}/{slug}"})
+        if not _UPLOAD_GATE.acquire(timeout=UPLOAD_WAIT):
+            return self._send(503, {"ok": False, "error": "another upload is in progress, try again"}, close=True)
+        tmp = root / "shows" / ".incoming" / f"up_{threading.get_ident()}.part"
+        try:
+            if path == "/show-import":
+                if not self._stream_body(shows.MAX_IMPORT, tmp):
+                    return
+                try:
+                    slug = shows.import_zip(tmp, root / "shows")
+                except ValueError as ex:
+                    return self._send(400, {"ok": False, "error": str(ex)[:200]})
+                self._queue({"cmd": "show", "op": "rescan"})
+                return self._send(200, {"ok": True, "slug": slug})
+            if path == "/media-upload":
+                name = unquote(self.headers.get("X-Filename", ""))[:200]
+                try:
+                    shows.check_media_name(name)                    # name / type check before the body
+                except ValueError as ex:
+                    return self._send(400, {"ok": False, "error": str(ex)[:200]}, close=True)
+                if not self._stream_body(shows.MAX_AUDIO, tmp):
+                    return
+                dst = root / "shows" / "_media" / name
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(tmp, dst)
+                except OSError as ex:
+                    return self._send(500, {"ok": False, "error": str(ex)[:120]})
+                self._queue({"cmd": "show", "op": "rescan"})
+                return self._send(200, {"ok": True, "name": name})
+        finally:
+            _UPLOAD_GATE.release()
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        self._send(404, {"ok": False, "error": "not found"}, close=True)
+
+    def _queue(self, c):
+        try:
+            self.server.rc._q.put_nowait(control.validate(c))
+        except (queue.Full, ValueError):
+            pass
 
     def _image(self, folder, name, thumb):
         """Serve one image from `folder`. The name must be a plain file name that really is in that folder."""
@@ -670,6 +920,7 @@ class _Handler(BaseHTTPRequestHandler):
             if body is None:
                 return
             try:
+                image_library.check_quota(rc.art_dir, len(body))
                 name = save_art(body, unquote(self.headers.get("X-Filename", ""))[:200], rc.art_dir)
             except ValueError as ex:
                 return self._send(400, {"ok": False, "error": str(ex)[:200]})
@@ -692,20 +943,103 @@ class _Handler(BaseHTTPRequestHandler):
         index = delete_art(self.server.rc.art_dir, name)
         if index < 0:
             return self._send(404, {"ok": False, "error": "no such art piece, or it could not be deleted"})
+        image_library.forget(self.server.rc.art_dir, "art", name)
         try:                                         # the controller keeps the same piece on screen
             self.server.rc._q.put_nowait({"cmd": "art_deleted", "i": index})
         except queue.Full:
             pass
         self._send(200, {"ok": True, "index": index})
 
+    def _library(self):
+        """POST /library: favourites / picked set / titles, AI image -> art piece, delete either kind."""
+        body = self._body(MAX_BODY)
+        if body is None:
+            return
+        rc = self.server.rc
+        try:
+            c = json.loads(body.decode("utf-8"))
+            if not isinstance(c, dict):
+                raise ValueError("body must be an object")
+            op, kind, name = c.get("op"), c.get("kind"), c.get("name")
+            title = c.get("title") if isinstance(c.get("title"), str) else None
+            if op == "import":
+                if kind != "ai":
+                    raise ValueError("only AI images are imported (art is already in the art library)")
+                art = image_library.import_ai(rc.tex_dir, rc.art_dir, name, title)
+                if not _depth_path(rc.art_dir, art).exists():
+                    request_depth(art, rc.ai_url, rc.token_paths)      # the relief fly-through wants one
+                names = [a["name"] for a in art_listing(rc.art_dir)]
+                return self._send(200, {"ok": True, "name": art, "index": names.index(art) if art in names else -1})
+            if op == "delete":
+                if kind == "art":
+                    index = delete_art(rc.art_dir, name)
+                    if index < 0:
+                        raise ValueError("no such art piece, or it could not be deleted")
+                    image_library.forget(rc.art_dir, "art", name)
+                    try:
+                        rc._q.put_nowait({"cmd": "art_deleted", "i": index})
+                    except queue.Full:
+                        pass
+                    return self._send(200, {"ok": True, "index": index})
+                if not image_library.delete(rc.art_dir, rc.tex_dir, kind, name):
+                    raise ValueError("the image could not be deleted")
+                return self._send(200, {"ok": True})
+            image_library.edit(rc.art_dir, rc.tex_dir, op, kind, name, title)
+            return self._send(200, {"ok": True})
+        except (ValueError, RecursionError, UnicodeDecodeError) as ex:
+            return self._send(400, {"ok": False, "error": str(ex)[:200]})
+        except OSError as ex:
+            return self._send(500, {"ok": False, "error": f"could not write ({type(ex).__name__})"})
+
+    def _dream(self, path):
+        body = self._body(4096)
+        if body is None:
+            return
+        rc = self.server.rc
+        if path == "/dream-cancel":
+            code, out = ai_call(rc.ai_url, rc.token_paths, "/dream-cancel", {})
+            return self._send(200 if code == 200 else 503, out)
+        try:
+            req = validate_dream_request(json.loads(body.decode("utf-8") or "{}"))
+        except (ValueError, RecursionError) as ex:
+            return self._send(400, {"ok": False, "error": str(ex)[:200]})
+        code, out = ai_call(rc.ai_url, rc.token_paths, "/dreamify", req)
+        self._send(code if code in (200, 400, 503) else 502, out)
+
+    def _same_site(self):
+        """State-changing requests must come from the panel itself, not from another web page open in a browser on
+        this network (CSRF) and not through a DNS name pointed at us (rebinding). A browser always sends Origin on a
+        POST; scripts and tools that send neither Origin nor Sec-Fetch-Site are judged by the token alone, as before."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        origin, site = self.headers.get("Origin"), self.headers.get("Sec-Fetch-Site")
+        browser = origin is not None or site is not None
+        if browser and not (name == "localhost" or name.startswith("[") or re.fullmatch(r"[0-9.]+", name)):
+            return False                                 # the panel is only ever opened by IP address or localhost
+        if (site or "same-origin").lower() not in ("same-origin", "none"):
+            return False
+        if origin is not None:
+            o = origin.strip().lower()
+            if o == "null" or o.split("://", 1)[-1] != host:
+                return False
+        return True
+
     def do_POST(self):
         path = self._gate()
         if path is None:
             return
+        if not self._same_site():
+            return self._send(403, {"ok": False, "error": "cross-site request refused"}, close=True)
         if path == "/upload":
             return self._upload()
         if path == "/art-delete":
             return self._art_delete()
+        if path == "/library":
+            return self._library()
+        if path in ("/dreamify", "/dream-cancel"):
+            return self._dream(path)
+        if path in ("/preset-import", "/show-import", "/media-upload"):
+            return self._library_post(path)
         if path != "/cmd":
             return self._send(404, {"ok": False, "error": "not found"}, close=True)
         body = self._body(MAX_BODY)
@@ -717,6 +1051,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not 1 <= len(cmds) <= MAX_BATCH:
                 raise ValueError(f"send 1..{MAX_BATCH} commands")
             cmds = [validate_command(c) for c in cmds]  # all-or-nothing
+            # the flash guard override: only from a panel opened on this laptop at a loopback address (the
+            # connection AND the Host it asked for; cross-site / rebinding POSTs were refused by _same_site above)
+            if flashguard.is_local_request(self.client_address[0], self.headers.get("Host")):
+                cmds = [flashguard.mark_local(c) for c in cmds]
+                cmds = [control.mark_local(c) for c in cmds]   # ONLINE: "Allow Google CLI tools" is laptop-only too
         except (ValueError, RecursionError) as ex:  # JSONDecodeError / UnicodeDecodeError are ValueErrors
             return self._send(400, {"ok": False, "error": str(ex)[:200]})
         try:
@@ -725,6 +1064,40 @@ class _Handler(BaseHTTPRequestHandler):
         except queue.Full:
             return self._send(503, {"ok": False, "error": "render loop is not draining"})
         self._send(200, {"ok": True, "n": len(cmds)})
+
+
+_PEAKS_LOCK = threading.Lock()
+
+
+def audio_peaks(f, per_s=50):
+    """Waveform peaks of an audio file for the timeline ({"rate", "peaks": [0..255]}), decoded once with ffmpeg and
+    cached next to it (shows/_media/.peaks/). None if ffmpeg is not there (the panel then decodes in the browser)."""
+    import shutil
+    import subprocess
+    f = Path(f)
+    cache = f.parent / ".peaks" / (f.name + ".json")
+    try:
+        if cache.is_file() and cache.stat().st_mtime >= f.stat().st_mtime:
+            return cache.read_bytes()
+    except OSError:
+        pass
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return None
+    with _PEAKS_LOCK:                                # one decode at a time, next to a running show
+        try:
+            r = subprocess.run([exe, "-v", "quiet", "-i", str(f), "-t", "7200", "-ac", "1", "-ar", str(per_s * 40),
+                                "-f", "u8", "-"], capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        out = r.stdout                                 # at most 2 h x 2000 B/s = 14 MB
+        if r.returncode != 0 or len(out) < 40:
+            return None
+    peaks = [min(255, 2 * max(abs(b - 128) for b in out[i:i + 40])) for i in range(0, len(out) - 39, 40)][:200000]
+    data = json.dumps({"rate": per_s, "peaks": peaks}, separators=(",", ":")).encode()
+    shows.write_atomic(cache, data)
+    return data
 
 
 def _jsonable(o):
@@ -744,6 +1117,7 @@ class RemoteControl:
         self.ai_url = ai_url                                                # depth maps for uploaded art
         self.token_paths = list(token_paths) if token_paths else [HERE / ".remote_token"]
         self.reload_page = False        # True: re-read panel.html on every page load (panel development)
+        self.state_dir = HERE           # shows/ + presets/ live here (the controller's state dir; the demo changes it)
         self.token = str(token) if token else secrets.token_urlsafe(6)  # 8 chars, 48 bits
         self._q = queue.Queue(maxsize=2000)
         self._state = b"{}"
@@ -849,11 +1223,13 @@ class RemoteControl:
         # `state` must be a dict the caller does not mutate afterwards (both callers build a fresh one each time).
         with self._lock:
             self._state_obj = state
+            self._state_seq = getattr(self, "_state_seq", 0) + 1
         self.state_published += 1
 
     def _state_bytes(self):
         with self._lock:
             obj, self._state_obj = self._state_obj, None
+            seq = getattr(self, "_state_seq", 0)
         if obj is not None:
             try:
                 data = json.dumps(obj, default=_jsonable, allow_nan=False).encode()
@@ -862,7 +1238,8 @@ class RemoteControl:
             if data is not None:
                 self.state_encoded += 1
                 with self._lock:
-                    self._state = data
+                    if seq >= getattr(self, "_state_done", 0):       # two GETs at once: the older snapshot never wins
+                        self._state, self._state_done = data, seq
         with self._lock:
             return self._state
 
@@ -932,7 +1309,9 @@ class RemoteControl:
             with self._lock:
                 if key in self._views:
                     self._views[key][1] = bytes(data)
-                elif not key:                            # the plain output is always kept (first GET gets a picture)
+                elif not key and time.monotonic() - self._preview_asked <= self.preview_linger:
+                    # the plain output is kept for the first GET, but a capture that lands after every watcher has
+                    # gone must not bring the view (and with it more captures) back to life
                     self._views[key] = [time.monotonic() - self.preview_linger * 0.5, bytes(data)]
 
 
@@ -983,14 +1362,18 @@ def _demo():
     ap.add_argument("--state-dir", default=None, help="where scenes / midi map go (default: a temp folder)")
     ap.add_argument("--art-dir", default=None, help="art library folder (default: a temp folder)")
     ap.add_argument("--midi", action="store_true", help="open MIDI ports too")
+    ap.add_argument("--fresh", action="store_true", help="start on a clean canvas (NEW CANVAS), panel in SIMPLE mode")
     args = ap.parse_args()
     state_dir = Path(args.state_dir or tempfile.mkdtemp(prefix="panel_demo_"))
     art_dir = Path(args.art_dir) if args.art_dir else state_dir / "art"
     rc = RemoteControl(port=args.port, token=args.token, art_dir=art_dir)
     rc.reload_page = True
+    rc.state_dir = state_dir
     if not rc.toggle():
         raise SystemExit(1)
     ctl = control.Controller(state_dir, restore=True, midi=args.midi, ai=False, art_dir=art_dir)
+    if args.fresh:
+        ctl.new_canvas(fresh=True)
     st = dict(fold_i=3, mode=2, fb=True, fbAmt=0.88, grid=False, calib=False, next=False, palette=0)
     mapper = surfaces.Mapper(state_dir / "surfaces.json")      # multi-surface mapping, saved in the demo folder
     corners = mapper.corners()
@@ -1022,7 +1405,7 @@ def _demo():
             if now - pub > 0.12:
                 pub = now
                 rc.publish_state(dict(grid=st["grid"], calib=st["calib"], corners=mapper.corners(), res=[1280, 800], fps=60.0,
-                                      surfaces=mapper.set.state(), bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
+                                      surfaces=mapper.state(), bass=bands[0], mid=bands[1], high=bands[2], tex=f"demo_{tex_i % 8:02d}.png",
                                       ctl=ctl.state()))
             time.sleep(1 / 60)
     except KeyboardInterrupt:

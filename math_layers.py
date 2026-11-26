@@ -123,19 +123,21 @@ void main(){
     vec3 n = normalize(e.xyy*de(pos + e.xyy*h, t2) + e.yyx*de(pos + e.yyx*h, t2) +
                        e.yxy*de(pos + e.yxy*h, t2) + e.xxx*de(pos + e.xxx*h, t2));
     float cosT = clamp(dot(n, -rd), 0.0, 1.0), fres = pow(1.0 - cosT, 2.5);
-    float k = TRAPK*log(1.0 + tr.w) + kb + 0.10*n.y + 0.12*tt;
+    float k = TRAPK*log(1.0 + tr.w) + kb + 0.10*n.y + KTT*tt;
     float mtr = min(tr.x, min(tr.y, tr.z));
     float seam = smoothstep(SEAMW, 0.35*SEAMW, mtr) + (1.0 - cut)*(0.05 + 0.4*p_fractal_glow)*exp(-mtr*SEAMK*2.0);
     float ao = clamp(1.25 - 1.3*sfrac, 0.0, 1.0);
     float ch = chaseAmt(BANDK*tt + 0.35*log(1.0 + tr.w));
-    float lit = (LIT0 + LIT1*pow(cosT, 5.0) + (0.12 + 0.9*p_fractal_metal)*fres)*(1.0 - cut);
+    float lit = (LIT0 + LIT1*pow(cosT, 5.0) + (0.12 + 0.9*p_fractal_metal)*fres + RIDGE*exp(-mtr*SEAMK*0.5))*(1.0 - cut);
     col = irid(k, cosT)*lit*ao*ch;
     col += pal5(k + 0.4)*seam*(0.5 + 0.7*p_fractal_glow)*(0.2 + 0.8*ch)*ao*mix(1.0, CUTSEAM, cut);
-    col *= fog*(LB0 + 1.5*LBAND(pos));
+    col *= fog*(LB0 + LBA*LBAND(pos));                            // light bands: shallow, or flying pumps the exposure
   }
   // glow from the march: near-misses and step count light the air around the crystal
   float g = sfrac*sfrac*(hit ? 0.45 : 1.0) + 0.15*acc/float(uSteps);
   col += pal5(kb + 0.2)*g*(1.6*p_fractal_glow)*GLOWA*fog*chaseAmt(BANDK*tt);
+  // the far end of the corridor glows softly (depth haze lit from within): no dead black hole at the vanishing point
+  col += pal5(kb + 0.62)*(1.0 - fog)*(0.07 + 0.26*p_fractal_glow)*exp(-dot(uv, uv)*11.0);
   col *= GAIN*smoothstep(0.70, 0.40, length(uv));
   f = finish(col);
 }
@@ -148,17 +150,20 @@ uniform vec3 uOff, uBox; uniform vec4 uRAB; uniform float uSc, uN, uTw, uRing, u
 #define STEPK 0.85
 #define MAXD 14.0
 #define FOGK 1.0
-#define TRAPK 0.55
+#define TRAPK 0.22
+#define KTT 0.04
 #define SEAMK 26.0
 #define BANDK 0.22
 #define GLOWA 1.0
 #define SEAMW 0.05
-#define LIT0 0.03
-#define LIT1 0.40
+#define LIT0 0.10
+#define LIT1 0.32
+#define RIDGE 0.60
 #define CUTSEAM 1.0
 #define LBAND(q) pow(0.5 + 0.5*cos(TAU*(q.z/2.6 - uT*0.05)), 2.0)
-#define LB0 0.16
-#define GAIN 1.0
+#define LB0 0.72
+#define LBA 0.55
+#define GAIN 1.25
 mat2 gRA, gRB;
 void setup(){ gRA = mat2(uRAB.x, -uRAB.y, uRAB.y, uRAB.x); gRB = mat2(uRAB.z, -uRAB.w, uRAB.w, uRAB.z); }
 float de(vec3 p, out vec4 tr){
@@ -201,15 +206,18 @@ uniform vec3 uCC, uCam; uniform float uN, uKal, uThick, uScale, uMinR2, uCarve;
 #define MAXD 9.0
 #define FOGK 2.2
 #define TRAPK 0.9
+#define KTT 0.12
 #define SEAMK 16.0
 #define BANDK 0.30
 #define GLOWA 0.8
 #define SEAMW 0.045
-#define LIT0 0.06
-#define LIT1 0.75
+#define LIT0 0.10
+#define LIT1 0.45
+#define RIDGE 0.45
 #define CUTSEAM 0.8
 #define LBAND(q) pow(0.5 + 0.5*cos(TAU*(q.x/2.6 - uT*0.05)), 1.5)
-#define LB0 0.60
+#define LB0 0.85
+#define LBA 0.70
 #define GAIN 1.5
 void setup(){}
 // Mandelbox-family corridor: Julia-type box fold + sphere fold on an exact mirror lattice (period 4), box ends,
@@ -307,19 +315,29 @@ void main(){
   vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
   float R = 0.485*exp(1.3*p_zoom);
   vec2 zs = rot(uRot)*(uv/R) + vec2(p_pan_x, p_pan_y)*0.6;
-  float r2 = dot(zs, zs);
+  float r2 = dot(zs, zs), r2o = r2, jac = 1.0, outer = 1.0;
   vec3 col = vec3(0.0);
+  if (r2 > 1.0005) {
+    // outside the disc: its reflection in the circle at infinity (inversion, conformal), dimmer, so the tiling fills
+    // the widescreen frame instead of floating as a sticker in black margins, and the disc stays the bright focus
+    zs /= r2; jac = 1.0/r2; r2 = dot(zs, zs);
+    outer = 0.30*smoothstep(0.38, 0.88, r2);
+  }
   if (r2 < 0.9995) {
     float rr = sqrt(r2), dScr = log((1.0 + rr)/(1.0 - rr));
-    float hpx = 2.0/(uRes.y*R)/(1.0 - r2);                           // pixel size in hyperbolic units
+    float hpx = 2.0*jac/(uRes.y*R)/(1.0 - r2);                       // pixel size in hyperbolic units
     zs = rot(p_twirl*0.9*dScr)*zs;
     zs += p_swim*0.035*(1.0 - r2)*sin(zs.yx*5.0 + uT*vec2(0.5, 0.37));
-    float fade = smoothstep(0.30, 0.05, hpx);
+    float fade = smoothstep(0.24, 0.035, hpx);
     if (fade > 0.0) {
       if (uTilMix < 0.999) col += (1.0 - uTilMix)*tiling(mobius(zs, uMob0), uTil.x, uTil.y, hpx, dScr);
       if (uTilMix > 0.001) col += uTilMix*tiling(mobius(zs, uMob1), uTil.z, uTil.w, hpx, dScr);
-      col *= fade*mix(1.0, exp(-0.35*dScr), p_depth_fog);
+      col *= fade*outer*mix(1.0, exp(-0.35*dScr), p_depth_fog);
     }
+  }
+  {                                                                   // velvet halo on the circle at infinity
+    float rr1 = sqrt(r2o), hl = exp(-abs(rr1 - 0.985)*26.0) + 0.35*exp(-max(rr1 - 0.985, 0.0)*5.0)*step(0.985, rr1);
+    col += mix(pal5(0.02*uT + 0.62), pal5(0.02*uT + 0.12 + 0.5*atan(zs.y, zs.x)/TAU), 0.5)*hl*(0.10 + 0.34*p_fractal_glow);
   }
   f = finish(col);
 }
@@ -373,6 +391,7 @@ void main(){
     col *= vis*smoothstep(0.0, 1.0, epx);
   }
   col *= mix(1.0, smoothstep(1.1, 0.25, length(uv)), 0.6*p_depth_fog)*smoothstep(0.0, 0.05, r);
+  col *= mix(0.72, 1.40, smoothstep(0.95, 0.0, length(uv)));           // focal lift toward the middle of the frame
   f = finish(col);
 }
 """
@@ -380,28 +399,31 @@ void main(){
 # ------------------------------------------------------------------ mode 4: Julia orbit-trap jewels, Koenigs zoom
 JULIA_FS = COMMON + """
 uniform int uIters, uPre;
-uniform vec2 uC, uBeta, uLam, uTrapC; uniform float uLogLam, uArgLam, uZf, uS0, uTrapR;
+uniform vec2 uC, uBeta, uLam, uTrapC; uniform float uLogLam, uArgLam, uZf, uS0, uTrapR, uAxis;
 out vec4 f;
 void main(){
   vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
   vec2 p = rot(uRot)*uv - vec2(p_pan_x, p_pan_y)*0.3;
-  float lr = length(p);
+  float lr = length(p), turn = PI*uZf;                                // no kaleidoscope: half a turn per period (a
+  if (p_symmetry > 0.5) {                                             // symmetry of the set, so the wrap is seamless)
+    // kaleidoscope round the centre: the whole mandala turns one fold per travel period (seamless for any fold
+    // count) while the wedge stays on the set's long axis, so the set never slides out of it
+    float sA = TAU/max(floor(p_folds + 0.5), 2.0), a = atan(p.y, p.x) + sA*uZf;
+    a = abs(mod(a + 0.5*sA, sA) - 0.5*sA) + uAxis;
+    p = lr*vec2(cos(a), sin(a));
+    turn = 0.0;
+  }
   p = rot(p_twirl*1.2*lr)*p;
   p += p_swim*0.02*sin(p.yx*7.0 + uT*vec2(0.5, 0.41));
-  // u = linearised (Koenigs) coordinate at the repelling fixed point: the image is invariant under u -> lambda*u
-  float sc = uS0*exp(-uZf*uLogLam - float(uPre)*uLogLam);
-  vec2 dl = sc*(rot(uZf*uArgLam + float(uPre)*uArgLam)*p);           // delta_0 = u / lambda^n
-  float dm = sc/uRes.y;                                              // |d delta / d pixel|
-  bool outp = false;
-  for (int i = 0; i < uPre + 28; i++) {
-    if (dot(dl, dl) > 0.0036) { outp = true; break; }
-    dm *= length(uLam + 2.0*dl);
-    dl = cmul(uLam + dl, dl);                                        // f(beta + d) - beta, no cancellation
-  }
+  // the whole Julia set, centred (it is point-symmetric round 0); the view breathes gently in and out with travel
+  float sc = uS0*exp(-0.5*p_zoom)*(1.0 - 0.16*sin(TAU*uZf));
+  vec2 dl = sc*(rot(turn)*p) - uBeta;                                // z0 = uBeta + dl
+  float dm = sc/uRes.y;                                              // |dz / d pixel|
+  bool outp = true;
   vec3 col = vec3(0.0);
   if (outp) {
     vec2 z = uBeta + dl;
-    float stalk = 1e3, sIdx = 0.0, rem = 1.0; bool esc = false;
+    float rem = 1.0, nu = 0.0, de = 1e3; bool esc = false;
     vec3 L = normalize(vec3(-0.45, 0.55, 0.7));
     for (int j = 0; j < uIters; j++) {
       vec2 q = z - uTrapC;
@@ -423,17 +445,24 @@ void main(){
           if (rem < 0.03) break;
         }
       }
-      float sd = min(abs(q.x), abs(q.y))/dm;                         // cross trap, measured in pixels
-      if (sd < stalk && j > 0) { stalk = sd; sIdx = float(j); }
       float r2 = dot(z, z);
-      if (r2 > 64.0) { esc = true; break; }
+      if (r2 > 64.0) {
+        esc = true; nu = float(j) + 1.0 - log2(max(0.5*log2(r2), 1e-3));            // smooth escape count
+        de = 0.5*sqrt(r2)*log(r2)/max(dm, 1e-12);                                     // distance to the set, in pixels
+        break;
+      }
       dm *= 2.0*sqrt(r2);
       z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + uC;
     }
     if (esc) {
+      // the Julia set as a luminous filament: a crisp 1-2 px core, a tight halo and a faint wide bloom, measured in
+      // pixels from the distance estimate (constant width at every zoom, no aliasing static); hue follows the smooth
+      // escape count, so it glides along the curve instead of stepping
       float g = p_fractal_glow;
-      float line = smoothstep(1.3, 0.3, stalk) + (0.1 + 0.6*g)*exp(-stalk*0.22);
-      col += rem*pal5(0.09*sIdx + 0.5 + 0.03*uT)*line*(0.25 + 0.75*chaseAmt(0.11*sIdx + 0.5));
+      float core = smoothstep(1.6, 0.4, de), halo = exp(-de*0.35), bloom = exp(-de*0.06);
+      float line = core + (0.25 + 0.35*g)*halo + (0.05 + 0.20*g)*bloom;
+      vec3 hc = pal5(0.045*nu + 0.5 + 0.03*uT);
+      col += rem*mix(hc, mix(hc, vec3(1.0), 0.35), core)*line*(0.3 + 0.7*chaseAmt(0.06*nu + 0.5));
     }
   }
   col *= mix(1.0, smoothstep(1.15, 0.3, lr), 0.6*p_depth_fog);
@@ -490,8 +519,8 @@ void main(){
   float halo = pow(1.0 - d, 3.0)*(0.08 + 0.55*p_fractal_glow);
   float along = clamp(v_l.x/max(v_len, 1e-3), 0.0, 1.0);
   float node = exp(-min(v_l.x, v_len - v_l.x)*min(v_l.x, v_len - v_l.x)*0.6)*exp(-d*d*7.0); // vertex jewels
-  float dc = 0.22 + 0.78*v_dep*v_dep;                                // depth cue
-  float k = v_k + 0.45*v_dep + 0.02*uT;
+  float dc = 0.16 + 0.84*v_dep*v_dep*v_dep;                          // depth cue: the back of the figure recedes
+  float k = 0.22*v_k + 0.42*v_dep + 0.02*uT;                         // hue by depth (two neighbours), not per edge
   float ch = chaseAmt(v_k*2.0 + 0.35*along + 0.6*v_dep);
   vec3 c = irid(k, v_dep)*(core + halo)*(0.25 + 0.75*ch) + mix(pal5(k + 0.5), vec3(1.0), 0.25)*node*0.9;
   c *= dc*v_bright;
@@ -599,13 +628,36 @@ def hyperbolic_view(P, Q, dist):
     return M[0], M[1], period
 
 
-def julia_constants(theta):
-    """c on a path hugging the outside of the Mandelbrot cardioid/bulb, its repelling fixed point and multiplier."""
-    th = math.pi + 0.80 * math.pi * math.sin(theta)                   # stay away from the cusp (multiplier -> 1)
-    e = cmath.exp(1j * th)
-    c = (0.5 * e - 0.25 * e * e) * 1.045
-    beta = 0.5 * (1 + cmath.sqrt(1 - 4 * c))
-    return c, beta, 2 * beta
+JULIA_BULBS = [(1, 3), (1, 4), (1, 2), (2, 5), (1, 5)]      # fractal_morph picks one; 0.5 = (1, 2), the basilica
+
+
+def bulb_centre(p, q):
+    """Centre of the p/q bulb of the Mandelbrot set (superattracting q-cycle), by Newton from a guess beside its root."""
+    e = cmath.exp(2j * math.pi * p / q)
+    root = e / 2 - e * e / 4
+    d = root + 0.1
+    c = root + d / abs(d) * math.sin(math.pi * p / q) / q ** 2
+    for _ in range(60):
+        z, dz = 0j, 0j
+        for _ in range(q):
+            dz, z = 2 * z * dz + 1, z * z + c
+        c -= z / dz
+    return c
+
+
+_BULB_C = [bulb_centre(p, q) for p, q in JULIA_BULBS]
+
+
+def julia_constants(morph, phase=0.0):
+    """c near the centre of a p/q bulb (drifting on a small circle inside it with `phase`), its alpha fixed point
+    (where the q spiral arms of the Julia set meet; repelling, multiplier of argument p/q turn) and the multiplier."""
+    m = min(max(float(morph), 0.0), 1.0) if math.isfinite(float(morph)) else 0.5
+    i = min(int(m * len(JULIA_BULBS)), len(JULIA_BULBS) - 1)
+    p, q = JULIA_BULBS[i]
+    ph = float(phase) if math.isfinite(float(phase)) else 0.0
+    c = _BULB_C[i] + 0.22 * math.sin(math.pi * p / q) / q ** 2 * cmath.exp(1j * ph)
+    alpha = 0.5 * (1 - cmath.sqrt(1 - 4 * c))
+    return c, alpha, 2 * alpha
 
 
 class FractalPass:
@@ -730,7 +782,7 @@ class FractalPass:
             s(m, "uN", float(n))
             s(m, "uTw", 0.5 * float(v.get("twirl", 0.0)))
             s(m, "uRing", K["ring"])
-            s(m, "uTravel", travel * 0.8)
+            s(m, "uTravel", travel * 0.3)                         # was 0.8: chambers popped past (strobing)
         elif m == 1:
             mo = (morph - 0.5) * 2.0
             B = MBOX
@@ -768,21 +820,22 @@ class FractalPass:
             s(m, "uZoom", (travel * 0.3) % period)
             s(m, "uIters", int(round(8 + 22 * det)))
         elif m == 4:
-            c, beta, lam = julia_constants(TAU * (morph - 0.5) * 0.5 + self._bars * TAU / 96.0 + T * 0.004)
+            c, beta, lam = julia_constants(morph, self._bars * TAU / 96.0 + T * 0.02)
             ll, al = math.log(abs(lam)), cmath.phase(lam)
-            s0 = 2.6
-            pre = int(min(40, max(3, math.ceil(math.log(s0 * 1.0 / 0.004) / ll))))
+            s0 = 2.5
+            pre = int(min(150, max(3, math.ceil(math.log(s0 * 1.0 / 0.004) / ll))))
             s(m, "uC", (c.real, c.imag))
             s(m, "uBeta", (beta.real, beta.imag))
             s(m, "uLam", (lam.real, lam.imag))
             s(m, "uLogLam", ll)
             s(m, "uArgLam", al)
-            s(m, "uZf", (travel * 0.30 + float(v.get("zoom", 0.0))) % 1.0)
+            s(m, "uZf", (travel * 0.15) % 1.0)
             s(m, "uS0", s0)
             s(m, "uPre", pre)
             s(m, "uTrapC", (0.10 * math.cos(T * 0.13), 0.10 * math.sin(T * 0.17)))
             s(m, "uTrapR", 0.42)
-            s(m, "uIters", int(round(14 + 36 * det)))
+            s(m, "uAxis", cmath.phase(1 - beta))                    # the other fixed point's direction: the long axis
+            s(m, "uIters", int(round(40 + 80 * det)))
         else:
             w = [max(0.0, 1.0 - abs(morph - c) / 0.4) for c in (0.0, 0.5, 1.0)]
             w = [x * x * (3 - 2 * x) for x in w]
@@ -794,7 +847,7 @@ class FractalPass:
             s(m, "uW", tuple(w))
             s(m, "uDW", 1.9)
             s(m, "uD3", 3.0)
-            s(m, "uFocal", 2.0 * math.exp(0.7 * float(v.get("zoom", 0.0))))
+            s(m, "uFocal", 2.25 * math.exp(0.7 * float(v.get("zoom", 0.0))))
             s(m, "uRad", 0.012 + 0.040 * float(v.get("fractal_glow", 0.5)))
             s(m, "uSwim", float(v.get("swim", 0.0)))
             s(m, "uTwirl", float(v.get("twirl", 0.0)))

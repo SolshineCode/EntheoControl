@@ -1,6 +1,6 @@
 # StreamDiffusion / StreamDiffusionTD / StreamTurbo on 4 GB GTX 1650 Ti (Windows, 2026)
 
-> Target GPU: **NVIDIA GeForce GTX 1650 Ti with Max-Q Design** — **4 GB VRAM**, Turing TU117 (**compute capability 7.5**), driver **581.57** (CUDA 13 capable), **no Tensor Cores**, 35 W Max-Q power envelope.
+> Target GPU: **NVIDIA GeForce GTX 1650 Ti with Max-Q Design** — **4 GB VRAM**, Turing TU117 (**compute capability 7.5**), a CUDA 13 capable driver, **no Tensor Cores**, 35 W Max-Q power envelope.
 
 ---
 
@@ -11,7 +11,7 @@
 | **StreamTurbo** (`tedliou/StreamTurbo`) | https://github.com/tedliou/StreamTurbo | Active (v1.0.0, Windows-only standalone rewrite of StreamDiffusion for TD over Spout/NDI) | **Best live-AI candidate** — automatic **Low-VRAM Mode** (4–6 GB), single-step `sd-turbo` + tiny VAE, one-click `start.cmd`, driver 580+ supported (we have 581.57). |
 | **StreamDiffusion** (`cumulo-autumn/StreamDiffusion`) | https://github.com/cumulo-autumn/StreamDiffusion | Original upstream repo; manual Python/CUDA/TensorRT dependency friction on Windows | Usable via Windows forks (`sdbds/StreamDiffusion-for-windows`), but fragile to set up compared to StreamTurbo. |
 | **StreamDiffusionTD** (DotSimulate) | https://www.dotsimulate.com/ | Modular TouchDesigner `.tox` ecosystem (supports local TRT + RunPod cloud fallback) | Local mode is tight on 4 GB VRAM alongside TD; cloud RunPod fallback is viable if you ever want 30+ FPS SDXL/Flux on gig Wi-Fi. |
-| **Async Hybrid (`ai_gen.py` → `live_visuals.py` / TD)** | Local (`Documents\Projection`) | Works today, zero mid-set OOM/thermal risk | **Best for live EDM shows** — locked 60 FPS shaders at 1280×800 over pre-generated seamless AI textures. |
+| **Async Hybrid (`ai_gen.py` → `live_visuals.py` / TD)** | Local (this project folder) | Works today, zero mid-set OOM/thermal risk | **Best for live EDM shows** — locked 60 FPS shaders at 1280×800 over pre-generated seamless AI textures. |
 
 ---
 
@@ -55,7 +55,7 @@ GTX 1650 / 1650 Ti / 1660 cards are notorious for producing **solid black frames
 StreamTurbo is self-contained inside its own folder (bundled `uv`, Python 3.12, CUDA runtime, models, and TRT engines — delete the folder to uninstall cleanly):
 
 ```bat
-cd C:\path\to\EntheoControl
+cd path\to\EntheoControl
 git clone --branch v1.0.0 https://github.com/tedliou/StreamTurbo.git
 cd StreamTurbo
 start.cmd

@@ -12,6 +12,7 @@ Cost: one draw + at most two texture reads per covered pixel per surface; 12 sur
     r = SurfaceRenderer(ctx)
     r.render(sset, disp_texture, target_fbo, (fb_w, fb_h), t, bass, grid=False)
 """
+import functools
 import math
 
 import moderngl
@@ -77,9 +78,10 @@ void main(){
     // line, a jewel at every corner, and two comets of light running round the perimeter. All of it stays
     // inside the outline, so nothing spills off the object.
     float u = arc / max(perim, 1.0);
-    float core = exp(-pow((inside - lineW) / (lineW * 0.75), 2.0));
+    float kc = (inside - lineW) / (lineW * 0.75), k2 = (inside - lineW * 5.0) / (lineW * 0.6);
+    float core = exp(-kc * kc);
     float halo = exp(-inside / (lineW * 7.0));
-    float line2 = exp(-pow((inside - lineW * 5.0) / (lineW * 0.6), 2.0)) * 0.22;
+    float line2 = exp(-k2 * k2) * 0.22;
     float jewel = exp(-sqrt(dv) / (lineW * 3.5));
     float ph = fract(u * 2.0 - time * 0.11);
     float comet = exp(-(1.0 - ph) * 6.0) + 0.5 * exp(-ph * 40.0);
@@ -124,6 +126,7 @@ void main(){
 """ % dict(MAXP=MAXP)
 
 
+@functools.lru_cache(maxsize=4)
 def _font(px):
     from PIL import ImageFont
     for name in ("arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf", "arial.ttf"):
@@ -179,7 +182,13 @@ class SurfaceRenderer:
             it["corner0"] = (cx * fb[0] / sset.output[0], fb[1] - cy * fb[1] / sset.output[1])
         self.vbo.write(verts.tobytes())
         self._key, self._items = key, items
+        self._prune({s["id"] for s in sset.surfaces})
         return items
+
+    def _prune(self, alive):
+        """Release the name tags of surfaces that no longer exist."""
+        for sid in [k for k in self._labels if k not in alive]:
+            self._labels.pop(sid)[1].release()
 
     def _label(self, it, index):
         key = (it["name"], it["color"], index)

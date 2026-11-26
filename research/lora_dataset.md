@@ -56,8 +56,8 @@ Minimum-VRAM SD 1.5 LoRA settings that fit under 4 GB VRAM:
 ```bash
 accelerate launch --num_cpu_threads_per_process=2 train_network.py \
   --pretrained_model_name_or_path="stable-diffusion-v1-5/stable-diffusion-v1-5" \
-  --train_data_dir="C:/path/to/EntheoControl/lora_data/img" \
-  --output_dir="C:/path/to/EntheoControl/loras" \
+  --train_data_dir="lora_data/img" \
+  --output_dir="loras" \
   --output_name="visbead_sd15_r16" \
   --resolution="512,512" \
   --train_batch_size=1 \
@@ -84,7 +84,7 @@ accelerate launch --num_cpu_threads_per_process=2 train_network.py \
 2. **GTX 16xx FP16 NaN risk during backward pass:** Some Turing GTX 16-series cards produce `loss=nan` under `--mixed_precision="fp16"` during LoRA training, and full `fp32` training will **not** fit in 4 GB VRAM. If you hit `loss=nan` locally, immediately move training to Kaggle/Colab below.
 
 ### Option B: Free Cloud GPU Fallback (Strongly Recommended!)
-Training is a one-time offline job (15–25 minutes) and outputs a tiny **18–36 MB `.safetensors`** file that you drop into `Documents\Projection\loras\` and run locally forever.
+Training is a one-time offline job (15–25 minutes) and outputs a tiny **18–36 MB `.safetensors`** file that you drop into the project's `loras\` folder and run locally forever.
 - **Kaggle Notebooks (Best free tier):** Offers **30 hours/week free GPU** (NVIDIA **T4 × 2** or **P100**, 16 GB VRAM each — native Tensor Cores on T4, zero FP16 NaN or 4 GB OOM headaches). Upload your zipped 60-image dataset as a private Kaggle Dataset and run `kohya-ss/sd-scripts` or a Kaggle-adapted Kohya notebook.
 - **Google Colab (`hollowstrawberry/kohya-colab`):** https://github.com/hollowstrawberry/kohya-colab — Well-maintained one-click Kohya LoRA trainer notebook for SD 1.5 (and SDXL). Note that Google Colab's free tier enforces stricter GPU session caps than Kaggle, so Kaggle is usually more reliable for uninterrupted runs.
 

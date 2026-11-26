@@ -1,6 +1,6 @@
 # Hardware Upgrades & BenQ MW632ST Throw-Distance Math
 
-> Ranked by impact-per-dollar for moving from bedroom wall testing to live EDM / house-party / art-installation gigs.
+> Ranked by impact-per-dollar for moving from home wall testing to live EDM / house-party / art-installation gigs.
 
 ---
 
@@ -49,8 +49,8 @@ Our BenQ MW632ST runs at **1280 × 800 @ 60 Hz** (low bandwidth compared to 4K60
 - **Up to 25 ft (7.5 m):** Standard certified **High-Speed HDMI 2.0 passive copper** (~$15–$25, 24–26 AWG). Rock-solid for bedrooms, house parties, and nearby booths.
 - **25–50 ft (7.5–15 m):** Passive copper is borderline at 50 ft (prone to HDMI handshake drops when club lights/subwoofers spike power). Prefer **Active Optical HDMI (AOC)** from 35 ft upward.
 - **50–150 ft (15–45 m):** **Active Optical HDMI (fiber optic AOC)** (~$40–$90). Zero signal loss, immune to electrical/lighting interference, thin & lightweight.
-  - **Critical AOC rules:** Always **directional** — plug the **`SOURCE`** end into the ThinkPad and **`DISPLAY`** into the BenQ. Never bend sharper than a ~2-inch radius or let crowds step on it (tape down with matte gaffer tape).
-- **Port saver ($8):** Keep a short 6-inch HDMI male-to-female pigtail on the ThinkPad so an accidental yank on a long cable never snaps the laptop's soldered HDMI port.
+  - **Critical AOC rules:** Always **directional** — plug the **`SOURCE`** end into the laptop and **`DISPLAY`** into the BenQ. Never bend sharper than a ~2-inch radius or let crowds step on it (tape down with matte gaffer tape).
+- **Port saver ($8):** Keep a short 6-inch HDMI male-to-female pigtail on the laptop so an accidental yank on a long cable never snaps the laptop's soldered HDMI port.
 
 ---
 

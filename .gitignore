@@ -23,3 +23,20 @@ online_keys.tmp
 fonts/*
 !fonts/.gitkeep
 tests/golden/*.tmp
+models/
+calibration/
+shows/
+presets/
+research/kene_reference/images/
+*.entheo
+# ONLINE plugin: the user's own Gemini API key + scratch folders (never commit)
+logs/online_work/
+online_local.json
+research/kene_reference/user_refs/
+
+# internal study sheets: they show copyrighted / named-artist reference photos. NEVER publish.
+test_frames/kene_real/user_ref_pairs.png
+test_frames/kene_real/reference_pairs.png
+tools/agy_neon_runner.py
+# the user's own sprite images (beings.py sprite creature) and art uploads stay local, never in the repo
+art/

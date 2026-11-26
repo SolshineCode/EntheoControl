@@ -13,6 +13,12 @@ HTTP (localhost only, header X-Token = contents of .remote_token):
   GET  /status
   POST /depth   {name}  -> art/<stem>.depth.png (Depth Anything V2 Small, 16-bit, white = near)
   POST /cancel
+  POST /dreamify {name, source: "art"|"ai", strength 0.05..1, octaves 1..10, preset}  -> real DeepDream of a library
+        image (dreamify.py: torchvision GoogLeNet, octaves, jitter, tiles, fp16) written as a NEW image:
+        art -> art/<stem>_dream_<preset>_<time>.png (+ a depth map job), ai -> textures/gen_dream_<time>_<preset>.png
+        (atomic, PNG text dream_*). VRAM: SD-Turbo is moved to system RAM while it runs if free VRAM is short, then
+        moved back; no room at all -> CPU at 384 px. /status "dream" = live progress {pct, octave, device, ...}.
+  POST /dream-cancel   stops a running / queued dreamify (nothing is written)
 """
 import argparse
 import json
@@ -29,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from PIL import Image, ImageOps, PngImagePlugin
+
+import dreamify
 
 HERE = Path(__file__).parent
 MAX_QUEUE = 16
@@ -75,8 +83,13 @@ def validate_job(body):
     if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**31):
         raise ValueError("seed must be an int")
     init = body.get("init")
-    if init not in (None, "snapshot"):
-        raise ValueError("init must be null or 'snapshot'")
+    if isinstance(init, dict):                       # dream from one library image (image_library ids)
+        nm = init.get("name")
+        if init.get("kind") not in ("art", "ai") or not isinstance(nm, str) or not ART_NAME.match(nm) or ".." in nm                 or nm.lower().endswith(".depth.png"):
+            raise ValueError("init image must be {kind: art | ai, name}")
+        init = {"kind": init["kind"], "name": nm}
+    elif init not in (None, "snapshot"):
+        raise ValueError("init must be null, 'snapshot' or {kind, name}")
     strength = body.get("strength", 0.45)
     if not isinstance(strength, (int, float)) or isinstance(strength, bool) or not 0.2 <= float(strength) <= 0.9:
         raise ValueError("strength must be 0.2..0.9")
@@ -97,7 +110,34 @@ class RealPipes:
         self.i2i = AutoPipelineForImage2Image.from_pipe(self.pipe)
         self.base = base
 
+    on_gpu = True
+
+    def offload(self):
+        """Move the weights to system RAM (DREAMIFY needs the VRAM); restore() brings them back."""
+        self.pipe.to("cpu")
+        self.on_gpu = False
+        self.torch.cuda.empty_cache()
+
+    def restore(self):
+        """Back to the GPU. On failure (OOM) the WHOLE pipe goes back to the CPU (never half on each) and the
+        next txt2img / img2img tries again; raises so the caller can report it."""
+        try:
+            self.pipe.to("cuda")
+            self.on_gpu = True
+        except Exception:
+            try:
+                self.pipe.to("cpu")
+            finally:
+                self.on_gpu = False
+                _free_cuda()
+            raise
+
+    def _ready(self):
+        if not self.on_gpu:
+            self.restore()
+
     def txt2img(self, prompt, negative, seed, size):
+        self._ready()
         g = self.torch.Generator("cuda").manual_seed(seed)
         kw = dict(num_inference_steps=self.cfg["steps"], guidance_scale=self.cfg["cfg"],
                   height=size, width=size, generator=g)
@@ -106,6 +146,7 @@ class RealPipes:
         return self.pipe(prompt, **kw).images[0]
 
     def img2img(self, prompt, negative, seed, init, strength):
+        self._ready()
         g = self.torch.Generator("cuda").manual_seed(seed)
         steps = max(self.cfg["steps"], math.ceil(1.0 / strength), 2)   # steps*strength must be >= 1
         return self.i2i(prompt, image=init, strength=strength, num_inference_steps=steps,
@@ -141,6 +182,16 @@ def validate_art_name(body, art_dir):
     return dict(kind="depth", name=name, prompt=f"depth: {name}", n=1)
 
 
+def init_path(init, tex_dir, art_dir):
+    """{kind: art | ai, name} -> the image file, which must lie directly in its folder (FileNotFoundError)."""
+    folder = Path(art_dir if init.get("kind") == "art" else tex_dir)
+    name = str(init.get("name") or "")
+    p = folder / name
+    if not ART_NAME.match(name) or Path(name).name != name or not p.is_file() or p.resolve().parent != folder.resolve():
+        raise FileNotFoundError(f"init image not found: {name}")
+    return p
+
+
 def save_depth(arr, path):
     """float depth (any range, larger = nearer) -> normalized 16-bit PNG, white = near. Atomic."""
     import numpy as np
@@ -162,7 +213,7 @@ def fit_init(img, max_side=768):
 
 class Worker:
     def __init__(self, out_dir, snapshot, token, port=8766, pipes_factory=None, size=512,
-                 art_dir=None, depth_factory=None):
+                 art_dir=None, depth_factory=None, dream_factory=None, vram_free=None):
         self.out_dir, self.snapshot, self.token, self.size = Path(out_dir), Path(snapshot), token, size
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.art_dir = Path(art_dir) if art_dir else Path(out_dir).parent / "art"
@@ -172,7 +223,10 @@ class Worker:
         self.lock = threading.Lock()
         self.pending = []            # [(id, job)] mirrors the queue for /status and cancel
         self.cancel_gen = 0
-        self.st = dict(loaded=False, loading=False, busy=False, current=None, done=[], error="", base="")
+        self.st = dict(loaded=False, loading=False, busy=False, current=None, done=[], error="", base="", dream=None)
+        self.dream_factory = dream_factory          # device -> object with .dream(...) / .release() (dreamify.RealDream)
+        self.vram_free = vram_free or dreamify.free_vram_mb
+        self.dream_cancel_gen = 0
         self.running = False
         self._srv = None
         self.port = port
@@ -241,8 +295,25 @@ class Worker:
                     if jid is None:
                         return self._send(503, {"error": "queue full"})
                     return self._send(200, {"id": jid})
+                if self.path == "/dreamify":
+                    if worker.dream_factory is None:
+                        return self._send(503, {"error": "dreamify is not available in this worker"})
+                    try:
+                        job = dreamify.validate(body, worker.art_dir, worker.out_dir)
+                    except ValueError as ex:
+                        return self._send(400, {"error": str(ex)})
+                    jid = worker.submit(job)
+                    if jid is None:
+                        return self._send(503, {"error": "queue full"})
+                    return self._send(200, {"id": jid})
+                if self.path == "/dream-cancel":
+                    worker.cancel_dream()
+                    return self._send(200, {"ok": True})
                 if self.path == "/cancel":
                     worker.cancel()
+                    return self._send(200, {"ok": True})
+                if self.path == "/offload":              # governor.py power balance: idle model -> system RAM
+                    worker.q.put(("offload", None, worker.cancel_gen))
                     return self._send(200, {"ok": True})
                 self._send(404, {"error": "not found"})
 
@@ -265,7 +336,8 @@ class Worker:
                 return None
             jid = secrets.token_hex(4)
             self.pending.append((jid, job))
-        self.q.put((jid, job, self.cancel_gen))
+            gens = (self.cancel_gen, self.dream_cancel_gen)
+            self.q.put((jid, job, gens[0], gens[1]))       # inside the lock: no cancel can slip in between
         return jid
 
     def cancel(self):
@@ -273,10 +345,18 @@ class Worker:
             self.pending.clear()
             self.cancel_gen += 1
 
+    def cancel_dream(self):
+        with self.lock:
+            self.pending = [(j, jb) for j, jb in self.pending if jb.get("kind") != "dream"]
+            self.dream_cancel_gen += 1
+
     def status(self):
         with self.lock:
             s = dict(self.st)
+            s["dream"] = dict(self.st["dream"]) if self.st["dream"] else None
             s["done"] = list(self.st["done"][-20:])
+            p = getattr(self, "_pipes", None)
+            s["on_gpu"] = bool(getattr(p, "on_gpu", True)) if p is not None else False
             s["queue"] = [dict(id=j, prompt=job["prompt"][:80], n=job["n"], kind=job.get("kind", "gen"))
                           for j, job in self.pending]
         return s
@@ -291,6 +371,7 @@ class Worker:
         t = time.time()
         pipes = self.pipes_factory()
         self._set(loading=False, loaded=True, base=getattr(pipes, "base", "fake"))
+        self._pipes = pipes                          # status() reports whether the weights sit on the GPU
         print(f"[ai] model ready in {time.time() - t:.1f}s", flush=True)
         return pipes
 
@@ -311,7 +392,16 @@ class Worker:
             item = self.q.get()
             if item is None:
                 break
-            jid, job, gen = item
+            jid, job, gen = item[:3]
+            dgen = item[3] if len(item) > 3 else self.dream_cancel_gen
+            if jid == "offload":                         # on this thread: never races a running job
+                if pipes is not None and getattr(pipes, "on_gpu", False) and hasattr(pipes, "offload"):
+                    try:
+                        pipes.offload()
+                        print("[ai] idle: model moved to system RAM (back on the next image)", flush=True)
+                    except Exception as ex:
+                        print(f"[ai] offload failed: {ex}", flush=True)
+                continue
             if jid == "warmup":
                 if pipes is None:
                     try:
@@ -321,10 +411,17 @@ class Worker:
                         print(f"[ai] model load failed: {ex}", flush=True)
                 continue
             with self.lock:
-                if gen != self.cancel_gen:
-                    continue
+                if gen != self.cancel_gen or (job.get("kind") == "dream" and dgen != self.dream_cancel_gen):
+                    self.pending = [(j, jb) for j, jb in self.pending if j != jid]
+                    continue                             # cancelled while it waited in the queue
                 self.pending = [(j, jb) for j, jb in self.pending if j != jid]
             self._set(busy=True, current=dict(id=jid, prompt=job["prompt"][:80]), error="")
+            if job.get("kind") == "dream":
+                try:
+                    self._dream(jid, job, gen, pipes, dgen)
+                finally:
+                    self._set(busy=False, current=None, dream=None)
+                continue
             if job.get("kind") == "depth":
                 try:
                     t = time.time()
@@ -362,6 +459,9 @@ class Worker:
                         raise FileNotFoundError(f"snapshot not found: {self.snapshot}")
                     with Image.open(self.snapshot) as im:
                         init = fit_init(im)
+                elif isinstance(job["init"], dict):     # dream from a library image (art upload / AI / dreamed)
+                    with Image.open(init_path(job["init"], self.out_dir, self.art_dir)) as im:
+                        init = fit_init(im.convert("RGB"))
                 for i in range(job["n"]):
                     if gen != self.cancel_gen:
                         break
@@ -393,6 +493,99 @@ class Worker:
                 self._set(busy=False, current=None)
 
 
+    def _dream(self, jid, job, gen, pipes, dgen=None):
+        """One DREAMIFY job: pick the device by free VRAM (moving SD-Turbo to RAM if that makes room), dream, save."""
+        g0 = self.dream_cancel_gen if dgen is None else dgen
+
+        def cancelled():
+            return gen != self.cancel_gen or g0 != self.dream_cancel_gen
+        t = time.time()
+        folder = self.art_dir if job["source"] == "art" else self.out_dir
+        offloaded, dreamer = False, None
+        try:
+            if cancelled():
+                return
+            free = self.vram_free()
+            if free is not None and free < dreamify.NEED_MB[768] and pipes is not None and hasattr(pipes, "offload"):
+                pipes.offload()                      # SD-Turbo -> system RAM (about 2 GB of VRAM back)
+                offloaded = True
+                free = self.vram_free()
+            if free is not None and free >= dreamify.NEED_MB[512]:
+                device = "cuda"
+                side = dreamify.GPU_SIDE if free >= dreamify.NEED_MB[768] else 512
+            else:
+                device, side = "cpu", dreamify.CPU_SIDE
+            info = dict(id=jid, name=job["name"], preset=job["preset"], source=job["source"], device=device, side=side,
+                        octave=0, octaves=job["octaves"], step=0, steps=0, pct=0.0,
+                        vram_free_mb=None if free is None else round(free))
+            self._set(dream=dict(info))
+
+            def progress(octave, step, total):
+                info.update(octave=octave + 1, step=step, steps=total, pct=round(100.0 * step / max(total, 1), 1))
+                self._set(dream=dict(info))
+            with Image.open(folder / job["name"]) as im:
+                if im.width * im.height > 60_000_000:
+                    raise ValueError(f"image too large ({im.width}x{im.height})")
+                im.load()
+                im = ImageOps.exif_transpose(im)
+                if im.mode in ("RGBA", "LA", "P", "PA"):
+                    im = im.convert("RGBA")
+                    im = Image.alpha_composite(Image.new("RGBA", im.size, (0, 0, 0, 255)), im)
+                src = im.convert("RGB")
+            dreamer = self.dream_factory(device)
+            out = dreamer.dream(src, job["preset"], job["strength"], job["octaves"], side, progress, cancelled)
+            if out is None or cancelled():
+                self._set(error="dreamify cancelled")
+                print(f"[ai] dreamify cancelled: {job['name']}", flush=True)
+                return
+            name = dreamify.out_name(job["source"], job["name"], job["preset"], time.strftime("%Y%m%d_%H%M%S"), folder)
+            secs = round(time.time() - t, 1)
+            dreamify.save_png(out, folder / name, dict(
+                prompt=job["prompt"], dream_source=job["name"], dream_preset=job["preset"],
+                dream_strength=job["strength"], dream_octaves=job["octaves"], dream_model=dreamify.MODEL_NAME,
+                dream_layers=",".join(dreamify.PRESETS[job["preset"]]["layers"]), dream_device=device, dream_secs=secs))
+            with self.lock:
+                self.st["done"].append(dict(id=jid, name=name, prompt=job["prompt"][:80], kind="dream",
+                                            source=job["source"], secs=secs, show=False))
+                self.st["done"] = self.st["done"][-50:]
+            print(f"[ai] dreamify {job['preset']} {job['name']} -> {name} on {device} in {secs:.1f}s", flush=True)
+            if job["source"] == "art" and self.depth_factory is not None:
+                try:                                 # the fly-through wants a depth map for the new piece
+                    self.submit(validate_art_name({"name": name}, self.art_dir))
+                except ValueError:
+                    pass
+        except Exception as ex:
+            msg = f"dreamify failed: {type(ex).__name__}: {ex}"
+            print(f"[ai] {msg}", flush=True)
+            self._set(error=msg[:300])
+            if "out of memory" in str(ex).lower():
+                traceback.print_exc()
+        finally:
+            if dreamer is not None:
+                try:
+                    dreamer.release()
+                except Exception:
+                    pass
+                dreamer = None
+            _free_cuda()                                 # GoogLeNet + its activations gone before SD-Turbo returns
+            if offloaded:
+                try:
+                    pipes.restore()
+                except Exception as ex:                  # RealPipes stays whole on the CPU and retries on its next job
+                    self._set(error=f"SD-Turbo stays in RAM for now (restore failed, retried on the next image): {ex}"[:300])
+
+
+def _free_cuda():
+    try:
+        import gc
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def lower_priority():
     try:
         import ctypes
@@ -415,7 +608,7 @@ def main():
     token = ensure_token(HERE / ".remote_token")
     w = Worker(HERE / "textures", HERE / "snapshots" / "current.png", token, a.port,
                pipes_factory=lambda: RealPipes(a.base, a.lora, a.vae_fp32), size=a.size,
-               art_dir=HERE / "art", depth_factory=RealDepth)
+               art_dir=HERE / "art", depth_factory=RealDepth, dream_factory=dreamify.RealDream)
     w.start()
     print(f"[ai] worker on http://127.0.0.1:{w.port}  base={a.base}", flush=True)
     if not a.no_preload:   # warm the model now so the first prompt is fast

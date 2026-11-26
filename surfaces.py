@@ -31,6 +31,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -571,6 +572,24 @@ def _atomic_write(path, obj):
         return False
 
 
+def _backup(path):
+    """Copy a file aside as <name>.<time>.bak before it is overwritten. True if there is nothing to lose
+    (no file) or the copy was made."""
+    try:
+        path = Path(path)
+        if not path.exists():
+            return True
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for n in range(100):
+            bak = path.with_name(f"{path.name}.{stamp}{'-%d' % n if n else ''}.bak")
+            if not bak.exists():
+                shutil.copy2(path, bak)
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def legacy_to_px(corners, output=DEFAULT_OUTPUT):
     """mapping.json corners (BL, BR, TR, TL in 0..1, v up) -> TL, TR, BR, BL in pixels (y down)."""
     w, h = output
@@ -612,6 +631,7 @@ class SurfaceSet:
         self.dirty = False                                 # unsaved edits
         self.can_save = True
         self.status = "default"                            # how load() got here
+        self.backup_first = False                          # copy the file on disk aside before the first save
         self._undo, self._redo, self._gesture = [], [], None
 
     # ---- construction / persistence
@@ -624,11 +644,12 @@ class SurfaceSet:
         if (not isinstance(out, (list, tuple)) or len(out) != 2
                 or any(isinstance(v, bool) or not isinstance(v, int) or not 16 <= v <= 16384 for v in out)):
             raise ValueError("bad output size")
-        surfs, seen = [], set()
+        surfs, seen, dropped = [], set(), max(0, len(raw["surfaces"]) - MAX_SURFACES)
         for item in raw["surfaces"][:MAX_SURFACES]:
             try:
                 s = clean_surface(item, out)
             except ValueError:
+                dropped += 1
                 continue                                   # one broken surface does not take the others down
             while s["id"] in seen or s["id"] < 1:
                 s["id"] = max(seen, default=0) + 1
@@ -637,7 +658,9 @@ class SurfaceSet:
         if not surfs:
             raise ValueError("no usable surface")
         surfs.sort(key=lambda s: s["order"])
-        return cls(out, surfs, raw.get("sel"))
+        obj = cls(out, surfs, raw.get("sel"))
+        obj.backup_first = dropped > 0                     # the file holds more than we could use: keep a copy of it
+        return obj
 
     def to_dict(self):
         return dict(version=VERSION, output=list(self.output), sel=self.sel, surfaces=copy.deepcopy(self.surfaces))
@@ -650,7 +673,7 @@ class SurfaceSet:
         unreadable (OSError)  defaults in memory, the file is left alone and saving is DISABLED
         bad JSON / shape      moved aside to surfaces.json.<time>.bad (only when writable), then as missing
         """
-        text, status, can_save = None, "default", True
+        text, status, can_save, stuck = None, "default", True, False
         if path is not None:
             path = Path(path)
             try:
@@ -667,18 +690,25 @@ class SurfaceSet:
                 moved = _quarantine(path) if writable else None
                 print(f"[map] {path} is not a valid surfaces file ({ex})" + (f" -> moved to {moved.name}" if moved else ""))
                 status = "quarantined"
+                stuck = writable and moved is None
         obj = cls(output)
-        pts = _read_legacy(legacy, obj.output) if legacy is not None and can_save else None
+        # the old corner pin is used whenever surfaces.json gave nothing, also when it could not be read
+        # (saving is off then anyway): the show must not fall back to the full frame if a pin exists
+        pts = _read_legacy(legacy, obj.output) if legacy is not None else None
         if pts is not None:
             obj.surfaces[0]["corners"] = pts
             status = "migrated" if status == "default" else status
-        obj.status, obj.can_save = status, can_save
+        obj.status, obj.can_save, obj.backup_first = status, can_save, stuck
         return obj
 
     def save(self, path, legacy=None):
         """Write surfaces.json atomically (and mapping.json for surface #1, so the old corner pin stays in step)."""
         if not self.can_save or path is None:
             return False
+        if self.backup_first:                              # lossy load, or a corrupt file that could not be moved aside
+            if not _backup(path):
+                return False                               # never overwrite the only copy
+            self.backup_first = False
         ok = _atomic_write(path, self.to_dict())
         if ok:
             self.dirty = False
@@ -738,7 +768,9 @@ class SurfaceSet:
     def span_box(self):
         """(x0, y0, w, h) in pixels of the virtual canvas all span-mode surfaces share: the smallest box of the
         output's aspect ratio that covers every one of them (so the picture is never stretched)."""
-        pts = [p for s in self.enabled() if s["source"]["mode"] == "span" for p in self.polygon(s)]
+        # every span-mode surface counts, on or off: switching one face off mid-show must not rescale or shift
+        # the picture on the others
+        pts = [p for s in self.surfaces if s["source"]["mode"] == "span" for p in self.polygon(s)]
         if not pts:
             return (0.0, 0.0, float(self.output[0]), float(self.output[1]))
         x0, y0, x1, y1 = bbox(pts)
@@ -1009,6 +1041,8 @@ class SurfaceSet:
         """Everything the renderer needs per enabled surface, in draw order, in FRAMEBUFFER pixels with y UP
         (gl_FragCoord): polygon, scissor box, matrices (row-major 9-tuples: pixel -> source uv with v up, and
         pixel -> the surface's own 0..1 square), look values. Pure maths, so it is tested without a GPU."""
+        if fb_w <= 0 or fb_h <= 0:
+            return []                                      # minimised window: nothing to draw, nothing to divide by
         sx, sy = fb_w / self.output[0], fb_h / self.output[1]
         to_px = [[1.0 / sx, 0.0, 0.0], [0.0, -1.0 / sy, fb_h / sy], [0.0, 0.0, 1.0]]     # gl pixel -> output pixel (y down)
         flip = [[1.0, 0.0, 0.0], [0.0, -1.0, 1.0], [0.0, 0.0, 1.0]]                      # v down -> v up
@@ -1041,17 +1075,67 @@ class SurfaceSet:
 
 # ---------------------------------------------------------------------------------------------- engine side
 
+class OutputGate:
+    """Which output path the engine takes this frame, so one bad moment never costs the mapping for the night.
+
+      "skip"   the framebuffer is 0 x 0 (window minimised / mid re-plug): draw nothing, count nothing
+      "multi"  draw every surface
+      "pin"    the old single corner pin: either that is all there is (plain mode "pin"), or the surface renderer
+               failed MAX_FAILS frames in a row (mode "fallback"). The pin shader lights only the inside of that
+               one quad, so the rest of the projector stays black. From a fallback the surface path is tried
+               again every RETRY_S, for as long as it takes.
+    """
+    MAX_FAILS = 5
+    RETRY_S = 2.0
+
+    def __init__(self):
+        self.fails, self.retry_at, self.mode, self.error = 0, 0.0, "pin", ""
+
+    def plan(self, fb, trivial, have_renderer, now):
+        if fb[0] <= 0 or fb[1] <= 0:
+            return "skip"
+        if trivial or not have_renderer:
+            self.mode = "pin"
+            return "pin"
+        if self.fails >= self.MAX_FAILS and now < self.retry_at:
+            self.mode = "fallback"
+            return "pin"
+        return "multi"
+
+    def ok(self):
+        self.fails, self.mode, self.error = 0, "multi", ""
+
+    def failed(self, now, error=""):
+        """Record a failed surface draw. Returns the line to log."""
+        self.fails += 1
+        self.error = str(error)[:200]
+        if self.fails >= self.MAX_FAILS:
+            self.fails, self.retry_at, self.mode = self.MAX_FAILS, now + self.RETRY_S, "fallback"
+            return f"[map] surface output failed: corner pin only, trying again in {self.RETRY_S:.0f} s ({self.error})"
+        return f"[map] surface output failed ({self.fails}/{self.MAX_FAILS}), corner pin this frame ({self.error})"
+
+
 class Mapper:
     """What the render engine holds: the set, where it lives on disk, autosave, and the bridge that keeps the
     old corner-pin commands / mouse calibration working on one surface."""
     AUTOSAVE_S = 1.5                                       # quiet time after the last edit before writing
+    RETRY_MAX_S = 30.0                                     # a failed write is retried: 1.5, 3, 6 ... 30 s apart
 
     def __init__(self, path=None, legacy=None, output=DEFAULT_OUTPUT, writable=True):
         self.path = Path(path) if path is not None else None
         self.legacy = Path(legacy) if legacy is not None else None
         self.writable = bool(writable) and self.path is not None
         self.set = SurfaceSet.load(self.path, self.legacy, output, writable=self.writable)
-        self._edit_t = None
+        self._edit_t = None                                # when the pending write became due-able
+        self._wait = self.AUTOSAVE_S                       # current delay (grows while writes fail)
+        self.save_failed = False
+        self.gate = OutputGate()
+
+    def state(self):
+        """The panel's view: the set plus what the engine is doing with it."""
+        d = self.set.state()
+        d.update(out=self.gate.mode, save_failed=self.save_failed)
+        return d
 
     def command(self, c):
         """One validated {"cmd": "surf"} command from the panel. Returns True if it did something."""
@@ -1059,25 +1143,48 @@ class Mapper:
             return self.save()
         changed = self.set.apply(c)
         if changed and self.set.dirty:
-            self._edit_t = time.monotonic()
+            self._touch()
         return changed
 
+    def _touch(self):
+        self._edit_t = time.monotonic()
+        if not self.save_failed:
+            self._wait = self.AUTOSAVE_S
+
     def save(self):
-        self._edit_t = None
-        if not self.writable:
+        """Write now. A failed write (Windows: a virus scanner or the indexer holding the file for a moment)
+        stays pending and is retried by tick() with a growing delay; the edits are never dropped."""
+        if not self.writable or not self.set.can_save:     # headless, or the file was unreadable at start: by design
+            self._edit_t = None
             return False
         ok = self.set.save(self.path, self.legacy)
-        print(f"[map] saved {len(self.set.surfaces)} surface(s) -> {self.path.name}" if ok else f"[map] could NOT save {self.path}")
+        if ok:
+            if self.save_failed:
+                print(f"[map] saving works again -> {self.path.name}")
+            self._edit_t, self._wait, self.save_failed = None, self.AUTOSAVE_S, False
+            print(f"[map] saved {len(self.set.surfaces)} surface(s) -> {self.path.name}")
+        else:
+            self._wait = self.AUTOSAVE_S if not self.save_failed else min(self.RETRY_MAX_S, self._wait * 2.0)
+            self._edit_t, self.save_failed = time.monotonic(), True
+            print(f"[map] could NOT save {self.path}: trying again in {self._wait:.1f} s")
         return ok
 
     def tick(self):
-        """Call every frame: writes the file once edits have been quiet for AUTOSAVE_S."""
-        if self._edit_t is not None and time.monotonic() - self._edit_t >= self.AUTOSAVE_S:
+        """Call every frame: writes the file once edits have been quiet for AUTOSAVE_S (longer after a failure)."""
+        if self._edit_t is not None and time.monotonic() - self._edit_t >= self._wait:
             self.save()
 
-    def flush(self):
-        if self._edit_t is not None:
-            self.save()
+    def flush(self, tries=4, pause=0.25):
+        """At exit: anything unsaved is written, with a few quick retries. Returns True if nothing is left unsaved."""
+        if not self.writable or not self.set.can_save or not (self.set.dirty or self._edit_t is not None):
+            return True
+        for k in range(max(1, tries)):
+            if self.save():
+                return True
+            if k + 1 < tries:
+                time.sleep(pause)
+        print(f"[map] UNSAVED mapping edits could not be written to {self.path}")
+        return False
 
     # ---- the old corner pin (BL, BR, TR, TL in 0..1, v up) is a view of one surface
     def target_id(self):
@@ -1091,7 +1198,7 @@ class Mapper:
     def push_corners(self, corners, sid=None, g="legacy"):
         sid = self.target_id() if sid is None else sid
         if self.set.set_legacy_corners(corners, sid, g=g):
-            self._edit_t = time.monotonic()
+            self._touch()
             return True
         return False
 

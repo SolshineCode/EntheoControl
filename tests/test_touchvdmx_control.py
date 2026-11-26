@@ -55,7 +55,7 @@ def do(c, **cmd):
 
 def test_mod_sources_are_appended():
     assert MOD_SOURCES[:9] == ["none", "bass", "mid", "high", "lfo_sine", "lfo_tri", "lfo_saw", "lfo_square", "random"]
-    assert MOD_SOURCES[9:] == ["seq", "seq_gate"]
+    assert MOD_SOURCES[9:11] == ["seq", "seq_gate"]       # later features may append more after these
     assert control.meta()["sources"] == list(MOD_SOURCES)
 
 

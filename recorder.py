@@ -34,6 +34,7 @@ Governor: Recorder.active (bool) and Recorder.cost() -> {active, encoders, readb
 """
 import collections
 import json
+import re
 import math
 import os
 import queue
@@ -54,6 +55,7 @@ AUDIO_MODES = ("off", "laptop", "mic")
 QUALITIES = ("draft", "standard", "high")
 REPLAY_MIN, REPLAY_MAX, SEG = 5, 120, 2
 WARN_FREE, STOP_FREE = 2 * 2 ** 30, 500 * 2 ** 20
+TOGGLE_DEBOUNCE = 0.5                                   # s: toggles closer than this are one bounce
 OPS = ("toggle", "start", "stop", "set", "save_replay", "open_folder")
 DEFAULTS = dict(source="program", fps=30, res="native", audio="laptop", quality="standard", replay=False, replay_s=30)
 ENCODER_ORDER = ("h264_nvenc", "libx264", "h264_mf")
@@ -79,14 +81,21 @@ def validate_cmd(c):
             out[key] = c[key]
     if "fps" in c:
         try:
-            fps = int(c["fps"])
-        except (TypeError, ValueError):
+            if isinstance(c["fps"], bool):
+                raise TypeError
+            f = float(c["fps"])
+            fps = int(f)
+            if fps != f:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
             raise ValueError("bad fps")
         if fps not in FPS_CHOICES:
             raise ValueError("bad fps")
         out["fps"] = fps
     if "replay" in c:
-        out["replay"] = bool(c["replay"])
+        if not isinstance(c["replay"], bool):                # "false" must not read as True
+            raise ValueError("bad replay")
+        out["replay"] = c["replay"]
     if "replay_s" in c:
         try:
             v = float(c["replay_s"])
@@ -115,12 +124,20 @@ def find_ffmpeg():
 
 
 _probe_cache = {}
+_probe_lock = threading.Lock()
 
 
 def probe_encoders(ffmpeg, popen=subprocess.Popen, order=ENCODER_ORDER):
-    """The H.264 encoders that really work here (NVENC can be listed yet fail: old driver, sessions used up)."""
+    """The H.264 encoders that really work here (NVENC can be listed yet fail: old driver, sessions used up).
+    One probe at a time (a REC press during the start-up probe waits for it instead of probing NVENC twice), and
+    only a result that includes NVENC is cached: a transient NVENC failure is probed again at the next start."""
     if not ffmpeg:
         return []
+    with _probe_lock:
+        return _probe_locked(ffmpeg, popen, order)
+
+
+def _probe_locked(ffmpeg, popen, order):
     if ffmpeg in _probe_cache:
         return _probe_cache[ffmpeg]
     ok = []
@@ -134,7 +151,8 @@ def probe_encoders(ffmpeg, popen=subprocess.Popen, order=ENCODER_ORDER):
                 ok.append(enc)
         except Exception:
             pass
-    _probe_cache[ffmpeg] = ok
+    if "h264_nvenc" in ok:
+        _probe_cache[ffmpeg] = ok
     return ok
 
 
@@ -144,7 +162,7 @@ def encoder_args(enc, quality, fps, gop=None):
     if enc == "h264_nvenc":
         cq = ("28", "23", "19")[q]
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
-                "-maxrate", "60M", "-bufsize", "120M", "-g", g, "-bf", "0", "-pix_fmt", "yuv420p"]
+                "-maxrate", "60M", "-bufsize", "120M", "-g", g, "-bf", "0"]    # rgb0 in: NVENC converts on the GPU
     if enc == "h264_mf":
         br = ("6M", "12M", "24M")[q]
         return ["-c:v", "h264_mf", "-b:v", br, "-g", g, "-pix_fmt", "nv12"]
@@ -222,11 +240,17 @@ class CFR:
 
 # ----------------------------------------------------------------------------- video writer thread
 class VideoWriter(threading.Thread):
-    """Frames -> encoder stdin. offer() never blocks; finish(n) pads to exactly n frames and closes stdin."""
+    """Frames -> encoder stdin. offer() never blocks; finish(n) pads to exactly n frames and closes stdin.
 
-    def __init__(self, proc, frame_bytes, maxq=10):
+    due(): optional, the slot that should already be on disk by now (wall clock minus a lag). While no frames arrive
+    (projector unplugged, window minimised, a long hitch) the writer keeps the file growing in real time with the
+    last frame, so a long pause never turns into a burst of thousands of duplicates on resume. abort(): stop at once,
+    no padding (crash / exit path); the fragmented MP4 written so far stays playable."""
+
+    def __init__(self, proc, frame_bytes, maxq=10, due=None):
         super().__init__(daemon=True, name="rec-writer")
-        self.proc, self.frame_bytes = proc, frame_bytes
+        self.proc, self.frame_bytes, self.due = proc, frame_bytes, due
+        self._abort = False
         self.q = queue.Queue(maxq)
         self.next_slot, self.last = 0, None
         self.dropped = self.dups = self.written = 0
@@ -249,6 +273,16 @@ class VideoWriter(threading.Thread):
         self.total = total
         self._finish.set()
 
+    def abort(self):
+        self._abort = True
+        self._finish.set()
+
+    def _fill_to(self, slot):
+        while self.next_slot < slot and not self._abort:
+            self._write(self.last)
+            self.dups += 1
+            self.next_slot += 1
+
     def _write(self, data):
         self.proc.stdin.write(data)
         self.written += 1
@@ -256,26 +290,27 @@ class VideoWriter(threading.Thread):
     def run(self):
         try:
             while True:
+                if self._abort:
+                    break
                 try:
                     slot, data = self.q.get(timeout=0.05)
                 except queue.Empty:
                     if self._finish.is_set():
                         break
+                    if self.due is not None and self.last is not None:
+                        self._fill_to(self.due())       # nothing arriving: keep real time with the last frame
                     continue
                 if slot < self.next_slot:
                     continue
-                fill = self.last if self.last is not None else data
-                while self.next_slot < slot:
-                    self._write(fill)
-                    self.dups += 1
-                    self.next_slot += 1
+                if self.last is None:
+                    self.last = data
+                self._fill_to(slot)
+                if self._abort:
+                    break
                 self._write(data)
                 self.last, self.next_slot = data, slot + 1
-            if self.total is not None and self.last is not None:
-                while self.next_slot < self.total:
-                    self._write(self.last)
-                    self.dups += 1
-                    self.next_slot += 1
+            if self.total is not None and self.last is not None and not self._abort:
+                self._fill_to(self.total)
         except Exception as ex:                          # BrokenPipe / OSError / ValueError: the encoder died
             self.error = f"{type(ex).__name__}: {ex}"
             while True:                                  # release the queued frames
@@ -381,6 +416,16 @@ class RingSink:
         return out
 
 
+def resample(a, n):
+    """Linear-interpolation resample of one block to n samples: drift steering without a splice (no click on tonal
+    material; a 3 % pitch bend for 10 ms is inaudible)."""
+    m = len(a)
+    if n == m or m < 2 or n < 1:
+        return a
+    x = np.linspace(0.0, m - 1, n)
+    return np.stack([np.interp(x, np.arange(m), a[:, c]) for c in range(a.shape[1])], axis=1).astype("f4")
+
+
 def as_stereo(block):
     a = np.asarray(block, dtype="f4")
     if a.ndim == 1:
@@ -439,12 +484,12 @@ class AudioSync:
                 self.m_win, self.m_cur, self.win_t = self.m_cur, math.inf, t
             if self.m_win is not None and abs(self.m_win) > self.soft:
                 k = int(min(self.step, abs(self.m_win), max(1, len(a) // 8)))
-                if self.m_win > 0:                         # behind: stretch by repeating a few samples
-                    a = np.concatenate([a[:k], a])
+                if self.m_win > 0:                         # behind: stretch this block by k samples
+                    a = resample(a, len(a) + k)
                     self.m_win -= k
                     self.m_cur -= k
-                else:                                      # ahead (device clock fast): drop a few
-                    a = a[k:]
+                else:                                      # ahead (device clock fast): squeeze it by k
+                    a = resample(a, len(a) - k)
                     self.m_win += k
                     self.m_cur += k
         if len(a):
@@ -561,35 +606,43 @@ def default_audio_factory(mode, engine_audio=None):
 # ----------------------------------------------------------------------------- GL readback ring
 class GLCapture:
     """Async readback: fbo.read_into(PBO) returns at once; the PBO is mapped `latency` frames later, when the GPU
-    has long finished, so reading it costs a memcpy and no pipeline stall."""
+    has long finished, so reading it costs a memcpy and no pipeline stall. Free PBOs are kept per size, so two
+    sources (or a projector of another size) never release and re-create buffers every frame; the pool covers two
+    sources x (latency + 1) grabs in flight."""
 
-    def __init__(self, ctx, pool=4, latency=2):
+    def __init__(self, ctx, pool=6, latency=2):
         self.ctx, self.pool, self.latency = ctx, pool, latency
-        self.free, self.pending, self.n = [], collections.deque(), 0
+        self.free, self.pending, self.n = {}, collections.deque(), 0
         self.count = 0
         self._ready = []
 
     def _pbo(self, nbytes):
-        while self.free:
-            b = self.free.pop()
-            if b.size == nbytes:
-                return b
-            b.release(); self.count -= 1
+        lst = self.free.get(nbytes)
+        if lst:
+            return lst.pop()
+        if self.count >= self.pool:                         # make room: drop a free buffer of another size
+            for k, other in self.free.items():
+                if other:
+                    other.pop().release()
+                    self.count -= 1
+                    break
         if self.count < self.pool:
+            b = self.ctx.buffer(reserve=nbytes, dynamic=True)   # count only what really exists
             self.count += 1
-            return self.ctx.buffer(reserve=nbytes, dynamic=True)
+            return b
         return None
 
     def grab(self, reader, t, tag=None):
         (fbo, att), (w, h) = reader
-        nbytes = w * h * 4
+        nbytes = int(w) * int(h) * 4
+        if nbytes <= 0:                                     # minimised window / 0x0 framebuffer: nothing to read
+            return False
         b = self._pbo(nbytes)
-        if b is None:                                       # every PBO still in flight: map the oldest early
-            item = self.pending.popleft()
-            self._ready.append(self._map(item))
+        if b is None and self.pending:                      # every PBO still in flight: map the oldest early
+            self._ready.append(self._map(self.pending.popleft()))
             b = self._pbo(nbytes)
-            if b is None:
-                return False
+        if b is None:
+            return False
         fbo.read_into(b, viewport=(0, 0, w, h), components=4, attachment=att, alignment=1)
         self.pending.append((b, t, (w, h), tag, self.n))
         return True
@@ -597,7 +650,7 @@ class GLCapture:
     def _map(self, item):
         b, t, size, tag, _ = item
         data = b.read()
-        self.free.append(b)
+        self.free.setdefault(b.size, []).append(b)
         return (t, data, size, tag)
 
     def collect(self, force=False):
@@ -608,12 +661,173 @@ class GLCapture:
         return out
 
     def release(self):
-        for b in self.free + [p[0] for p in self.pending]:
+        for b in [x for lst in self.free.values() for x in lst] + [p[0] for p in self.pending]:
             try:
                 b.release()
             except Exception:
                 pass
-        self.free, self.pending, self.count = [], collections.deque(), 0
+        self.free, self.pending, self.count = {}, collections.deque(), 0
+
+
+# ----------------------------------------------------------------------------- parts dir -> finished MP4
+LOCK_NAME, LOCK_STALE = "finalizing.lock", 30.0
+
+
+def index_add(folder, name, secs, s):
+    p = Path(folder) / ".index.json"
+    try:
+        idx = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        idx = {}
+    idx[name] = dict(secs=round(float(secs or 0), 2), fps=s.get("fps"), source=s.get("source"), audio=s.get("audio"))
+    try:
+        p.write_text(json.dumps(idx), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_mux(ffmpeg, popen, video, pcm, out, logpath, pad=False, concat=False, procs=None, log=print):
+    """ffmpeg mux into <out>.muxing.mp4, then rename. procs: a list the running process is put in (so an exit can
+    kill it). False on any failure; never touches the inputs."""
+    if not ffmpeg:
+        return False
+    out = Path(out)
+    tmp = out.with_name(out.stem + ".muxing.mp4")
+    try:
+        with open(logpath, "ab") as lg:
+            p = popen(mux_cmd(ffmpeg, video, pcm, tmp, pad=pad, concat=concat), stdin=subprocess.DEVNULL,
+                      stdout=subprocess.DEVNULL, stderr=lg, creationflags=_FLAGS)
+            if procs is not None:
+                procs.append(p)
+            try:
+                rc = p.wait(timeout=3600)
+            finally:
+                if procs is not None and p in procs:
+                    procs.remove(p)
+        if rc == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, out)
+            return True
+    except Exception as ex:
+        log(f"[rec] mux error: {ex}")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _lock_fresh(d):
+    try:
+        return time.time() - (Path(d) / LOCK_NAME).stat().st_mtime < LOCK_STALE
+    except OSError:
+        return False
+
+
+_SAFE_MP4 = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,150}[.]mp4$", re.I)
+
+
+def safe_output_name(name, fallback, folder):
+    """meta.json is a file on disk and may be damaged or planted: the output name taken from it must be a plain
+    .mp4 file name that lands directly inside `folder` (no path, no drive, no "..", no odd characters). Anything
+    else falls back to the parts folder's own name (made safe the same way)."""
+    folder = Path(folder)
+    for cand in (name, fallback, "recovered.mp4"):
+        if not isinstance(cand, str) or not _SAFE_MP4.match(cand) or ".." in cand or Path(cand).name != cand:
+            continue
+        try:
+            if (folder / cand).resolve().parent == folder.resolve():
+                return cand
+        except OSError:
+            continue
+    return "recovered.mp4"
+
+
+def finalize_parts(parts, ffmpeg, popen=subprocess.Popen, disk_free=None, log=print, procs=None, wait_lock=0.0):
+    """Turn one sealed (or crash-left) parts dir into recordings/<name>.mp4. Returns (status, message, secs).
+
+    status: "ok" (the MP4 is written, the parts dir removed), "busy" (another process is finalizing it), "nospace"
+    (the mux needs a full extra copy: parts kept), "failed" (parts kept, retried at the next start), "empty" (nothing
+    worth keeping, dir removed). Audio is never deleted unless it made it into an MP4."""
+    parts = Path(parts)
+    folder = parts.parent.parent
+    end = time.time() + wait_lock
+    while _lock_fresh(parts):
+        if time.time() >= end:
+            return "busy", f"{parts.name} is being finalized by another process", 0.0
+        time.sleep(0.5)
+    try:
+        meta = json.loads((parts / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    for k in ("fps", "frames", "mux_failed"):               # numbers only: a planted string must not crash recovery
+        if not isinstance(meta.get(k), (int, float)) or isinstance(meta.get(k), bool) or not meta[k] == meta[k] or meta[k] < 0:
+            meta.pop(k, None)
+    name = safe_output_name(meta.get("name"), f"{parts.name}.mp4", folder)
+    video, pcm = parts / "video.mp4", parts / "audio.pcm"
+    vsize = video.stat().st_size if video.exists() else 0
+    asize = pcm.stat().st_size if pcm.exists() else 0
+    if vsize == 0:
+        if asize > 0:
+            return "failed", f"{name}: no video, audio kept in {parts}", 0.0
+        shutil.rmtree(parts, ignore_errors=True)
+        return "empty", f"{name}: nothing recorded", 0.0
+    need = vsize + asize // 8 + 200 * 2 ** 20                # the mux writes a full copy of the video (+ AAC)
+    try:
+        free = (disk_free or (lambda p: shutil.disk_usage(p).free))(folder)
+    except Exception:
+        free = None
+    if free is not None and free < need:
+        return "nospace", (f"{name}: not enough disk to finish ({free / 2 ** 30:.1f} GB free, needs "
+                           f"{need / 2 ** 30:.1f} GB); parts kept in {parts}, finished at the next start"), 0.0
+    lock = parts / LOCK_NAME
+    stop = threading.Event()
+
+    def beat():                                             # heartbeat: recover() in another process waits on it
+        while not stop.wait(5.0):
+            try:
+                os.utime(lock)
+            except OSError:
+                pass
+    try:
+        lock.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    th = threading.Thread(target=beat, daemon=True)
+    th.start()
+    try:
+        fps = meta.get("fps") or 30
+        secs = (meta["frames"] / fps) if meta.get("frames") else 0.0
+        use_pcm = pcm if meta.get("audio", asize > 0) and asize > 0 else None
+        out = folder / name
+        ok = run_mux(ffmpeg, popen, video, use_pcm, out, parts / "ffmpeg.log", pad=not meta.get("sealed"),
+                     procs=procs, log=log)
+        if ok:
+            stop.set()
+            shutil.rmtree(parts, ignore_errors=True)
+            index_add(folder, name, secs, meta)
+            return "ok", f"saved {name} ({secs:.0f} s, {out.stat().st_size / 2 ** 20:.0f} MB)", secs
+        meta["mux_failed"] = int(meta.get("mux_failed", 0)) + 1
+        try:
+            (parts / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        except OSError:
+            pass
+        return "failed", f"{name}: could not write the MP4; parts (video + audio) kept in {parts}, retried at the next start", secs
+    finally:
+        stop.set()
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def spawn_finalizer(parts):
+    """Finish a sealed recording in a detached process, so the show window can close at once."""
+    flags = (0x00000008 | 0x00000200 | 0x08000000 | 0x00004000) if _WIN else 0  # DETACHED | NEW_GROUP | NO_WINDOW | BELOW_NORMAL
+    return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--finalize", str(parts)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=flags, close_fds=True, cwd=str(Path(parts).parent))
 
 
 # ----------------------------------------------------------------------------- one output (file or replay ring)
@@ -624,13 +838,16 @@ class Session:
         self.fps, self.source = int(self.s["fps"]), self.s["source"]
         self.size = tuple(rec._sizes.get(self.source) or rec.program_size)
         self.cfr = CFR(self.fps)
-        self.ready = self.failed = self.stopping = self.done = False
+        self.ready = self.failed = self.stopping = self.done = self.sealed = False
+        self.handoff = False                                 # exit: a detached process / the next start finishes it
         self.error = None
-        self.writer = self.proc = self.sync = self.audio = None
+        self.writer = self.proc = self.sync = self.audio = self.sink = self.log = None
         self.t0 = self.t_end = None
         self.size_skips = 0
         self.blocks = collections.deque()
         self.threads = []
+        self.mux_procs = []
+        self.frames = 0
         self._lock = threading.Lock()
         self._late_stop = False
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -643,9 +860,10 @@ class Session:
             self.name = n
             self.parts = rec.dir / ".parts" / Path(self.name).stem
             self.video = self.parts / "video.mp4"
-        else:
+        else:                                                # each replay ring has its own folder (M3)
+            rec._replay_n += 1
             self.name = "replay"
-            self.parts = rec.dir / ".replay"
+            self.parts = rec.dir / ".replay" / f"{stamp}_{os.getpid()}_{rec._replay_n}"
             self.video = self.parts / "seg%03d.ts"
         self.pcm = self.parts / "audio.pcm"
         self.with_audio = self.s["audio"] != "off"
@@ -654,8 +872,6 @@ class Session:
     def start(self):
         rec = self.rec
         try:
-            if self.kind == "replay" and self.parts.exists():
-                shutil.rmtree(self.parts, ignore_errors=True)
             self.parts.mkdir(parents=True, exist_ok=True)
             encs = rec.encoders if rec.encoders is not None else probe_encoders(rec.ffmpeg, rec.popen)
             if not rec.ffmpeg or not encs:
@@ -668,17 +884,16 @@ class Session:
             self.proc = rec.popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.log,
                                   creationflags=_FLAGS)
             if self.kind == "file":
-                (self.parts / "meta.json").write_text(json.dumps(dict(
-                    name=self.name, audio=self.with_audio, fps=self.fps, source=self.source, res=self.s["res"],
-                    encoder=self.encoder, size=list(self.size), started=time.time())), encoding="utf-8")
-            self.writer = VideoWriter(self.proc, self.size[0] * self.size[1] * 4)
+                self._write_meta()
+            lag = max(1, int(self.fps * 0.5))
+            self.writer = VideoWriter(self.proc, self.size[0] * self.size[1] * 4,
+                                      due=lambda: self.cfr.slot(rec.clock()) - lag)
             self.writer.start()
             self.t0 = rec.clock()
             self.cfr.start(self.t0)
             if self.with_audio:
-                sink = FileSink(self.pcm) if self.kind == "file" else RingSink(int(self.s["replay_s"]) + 3 * SEG + 6)
-                self.sink = sink
-                self.sync = AudioSync(self.t0, sink)
+                self.sink = FileSink(self.pcm) if self.kind == "file" else RingSink(int(self.s["replay_s"]) + 3 * SEG + 6)
+                self.sync = AudioSync(self.t0, self.sink)
                 self.audio = rec.audio_factory(self.s["audio"], engine_audio=rec.engine_audio)
                 self.audio.add(self._on_audio)
                 th = threading.Thread(target=self._audio_loop, daemon=True, name="rec-audio-sync")
@@ -688,7 +903,7 @@ class Session:
                 self.ready = True
                 late = self._late_stop
             if late:
-                self._begin_finalize(False)
+                self._begin_finalize()
         except Exception as ex:
             self.failed, self.error = True, f"could not start: {ex}"
             self.stopping = self.done = True
@@ -698,6 +913,15 @@ class Session:
                     self.proc.kill()
             except Exception:
                 pass
+
+    def _write_meta(self, **extra):
+        d = dict(name=self.name, audio=self.with_audio, fps=self.fps, source=self.source, res=self.s["res"],
+                 encoder=getattr(self, "encoder", None), size=list(self.size), started=time.time())
+        d.update(extra)
+        try:
+            (self.parts / "meta.json").write_text(json.dumps(d), encoding="utf-8")
+        except OSError:
+            pass
 
     def _on_audio(self, block, t):                       # capture thread: just queue it
         if not self.stopping:
@@ -759,6 +983,14 @@ class Session:
             return 0.0
         return max(0.0, (self.t_end if self.t_end is not None else self.rec.clock()) - self.t0)
 
+    def part_bytes(self):
+        try:
+            if self.kind == "file":
+                return self.video.stat().st_size + (self.pcm.stat().st_size if self.pcm.exists() else 0)
+        except OSError:
+            pass
+        return 0
+
     def mb(self):
         try:
             if self.kind == "file":
@@ -767,8 +999,8 @@ class Session:
             pass
         return 0.0
 
-    # -- stop (render thread) -> finalize (own thread)
-    def stop(self, error=None, wait=False):
+    # -- stop (render thread) -> seal + publish (own thread)
+    def stop(self, error=None):
         with self._lock:
             if self.stopping:
                 return
@@ -782,52 +1014,73 @@ class Session:
             if not self.ready:
                 self._late_stop = True                     # still starting: start() finalizes when it is up
                 return
-        self._begin_finalize(wait)
+        self._begin_finalize()
 
-    def _begin_finalize(self, wait):
+    def _begin_finalize(self):
         t_end = self.t_end if self.t_end is not None else self.rec.clock()
         self.total = max(self.cfr.last + 1, int(round((t_end - self.t0) * self.fps)), 1)
         self.writer.finish(self.total)
         th = threading.Thread(target=self._finalize, daemon=True, name="rec-finalize")
         th.start()
         self.threads.append(th)
-        if wait:
-            th.join(120)
+
+    def seal(self, timeout=60.0, abort=False):
+        """Close the encoder and the audio file, pad audio to the video, note the frame count in meta.json.
+        Bounded: a hung encoder is killed after `timeout`; abort = no padding (exit / crash path)."""
+        if self.sealed or self.writer is None:
+            return
+        if abort:
+            self.writer.abort()
+        self.writer.join(timeout)
+        if self.writer.is_alive():
+            self.writer.abort()
+            try:
+                self.proc.kill()                           # unblocks a write stuck in the pipe
+            except Exception:
+                pass
+            self.writer.join(2.0)
+        try:
+            self.proc.wait(timeout=max(1.0, timeout / 4))
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.frames = max(self.writer.next_slot, 1)
+        for th in self.threads:
+            if th is not threading.current_thread() and th.name == "rec-audio-sync":
+                th.join(min(10.0, timeout))
+        self._close_audio()
+        if self.sync is not None:
+            try:
+                self.sync.finish(self.frames * SR // self.fps)
+            except Exception:
+                pass
+            if isinstance(self.sink, FileSink):
+                self.sink.close()
+        try:
+            self.log.close()
+        except Exception:
+            pass
+        if self.kind == "file":
+            self._write_meta(frames=self.frames, sealed=True, dropped=self.writer.dropped)
+        self.sealed = True
 
     def _finalize(self):
         rec = self.rec
         try:
-            self.writer.join(60)
-            frames = max(self.writer.next_slot, 1)
-            try:
-                self.proc.wait(timeout=60)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-            for th in self.threads:
-                if th is not threading.current_thread() and th.name == "rec-audio-sync":
-                    th.join(10)
-            self._close_audio()
-            if self.sync is not None:
-                self.sync.finish(frames * SR // self.fps)
-                if isinstance(self.sink, FileSink):
-                    self.sink.close()
-            try:
-                self.log.close()
-            except Exception:
-                pass
+            self.seal(60.0)
             if self.kind == "replay":
-                shutil.rmtree(self.parts, ignore_errors=True)
+                shutil.rmtree(self.parts, ignore_errors=True)    # only this ring's own folder
                 return
-            secs = frames / self.fps
-            out = rec.dir / self.name
-            ok = rec._mux(self.video, self.pcm if self.with_audio else None, out, self.parts / "ffmpeg.log")
-            if ok:
-                shutil.rmtree(self.parts, ignore_errors=True)
-                rec._index_add(self.name, secs, self.s)
-                msg = f"saved {self.name} ({secs:.0f} s, {out.stat().st_size / 2 ** 20:.0f} MB)"
+            if self.handoff:
+                return
+            status, msg, secs = finalize_parts(self.parts, rec.ffmpeg, rec.popen, rec.disk_free, rec._log,
+                                               procs=self.mux_procs)
+            if self.handoff and status != "ok":
+                return                                         # exit killed the mux: a detached finalizer retries
+            rec._recent_t = -1e9
+            if status == "ok":
                 if self.writer.dropped:
                     msg += f", {self.writer.dropped} frames dropped (encoder behind)"
                 if self.error:
@@ -835,15 +1088,8 @@ class Session:
                 else:
                     rec.notice(msg, "info")
             else:
-                try:
-                    if self.video.exists() and not out.exists():
-                        shutil.move(str(self.video), str(out))
-                        rec._index_add(self.name, secs, self.s)
-                except Exception:
-                    pass
-                lvl = "error" if self.error else "warn"
-                rec.notice(f"{'recording stopped: ' + self.error + '; ' if self.error else ''}"
-                           f"audio mux failed: kept the video only as {self.name} (parts in {self.parts})", lvl)
+                pre = f"recording stopped: {self.error}; " if self.error else ""
+                rec.notice(pre + msg, "error" if self.error or status == "nospace" else "warn")
         except Exception as ex:
             rec.notice(f"finalize failed: {ex} (parts kept in {self.parts})", "error")
         finally:
@@ -854,7 +1100,7 @@ class Session:
 class Recorder:
     def __init__(self, out_dir, ffmpeg=None, popen=subprocess.Popen, clock=time.perf_counter, capture=None,
                  encoders=None, audio_factory=default_audio_factory, engine_audio=None, persist=True,
-                 start_async=True, program_size=(1280, 800), disk_free=None, log=print):
+                 start_async=True, program_size=(1280, 800), disk_free=None, log=print, spawn=None):
         self.dir = Path(out_dir)
         self.ffmpeg = ffmpeg if ffmpeg is not None else find_ffmpeg()
         self.popen, self.clock, self.capture = popen, clock, capture
@@ -863,6 +1109,7 @@ class Recorder:
         self.persist, self.start_async = persist, start_async
         self.program_size = tuple(program_size)
         self.disk_free = disk_free or (lambda p: shutil.disk_usage(p).free)
+        self.spawn = spawn or spawn_finalizer
         self._log = log
         self.settings = dict(DEFAULTS)
         self.rec = self.replay = None
@@ -873,6 +1120,8 @@ class Recorder:
         self._disk_t = -1e9
         self._warned = False
         self._recent, self._recent_t = [], -1e9
+        self._toggle_t = -1e9
+        self._replay_n = 0
         self.readback_ms = 0.0
         self.auto_stop_at = None
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -905,9 +1154,12 @@ class Recorder:
 
     def cost(self):
         live = [s for s in (self.rec, self.replay) if s is not None and not s.stopping]
+        encs = [getattr(s, "encoder", None) for s in live]
         return dict(active=bool(live), encoders=len(live), readback_ms=round(self.readback_ms, 3),
                     dropped=sum(s.writer.dropped for s in live if s.writer is not None),
-                    fps=max((s.fps for s in live), default=0), res=self.settings["res"])
+                    fps=max((s.fps for s in live), default=0), res=self.settings["res"],
+                    encoder=encs[0] if encs else None,
+                    cpu_encode=any(e is not None and e != "h264_nvenc" for e in encs))
 
     # -- helpers
     def notice(self, msg, level="info"):
@@ -934,36 +1186,10 @@ class Recorder:
                 pass
 
     def _mux(self, video, pcm, out, logpath, pad=False, concat=False):
-        if not self.ffmpeg:
-            return False
-        tmp = out.with_name(out.stem + ".muxing.mp4")
-        try:
-            with open(logpath, "ab") as lg:
-                p = self.popen(mux_cmd(self.ffmpeg, video, pcm, tmp, pad=pad, concat=concat), stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=lg, creationflags=_FLAGS)
-                rc = p.wait(timeout=1800)
-            if rc == 0 and tmp.exists() and tmp.stat().st_size > 0:
-                os.replace(tmp, out)
-                return True
-        except Exception as ex:
-            self._log(f"[rec] mux error: {ex}")
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return False
+        return run_mux(self.ffmpeg, self.popen, video, pcm, out, logpath, pad=pad, concat=concat, log=self._log)
 
     def _index_add(self, name, secs, s):
-        p = self.dir / ".index.json"
-        try:
-            idx = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            idx = {}
-        idx[name] = dict(secs=round(secs, 2), fps=s.get("fps"), source=s.get("source"), audio=s.get("audio"))
-        try:
-            p.write_text(json.dumps(idx), encoding="utf-8")
-        except Exception:
-            pass
+        index_add(self.dir, name, secs, s)
         self._recent_t = -1e9
 
     def recent(self, n=8):
@@ -998,6 +1224,10 @@ class Recorder:
             return
         op = c["op"]
         if op == "toggle":
+            now = self.clock()
+            if now - self._toggle_t < TOGGLE_DEBOUNCE:      # a CC / pad / key bounce must not start + stop + start
+                return
+            self._toggle_t = now
             self.stop() if self.active else self.start()
         elif op == "start":
             self.start()
@@ -1025,11 +1255,15 @@ class Recorder:
                 self._stop_session(self.replay)
                 self.replay = None
 
-    def _disk_ok(self):
+    def _free(self):
         try:
-            return self.disk_free(self.dir) >= STOP_FREE
+            return self.disk_free(self.dir)
         except Exception:
-            return True
+            return None
+
+    def _disk_ok(self):
+        free = self._free()
+        return free is None or free >= STOP_FREE
 
     def start(self, seconds=None):
         if self.active:
@@ -1053,7 +1287,11 @@ class Recorder:
             self.auto_stop_at = None
         elif s.kind == "file":
             extra = f", audio {s.s['audio']}" if s.with_audio else ", no audio"
-            self.notice(f"recording {s.name} ({s.source}, {s.fps} fps, {s.s['res']}, {s.encoder}{extra})", "info")
+            if s.encoder != "h264_nvenc":                   # M4: say it loudly, the CPU path heats the laptop
+                self.notice(f"recording {s.name} on the CPU ({s.encoder}): NVENC is not available. Expect more heat "
+                            f"and dropped frames; DRAFT quality / 30 fps help", "warn")
+            else:
+                self.notice(f"recording {s.name} ({s.source}, {s.fps} fps, {s.s['res']}, {s.encoder}{extra})", "info")
 
     def _start_replay(self):
         if not self._disk_ok():
@@ -1066,17 +1304,16 @@ class Recorder:
         else:
             s.start()
 
-    def _stop_session(self, s, error=None, wait=False):
+    def _stop_session(self, s, error=None):
         if s is None:
             return
-        s.stop(error=error, wait=wait)
+        s.stop(error=error)
         self.finishing.append(s)
 
-    def stop(self, error=None, wait=False):
+    def stop(self, error=None):
         if self.rec is None or self.rec.stopping:
             return
-        s = self.rec
-        self._stop_session(s, error=error, wait=wait)
+        self._stop_session(self.rec, error=error)
         self.auto_stop_at = None
 
     def save_replay(self):
@@ -1130,34 +1367,31 @@ class Recorder:
         except Exception as ex:
             self.notice(f"replay save failed: {ex}", "error")
 
-    # -- crash recovery: parts left by a hard kill -> finished MP4s
+    # -- crash recovery: parts left by a hard kill / an exit -> finished MP4s
     def recover(self, wait=False):
         def work():
-            if self.replay is None:                               # a replay ring left by a hard kill: just space
-                shutil.rmtree(self.dir / ".replay", ignore_errors=True)
+            rb = self.dir / ".replay"                         # replay rings left by a hard kill: just space
+            if rb.is_dir():
+                mine = self.replay.parts if self.replay is not None else None
+                for d in rb.iterdir():
+                    if d != mine:
+                        shutil.rmtree(d, ignore_errors=True)
             base = self.dir / ".parts"
             if not base.is_dir():
                 return
-            live = {s.parts for s in (self.rec, self.replay) if s is not None}
+            live = {s.parts for s in [self.rec, self.replay] + self.finishing if s is not None and not s.done}
             for d in sorted(base.iterdir()):
                 if not d.is_dir() or d in live or d.name.startswith("replay_"):
                     continue
                 try:
-                    meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
-                    name = meta.get("name") or f"{d.name}.mp4"
-                    video, pcm = d / "video.mp4", d / "audio.pcm"
-                    if not video.exists() or video.stat().st_size == 0:
-                        shutil.rmtree(d, ignore_errors=True)
-                        continue
-                    out = self.dir / name
-                    use_pcm = pcm if meta.get("audio") and pcm.exists() and pcm.stat().st_size > 0 else None
-                    if self._mux(video, use_pcm, out, d / "ffmpeg.log", pad=True) or \
-                            (use_pcm and self._mux(video, None, out, d / "ffmpeg.log")):
-                        shutil.rmtree(d, ignore_errors=True)
-                        self._index_add(name, 0.0, meta)
-                        self.notice(f"recovered {name} from an interrupted recording", "warn")
+                    status, msg, _ = finalize_parts(d, self.ffmpeg, self.popen, self.disk_free, self._log)
+                    if status == "ok":
+                        self.notice(f"recovered an interrupted recording: {msg}", "warn")
+                    elif status in ("failed", "nospace"):
+                        self.notice(msg, "warn")
                 except Exception as ex:
                     self._log(f"[rec] could not recover {d.name}: {ex}")
+            self._recent_t = -1e9
         if wait:
             work()
         else:
@@ -1166,10 +1400,12 @@ class Recorder:
     # -- the render-thread hook
     def frame(self, readers, t=None):
         """Call once per rendered frame, after the output pass (before swap). readers: {"program": reader,
-        "projector": reader}; a reader is whatever the capture object understands plus its (w, h)."""
+        "projector": reader}; a reader is whatever the capture object understands plus its (w, h). A reader with a
+        0 x 0 size (minimised window) counts as absent: the writer keeps time with the last frame."""
+        readers = {k: r for k, r in readers.items()
+                   if r is not None and int(r[1][0]) > 0 and int(r[1][1]) > 0}
         for src, r in readers.items():
-            if r is not None:
-                self._sizes[src] = tuple(r[1])
+            self._sizes[src] = tuple(r[1])
         live = [s for s in (self.rec, self.replay) if s is not None and s.ready and not s.stopping]
         cap = self.capture
         if not live and not (cap is not None and getattr(cap, "pending", None)):
@@ -1208,19 +1444,19 @@ class Recorder:
                 self.stop()
         if t - self._disk_t >= 1.0 and (self.active or self.replay_active):
             self._disk_t = t
-            try:
-                free = self.disk_free(self.dir)
-            except Exception:
-                free = None
-            if free is not None and free < STOP_FREE:
-                self.notice(f"disk almost full ({free / 2 ** 20:.0f} MB free): recording stopped", "error")
+            free = self._free()
+            part = self.rec.part_bytes() if self.active else 0      # H3: the stop-time mux needs a full copy
+            if free is not None and free < STOP_FREE + part:
+                self.notice(f"disk almost full ({free / 2 ** 20:.0f} MB free, the MP4 needs "
+                            f"{part / 2 ** 20:.0f} MB more): recording stopped", "error")
                 self.stop(error="disk full")
                 if self.replay is not None:
                     self._stop_session(self.replay)
                     self.replay = None
-            elif free is not None and free < WARN_FREE and not self._warned:
+            elif free is not None and free < WARN_FREE + part and not self._warned:
                 self._warned = True
-                self.notice(f"low disk space: {free / 2 ** 30:.1f} GB free (recording stops at 0.5 GB)", "warn")
+                self.notice(f"low disk space: {free / 2 ** 30:.1f} GB free (recording stops at 0.5 GB + the "
+                            f"size of the recording)", "warn")
 
     def auto_pending(self):
         """Headless --record-seconds: True until the timed recording has stopped and been written."""
@@ -1231,6 +1467,7 @@ class Recorder:
         st = dict(active=s is not None, starting=bool(s is not None and not s.ready),
                   elapsed=round(s.elapsed(), 1) if s else 0.0, mb=round(s.mb(), 1) if s else 0.0,
                   file=s.name if s else None, encoder=getattr(s, "encoder", None) if s else None,
+                  cpu_encode=bool(s and getattr(s, "encoder", None) not in (None, "h264_nvenc")),
                   dropped=s.writer.dropped if s and s.writer else 0,
                   settings=dict(self.settings), folder=str(self.dir.resolve()),
                   replay=dict(on=self.replay_active, ready=bool(self.replay and self.replay.ready),
@@ -1239,27 +1476,77 @@ class Recorder:
                   notice=self._notice, recent=self.recent())
         return st
 
-    def close(self, wait=True):
-        """Show exit / crash unwinding: finalize everything (the MP4 is written before this returns when wait)."""
+    def close(self, crash=False, budget=4.0):
+        """Show exit / crash unwinding. Bounded (about `budget` s): the encoder is closed so the fragmented MP4 on
+        disk is complete, the audio file is closed, and nothing is muxed here. Clean exit: a detached process muxes
+        the parts into the final MP4 (the window closes at once). Crash: nothing more; the next start's recover()
+        finishes it. Never blocks on a long mux (H2)."""
+        t_end = time.monotonic() + budget
         self.auto_stop_at = None
         for th in list(self.bg):                          # a session that is still starting
-            th.join(10)
-        if self.capture is not None and getattr(self.capture, "pending", None):
+            th.join(max(0.0, min(1.0, t_end - time.monotonic())))
+        if self.capture is not None and getattr(self.capture, "pending", None) and not crash:
             try:                                          # frames still in the readback ring go in first
                 for (tc, data, size, tag) in self.capture.collect(force=True):
                     for s, slot in (tag or ()):
                         s.offer(slot, data, size)
             except Exception:
                 pass
-        if self.rec is not None and not self.rec.stopping:
-            self._stop_session(self.rec)
-        if self.replay is not None:
-            self._stop_session(self.replay)
-            self.replay = None
-        if wait:
-            end = time.time() + 120
-            while time.time() < end and self.busy():
-                time.sleep(0.02)
+        sessions = [s for s in [self.rec, self.replay] + list(self.finishing) if s is not None]
+        seen, handed = set(), []
+        for s in sessions:
+            if id(s) in seen:
+                continue
+            seen.add(id(s))
+            s.handoff = True
+            if s.done or s.failed:
+                continue
+            with s._lock:
+                was_stopping = s.stopping
+                s.stopping = True
+                if s.t_end is None:
+                    s.t_end = self.clock()
+            if not s.ready:
+                continue
+            for p in list(s.mux_procs):                   # a stop-time mux still running: kill it, retry detached
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            left = max(0.5, t_end - time.monotonic())
+            if not was_stopping:                          # still recording: close it here, bounded
+                s.total = max(s.cfr.last + 1, int(round((s.t_end - s.t0) * s.fps)), 1)
+                s.writer.finish(s.total)
+                try:
+                    s.seal(timeout=left, abort=crash or s.kind == "replay")
+                except Exception as ex:
+                    self._log(f"[rec] seal failed: {ex}")
+            else:                                         # its finalize thread is running: hurry it, bounded
+                if crash or not s.sealed:
+                    s.writer.abort()
+                for th in s.threads:
+                    if th.name == "rec-finalize" and th is not threading.current_thread():
+                        th.join(max(0.1, min(left, 2.0)))
+                        if th.is_alive() and not s.sealed:
+                            try:
+                                s.proc.kill()
+                            except Exception:
+                                pass
+            if s.kind == "replay":
+                shutil.rmtree(s.parts, ignore_errors=True)
+            elif s.parts.exists():
+                handed.append(s)
+            s.done = True
+        self.rec = self.replay = None
+        for s in handed:
+            if crash:
+                self._log(f"[rec] {s.name}: left in {s.parts}; finished at the next start")
+            else:
+                self._log(f"[rec] saving {s.name} in the background (a separate process finishes the MP4)")
+                try:
+                    self.spawn(s.parts)
+                except Exception as ex:
+                    self._log(f"[rec] could not start the finisher ({ex}); finished at the next start")
         if self.capture is not None:
             try:
                 self.capture.release()
@@ -1294,3 +1581,13 @@ def for_engine(ctx, engine_audio, program_size, args=None, headless=False, folde
     if secs is not None:
         r.start(seconds=secs or None)
     return r
+
+
+if __name__ == "__main__":                                  # detached finisher: python recorder.py --finalize <parts>
+    import argparse
+    _ap = argparse.ArgumentParser(description="finish an interrupted / handed-off recording")
+    _ap.add_argument("--finalize", required=True, metavar="PARTS_DIR")
+    _a = _ap.parse_args()
+    _st, _msg, _ = finalize_parts(_a.finalize, find_ffmpeg(), wait_lock=60.0)
+    print(f"[rec] {_st}: {_msg}")
+    sys.exit(0 if _st in ("ok", "empty") else 1)

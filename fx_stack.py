@@ -1,4 +1,5 @@
-"""TouchVDMX merge: effects ported from the outside browser prototype into THIS engine (one engine, one panel).
+"""TouchVDMX merge: effects reimplemented in THIS engine (one engine, one panel) after a browser prototype that the
+project owner generated with their own Gemini session (not distributed; provenance: THIRD_PARTY_NOTICES.md 1.4).
 
     lp = LandPass(ctx, out_size=(1280, 800))
     tex = lp.render(frame.values, frame.clock, t, travel_z, dt, palette_rgb, bands)   # moderngl.Texture, RGBA8
@@ -67,6 +68,8 @@ uniform vec3 pal[5];
 const float TAU = 6.2831853, PI = 3.14159265;
 
 mat2 rot2(float a){ float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+// hash12: "Hash without Sine", Copyright (c) 2014 David Hoskins, MIT License (full text: THIRD_PARTY_NOTICES.md)
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
 vec3 palC(float t){ t = fract(t)*5.0; int i = int(t); float k = fract(t); k = k*k*(3.0 - 2.0*k);
   return mix(pal[i % 5], pal[(i + 1) % 5], k); }
 vec2 polarFold(vec2 p, float n){
@@ -158,7 +161,7 @@ void main(){
       vec3 glass = palC(floor(uv.x)*0.13 + mod(floor(uv.y), 16.0)*0.1875 + pat*0.8 + uPal*2.0);
       if (uStyle < 0.5) col = glass*0.22 + palC(0.1 + uPal)*edge*1.45 + palC(0.5 + uPal)*smoothstep(0.12, 0.0, pat)*0.5;
       else {                                             // backlit cells, about a third left dark (black = no light)
-        float lit = step(0.34, fract(sin(dot(vec2(floor(uv.x), mod(floor(uv.y), 32.0)), vec2(12.9898, 78.233)))*43758.5453));
+        float lit = step(0.34, hash12(vec2(floor(uv.x), mod(floor(uv.y), 32.0))));
         col = glass*lead*(0.12 + 0.78*lit)*smoothstep(0.30, 0.0, pat - 0.06) + vec3(1.0, 0.9, 0.7)*edge*0.5;
       }
       col *= (0.85 + uLow*0.55)*exp(-t*0.07);
@@ -173,6 +176,8 @@ void main(){
 
 # ---- 2: prismatic stained-glass vortex
 VORTEX_FS = HEADER + """
+// hash2 and the animated-feature-point cell search in voronoiGlass follow Inigo Quilez's Voronoi shaders,
+// Copyright (c) 2013 Inigo Quilez, MIT License (full text: THIRD_PARTY_NOTICES.md)
 vec2 hash2(vec2 p){ return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3))))*43758.5453); }
 vec3 voronoiGlass(vec2 x, float per){               // per: cells around the funnel, so the seam closes
   vec2 n = floor(x), f = fract(x), cid = vec2(0.0);
@@ -216,13 +221,22 @@ void main(){
 
 # ---- 3: hexagonal honeycomb domes
 HEX_FS = HEADER + """
+// Pointy-top hexagon lattice, apothem 0.5 (neighbouring centres 1 apart; rows sqrt(3)/2 apart, odd rows shifted by 0.5).
+// Written from the lattice geometry: p -> fractional axial coordinates (a, b) with p = a*(1, 0) + b*(1/2, sqrt(3)/2),
+// cube-coordinate rounding (a + b + c = 0: round all three, then re-derive the one with the largest rounding error),
+// back to the cell centre. Edge distance = apothem minus the largest projection of the local offset onto the three
+// edge normals (0, 60, 120 degrees). Returns (distance to the cell edge, distance to the centre, centre xy).
 vec4 hexGrid(vec2 p){
-  vec2 r = vec2(1.0, 1.7320508), hh = r*0.5;
-  vec2 a = mod(p, r) - hh, b = mod(p - hh, r) - hh;
-  vec2 gv = dot(a, a) < dot(b, b) ? a : b;
-  float edge = 0.5 - max(abs(gv.x), dot(abs(gv), normalize(r)));
-  vec2 id = p - gv;
-  return vec4(edge, length(gv), id); }
+  const float S3 = 1.7320508;
+  float fb = p.y*(2.0/S3), fa = p.x - 0.5*fb, fc = -fa - fb;
+  vec3 c = vec3(floor(fa + 0.5), floor(fb + 0.5), floor(fc + 0.5));
+  vec3 err = abs(c - vec3(fa, fb, fc));
+  if (err.x > err.y && err.x > err.z) c.x = -c.y - c.z;
+  else if (err.y > err.z) c.y = -c.x - c.z;
+  vec2 ctr = vec2(c.x + 0.5*c.y, 0.5*S3*c.y);
+  vec2 lo = p - ctr, al = abs(lo);
+  float edge = 0.5 - max(al.x, 0.5*al.x + 0.5*S3*al.y);
+  return vec4(edge, length(lo), ctr); }
 
 void main(){
   vec3 ro = uCam, rd = rayDir(v_uv), col = vec3(0.0);
@@ -247,7 +261,7 @@ void main(){
       vec4 hx = hexGrid(suv + vec2(uSh, 0.0));
       float rim = smoothstep(0.08, 0.015, hx.x), cell = smoothstep(0.02, 0.14, hx.x), star = smoothstep(0.18, 0.04, hx.y);
       vec2 cid = vec2(mod(hx.z - uSh, nx), hx.w);
-      float ch = fract(sin(dot(floor(cid*2.0 + 0.5), vec2(12.9898, 78.233)))*43758.5453);
+      float ch = hash12(floor(cid*2.0 + 0.5));
       vec3 cc = palC(ch*0.85 + hx.y*0.5 + uPal*2.0);
       col = cc*cell*(0.35 + star*1.1)*step(0.45, ch + star*0.6) + mix(cc, vec3(1.0, 0.88, 0.45), 0.5)*rim*(0.55 + uHigh*0.7);
       col *= (0.85 + uMid*0.5)*exp(-t*0.07);
@@ -261,6 +275,92 @@ void main(){
 """
 
 LAND_FS = [CORRIDOR_FS, TORUS_FS, VORTEX_FS, HEX_FS]
+
+# ---- environment skins (materials.py). The ORIGINAL programs above are what runs while every slot is procedural
+# (pixel-identical, zero extra cost). A world with a skinned slot draws with a second program: the same source with
+# the materials chunk in the header and ONE block pasted next to the line that sets the surface colour.
+try:
+    import materials as _mat
+except Exception:                                  # the module is optional: without it the decks are as they were
+    _mat = None
+
+# The skin runs AFTER the march loop: inside the loop the hook only RECORDS the hit (mapping inputs, normal, line
+# mask, shade, the world's own depth scale k); the fetch, the light, the mix and the overlay layers run once, after
+# the loop. Code inside the loop body costs registers for all ~46 march steps (occupancy), code after it does not.
+# f = one pixel's footprint on the surface (grown with distance: far detail is filtered a little harder than
+# strictly needed, which is what stops far-wall sparkle), zr = distance along the travel axis
+_SK_PX = "float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t), zr = p.z - uCam.z;"
+SKIN_DECL_ANCHOR = "  vec3 ro = uCam, rd = rayDir(v_uv), col = vec3(0.0);\n"
+SKIN_DECL = ("  int hkS = 0; float hkT = -1.0, hkI = 0.0, hkF = 0.0, hkLn = 0.0, hkSh = 1.0, hkLm = 1.0, hkK = 1.0;\n"
+             "  vec3 hkN = vec3(0.0, 0.0, 1.0), hkTN = hkN, hkP = vec3(0.0); vec2 hkUV = vec2(0.0), hkGX = hkUV, hkGY = hkUV;\n")
+SKIN_POST = """
+  if (hkT >= 0.0) {                                    // [skins] one hit recorded in the loop: skin it once, here
+    float mp = skB[hkS].x, lit = skLight(hkN, rd, hkT, hkI)*hkLm; vec3 S;
+    if (mp > 1.5) S = skTap(hkS, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0) + hkN.xy*0.35, vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
+    else if (mp > 0.5) S = skTri(hkS, hkP, hkTN, hkF);
+    else S = skTap(hkS, hkUV, hkGX, hkGY);
+    col = skMix(hkS, col/hkK, S, hkLn, hkSh*lit)*hkK;
+  }"""
+SKIN_HOOKS = [
+    # corridor: slot 0 = the vault, slot 1 = floor + ceiling
+    ("      col = mix(pc*facets*0.55, mix(pc*1.5, vec3(1.0, 0.86, 0.5), 0.4), lines);\n", """
+      { bool fl = (1.65 - abs(p.y)) < (rad - length(p.xy)); int s = fl ? 1 : 0;
+        if (skA[s].w > 0.0005) {
+          """ + _SK_PX + """
+          hkS = s; hkT = t; hkI = float(i); hkF = f; hkLn = lines; hkSh = 0.66 + 0.34*facets; hkK = (0.85 + uMid*0.65)*exp(-t*0.06);
+          hkN = fl ? vec3(0.0, -sign(p.y), 0.0) : vec3(-normalize(p.xy), 0.0); hkTN = hkN; hkP = vec3(p.xy, zr);
+          if (fl) { hkUV = vec2(p.x + step(0.0, p.y)*1.7, zr); hkGX = vec2(f, 0.0); hkGY = vec2(0.0, f*clamp(t/1.65, 1.0, 64.0)); }
+          else { hkUV = vec2(ang/TAU, zr); hkGX = vec2(f/(TAU*rad), 0.0); hkGY = vec2(0.0, f*clamp(t/rad, 1.0, 64.0)); }
+        } }
+""", "after"),
+    # torus: slot 0 = the tube, slot 1 = the torus side chambers
+    ("      col *= (0.85 + uLow*0.55)*exp(-t*0.07);\n", """
+      { int s = dTor > dTube ? 1 : 0;
+        if (skA[s].w > 0.0005) {
+          """ + _SK_PX + """
+          hkS = s; hkT = t; hkI = float(i); hkF = f; hkLn = edge; hkSh = 0.60 + 0.40*lead; hkK = (0.85 + uLow*0.55)*exp(-t*0.07);
+          hkN = vec3(-normalize(q.xy - (s == 0 ? ctr : vec2(0.0))), 0.0); hkTN = hkN; hkP = vec3(q.xy, zr);
+          hkUV = vec2(atan(q.y, q.x)/TAU, zr); hkGX = vec2(f/(TAU*1.9), 0.0); hkGY = vec2(0.0, f*clamp(t/1.9, 1.0, 64.0));
+        } }
+""", "before"),
+    # vortex: the stained-glass panes are the "lines" (the lead between them stays dark)
+    ("      col *= exp(-t*0.06);\n", """
+      if (skA[0].w > 0.0005) {
+        """ + _SK_PX + """
+        hkS = 0; hkT = t; hkI = float(i); hkF = f; hkLn = 1.0 - lead; hkK = exp(-t*0.06);   // lines = the lead network
+        hkSh = (0.40 + 0.60*lead)*(1.0 - 0.35*smoothstep(0.1, 0.6, vG.x));
+        hkN = vec3(-normalize(p.xy), 0.0); hkTN = hkN; hkP = vec3(p.xy, zr);
+        hkUV = vec2(ang/TAU, zr); hkGX = vec2(f/(TAU*1.9), 0.0); hkGY = vec2(0.0, f*clamp(t/1.9, 1.0, 64.0));
+      }
+""", "before"),
+    # hex domes: ONE image per honeycomb cell (cell-local coordinates: no polar stretch, the rims hide the joins);
+    # the domes are fixed in the world, so there is no travel follow
+    ("      col *= (0.85 + uMid*0.5)*exp(-t*0.07);\n", """
+      if (skA[0].w > 0.0005) {
+        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t);
+        hkS = 0; hkT = t; hkI = float(i); hkF = f; hkLn = rim; hkSh = 0.50 + 0.50*cell; hkK = (0.85 + uMid*0.5)*exp(-t*0.07);
+        hkN = -n*sign(dot(n, -rd) + 1e-4); hkTN = n; hkP = q;
+        hkLm = smoothstep(0.0, 0.15, abs(dot(n, rd)));   // silhouettes fall to black
+        hkUV = suv + vec2(uSh, 0.0) - hx.zw + 0.5 + vec2(ch, fract(ch*7.31))*4.0; hkGX = vec2(f*nx/(TAU*2.4), 0.0); hkGY = vec2(0.0, f*ny/(PI*2.65));
+      }
+""", "before"),
+]
+GLOW_ANCHOR = "\n  col += palC("          # each world adds its own coloured haze once, after the march
+
+
+def skinned_source(mode):
+    """LAND_FS[mode] with the skin chunk, the declarations, the in-loop recorder and the post-loop skin block.
+    Raises if an anchor moved (a test pins this)."""
+    anchor, add, where = SKIN_HOOKS[mode]
+    fs = LAND_FS[mode]
+    if fs.count(anchor) != 1 or fs.count(HEADER) != 1:
+        raise ValueError(f"skin hook anchor not found in landscape {mode}")
+    if fs.count(GLOW_ANCHOR) != 1 or fs.count(SKIN_DECL_ANCHOR) != 1:
+        raise ValueError(f"glow / declaration anchor not found in landscape {mode}")
+    fs = fs.replace(HEADER, HEADER + _mat.GLSL)
+    fs = fs.replace(SKIN_DECL_ANCHOR, SKIN_DECL_ANCHOR + SKIN_DECL)
+    fs = fs.replace(GLOW_ANCHOR, SKIN_POST + "\n  col += skDim*palC(")   # a skinned surface dims the world's coloured haze
+    return fs.replace(anchor, add + anchor if where == "before" else anchor + add)
 
 TRAIL_FS = """
 #version 330
@@ -437,6 +537,13 @@ class LandPass:
         self._quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
         self._progs = [ctx.program(vertex_shader=VS, fragment_shader=fs) for fs in LAND_FS]
         self._vaos = [ctx.vertex_array(p, [(self._quad, "2f", "in_pos")]) for p in self._progs]
+        # environment skins are INACTIVE by default: nothing is compiled or allocated for them here. Setting `skins`
+        # to a materials.SkinEngine (the engine does that when the performer switches skins on) compiles the four
+        # skinned programs, once; a failed compile is remembered and the decks stay procedural.
+        self._skins = None
+        self.skinned_decks = 0               # decks drawn with a skinned program by the last render()
+        self._sprogs, self._svaos = [None] * len(LAND_FS), [None] * len(LAND_FS)
+        self.skin_programs = None            # None = not compiled yet, True = ready, False = failed (not retried)
         self._trail = ctx.program(vertex_shader=VS, fragment_shader=TRAIL_FS)
         self._trail_vao = ctx.vertex_array(self._trail, [(self._quad, "2f", "in_pos")])
         self._comp = ctx.program(vertex_shader=VS, fragment_shader=COMP_FS)
@@ -466,6 +573,24 @@ class LandPass:
             self._gl, self._gl_enums = _ml._gl_lib(), (_ml._GL_BLEND, _ml._GL_BLEND_ENUMS, _ml.gl_get_int)
         except Exception:
             self._gl = None
+
+    @property
+    def skins(self):
+        return self._skins
+
+    @skins.setter
+    def skins(self, engine):
+        self._skins = engine
+        if engine is None or self.skin_programs is not None or _mat is None:
+            return
+        try:
+            self._sprogs = [self.ctx.program(vertex_shader=VS, fragment_shader=skinned_source(i)) for i in range(len(LAND_FS))]
+            self._svaos = [self.ctx.vertex_array(p, [(self._quad, "2f", "in_pos")]) for p in self._sprogs]
+            self.skin_programs = True
+        except Exception as ex:
+            print(f"[skins] landscape skins disabled (shader did not compile): {str(ex)[:300]}")
+            self._sprogs, self._svaos = [None] * len(LAND_FS), [None] * len(LAND_FS)
+            self.skin_programs = False
 
     # ---- resources
     def _ensure(self, w, h):
@@ -499,7 +624,7 @@ class LandPass:
 
     def release(self):
         self._free_targets()
-        for o in (self._vaos + self._progs + [self._trail_vao, self._trail, self._comp_vao, self._comp, self._svao,
+        for o in ([x for x in self._svaos + self._sprogs if x is not None] + self._vaos + self._progs + [self._trail_vao, self._trail, self._comp_vao, self._comp, self._svao,
                                               self._sprog, self._sbuf, self._quad]):
             o.release()
         self._vaos, self._progs, self._size = [], [], None
@@ -535,6 +660,14 @@ class LandPass:
         if cam == 2:
             self._roll = (self._roll + dt * (0.18 + bands[1] * 0.6)) % TAU
         self._spin = (self._spin + dt * _f(v, "spin") * self.spin_rate) % TAU       # used unless spin_phase is given
+        sk = self._skins
+        if sk is not None and dzc:                                    # skins stay on their wall while the camera flies
+            ea = _mat.LAND_ENVS[_idx(v, "land_a", 3)]
+            eb = _mat.LAND_ENVS[_idx(v, "land_b", 3)]
+            if sk.active(ea):
+                sk.advance(ea, dzc)
+            if eb != ea and sk.active(eb):
+                sk.advance(eb, dzc)
         return dt, cam
 
     def _camera(self, v, cam, spin_phase=None):
@@ -559,7 +692,12 @@ class LandPass:
         return (x, y, self._z + 4.5 * punch), camera_matrix(yaw, pitch, roll), min(fov, 150.0)
 
     def _deck(self, which, mode, v, cam_pos, cam_mat, fov, bands, warp_tex, warp):
-        prog = self._progs[mode]
+        prog, vao = self._progs[mode], self._vaos[mode]
+        sk = self._skins
+        if sk is not None and self._sprogs[mode] is not None and sk.active(_mat.LAND_ENVS[mode]):
+            prog, vao = self._sprogs[mode], self._svaos[mode]         # only a world with a skinned slot pays for skins
+            sk.bind(prog, _mat.LAND_ENVS[mode])
+            self.skinned_decks += 1
         w, h = self._size
         folds, ph, k = float(min(max(round(_f(v, "folds", 8.0)), 3), 16)), self._ph, min(mode, 2)
         nx = math.floor(max(folds * 2.0, 12.0) + 0.5)                 # hex cells around the dome (as in HEX_FS)
@@ -582,7 +720,7 @@ class LandPass:
             warp_tex.use(0)
         self._fbo[which].use()
         self.ctx.viewport = (0, 0, w, h)
-        self._vaos[mode].render(moderngl.TRIANGLE_STRIP)
+        vao.render(moderngl.TRIANGLE_STRIP)
 
     def _swarm_pass(self, v, dt, cam_mat, fov, bands):
         w, h = self.swarm_size
@@ -647,7 +785,7 @@ class LandPass:
             en, enums, get = self._gl_enums
             blend_on = bool(self._gl.glIsEnabled(en))
             blend_state = [get(self._gl, e) for e in enums]
-        self.decks_rendered, self.swarm_rendered = 0, False
+        self.decks_rendered, self.swarm_rendered, self.skinned_decks = 0, False, 0
         try:
             ctx.viewport = (0, 0, w, h)
             ctx.disable(moderngl.BLEND)
@@ -682,7 +820,8 @@ class LandPass:
             c = self._comp
             c["texA"].value, c["texB"].value, c["texS"].value = 0, 1, 2
             c["uX"].value, c["uLand"].value, c["uSwarm"].value = x, land if land > 0.001 else 0.0, swarm if stex else 0.0
-            c["uDisp"].value = min(max(_f(v, "land_disp"), 0.0), 1.0)
+            # the radial prism split turns fine image detail into rainbow mush: much gentler while a deck is skinned
+            c["uDisp"].value = min(max(_f(v, "land_disp"), 0.0), 1.0) * (0.35 if self.skinned_decks else 1.0)
             c["uHasB"].value = 1.0 if has_b else 0.0
             c["uBlend"].value = _idx(v, "land_blend", 7)
             c["uRaw"].value = 1.0 if self.debug_raw else 0.0
@@ -780,6 +919,19 @@ class PreviewTap:
     def capture(self, tex, sink, wait=False):
         """Read `tex` now and hand the JPEG to sink(bytes) from a worker thread. Skips if an encode is running."""
         return self._grab(lambda: self.read(tex), sink, wait, False)
+
+    def snap(self, tex, sink):
+        """One picture of `tex` for a caller that is not the panel monitor (the ONLINE assistant's SEE THE OUTPUT):
+        a small blit + a readback into the pixel buffer NOW (no GPU stall), the bytes collected by a later
+        collect() and JPEG-encoded on a worker thread, then sink(bytes). False if one is still in flight."""
+        self.collect()
+        if self._pending is not None or self._busy.locked():
+            return False
+        self._blit(tex)
+        self._fbo.read_into(self._pbo, components=3)
+        self._pending = (sink, False)
+        self.captures += 1
+        return True
 
     # ---- preview-only layer mix: the scene shader drawn once more, small, with some layers muted
     def render_mix(self, scene_prog, scene_vao, uni, mask, bright=False):

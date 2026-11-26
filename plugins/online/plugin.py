@@ -3,18 +3,25 @@ closed (worker threads stopped, child processes killed) when it goes OFF. Import
 subprocess-capable code reachable; control.py never imports it directly.
 """
 import os
+import threading
 import time
 from pathlib import Path
 
 from . import protocol
 from .assistant import Assistant, OnlineLog
 from .backends import AgyBackend, ClaudeBackend
-from .images import AgyImageProvider, GeminiApiProvider, GeminiNanoProvider, KeyStore, NanoBanana
+from .images import AgyImageProvider, GeminiApiProvider, KeyStore, NanoBanana, default_key_path
+from .vision import GeminiChatBackend
 
 PRIVACY_NOTE = ("ONLINE is on: chat messages + the current settings go to the chosen assistant (Anthropic / Google); "
-                "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.")
-CLI_NOTE = ("Driving Google's CLIs (agy / gemini CLI) from other software may not be allowed by Antigravity's terms "
-            "(https://antigravity.google/terms): read them and decide before ticking this.")
+                "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply. With "
+                "\"Show the assistant the output\" one small picture of the output goes with that message.")
+CLI_NOTE = ("Allow Google CLI tools lets this plugin drive the agy CLI (chat, Nano Banana images, AUTO MAP vision) with "
+            "your agy login. agy is a coding AGENT: it runs in read-only plan mode inside a throw-away folder and is "
+            "told to answer only, but it is not a tool-less model. Antigravity's terms (antigravity.google/terms) may "
+            "not allow other software to drive the CLI: read them first. Off by default; can only be switched from a "
+            "panel opened on the laptop itself or in online_local.json.")
+AGY_CHAT_NOTE = "agy is opt-in: tick Allow Google CLI tools (on the laptop itself)."
 TEX_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 
@@ -35,44 +42,93 @@ def list_names(folder, cap=24, prefix=None):
 
 class OnlinePlugin:
     def __init__(self, root, art_dir=None, settings=None, backends=None, image_providers=None, log_dir="auto",
-                 tex_dir=None, snapshot=None, work_root=None, clock=time.monotonic, sync=False):
+                 tex_dir=None, snapshot=None, work_root=None, clock=time.monotonic, sync=False, keys_path=None):
         self.root = Path(root)
         self.tex_dir = Path(tex_dir) if tex_dir else self.root / "textures"
         self.art_dir = Path(art_dir) if art_dir else self.root / "art"
         s = dict(protocol.DEFAULTS, **(settings or {}))
         self.engine, self.cli_google = s["engine"], bool(s.get("cli_google"))
-        self.keys = KeyStore(self.root / "online_keys.json")
+        self._vision = None                                        # plugins.online.vision.Vision, one per session
+        self.keys = KeyStore(keys_path or default_key_path())      # outside the project folder
+        self.sync = bool(sync)
+        self._lists = ([], [])                                     # cached (textures, art), refreshed by _scan
+        self._scanning = threading.Lock()
+        self.notice = ""
         self._fixed_providers = image_providers is not None
         self.log = OnlineLog(self.root / "logs" if log_dir == "auto" else log_dir)
         work = Path(work_root) if work_root else self.root / "logs" / "online_work"
-        if backends is None:
-            backends = {"claude": ClaudeBackend(model=os.environ.get("ONLINE_CLAUDE_MODEL") or "sonnet"),
-                        "agy": AgyBackend(work, model=os.environ.get("ONLINE_AGY_MODEL") or None)}
+        if backends is None:                                       # Claude Code is the default; agy is opt-in
+            backends = {"claude": ClaudeBackend(work, model=os.environ.get("ONLINE_CLAUDE_MODEL") or "sonnet"),
+                        "agy": AgyBackend(model=os.environ.get("ONLINE_AGY_MODEL") or None),
+                        "gemini": GeminiChatBackend(self.keys)}           # the user's own key (AI DREAM tab)
         self.assistant = Assistant(backends, log=self.log, lister=self._lister, clock=clock, sync=sync,
                                    mode=s["mode"], backend=s["backend"])
         self.images = NanoBanana(self.tex_dir, Path(snapshot) if snapshot else self.root / "snapshots" / "current.png",
                                  work, providers=image_providers if self._fixed_providers else self._providers(),
                                  log=self.log, clock=clock, sync=sync)
-        self.assistant.optin = {} if self.cli_google else {"agy": CLI_NOTE}
+        self.assistant.blocked = {} if self.cli_google else {"agy": AGY_CHAT_NOTE}
+        self.assistant.rescan = self._scan_lists
+        self.assistant.capture = self._capture                     # SEE THE OUTPUT: one picture from the engine
+        self.images.rescan = self._scan_lists
         self.log.log("online", on=True, mode=s["mode"], backend=s["backend"], engine=s["engine"])
+        self.rescan()
+
+    @property
+    def snaps(self):
+        return self.assistant.snaps
+
+    @staticmethod
+    def _capture(ctl):
+        """GL thread: ask the engine for ONE picture of the guarded output (live_visuals `[online-see>`)."""
+        import control
+        ctl._out.append(control.passthrough("assist_snap"))
+        return True
+
+    def snapshot_in(self, jpg):
+        self.assistant.snapshot_in(jpg)
+
+    def snap_jpeg(self, i):
+        return self.assistant.snaps.get(i)
 
     def _lister(self):
-        return list_names(self.tex_dir), list_names(self.art_dir)
+        return self._lists                                         # cached: the render thread never lists folders
+
+    def _scan_lists(self):
+        self._lists = (list_names(self.tex_dir), list_names(self.art_dir))
+
+    def _scan(self):
+        """Everything that touches the disk or starts a process just to find out what is there: folder listings,
+        `claude --help` (flag check), shutil.which, the key file. Never on the render thread."""
+        with self._scanning:
+            try:
+                self._scan_lists()
+                self.keys.get()
+                self.images.refresh()
+                self.assistant.refresh()
+            except Exception:
+                pass
+
+    def rescan(self):
+        if self.sync:
+            self._scan()
+        else:
+            threading.Thread(target=self._scan, name="online-scan", daemon=True).start()
 
     def _providers(self):
-        """Recommended: the Gemini API with the user's own key. Google's CLIs only after the explicit opt-in."""
+        """Recommended: the Gemini API with the user's own key. The agy CLI only after the explicit local opt-in."""
         out = [GeminiApiProvider(self.keys)]
         if self.cli_google:
-            out += [GeminiNanoProvider(), AgyImageProvider()]
+            out.append(AgyImageProvider())
         return out
 
     def configure(self, s):
         self.assistant.mode, self.assistant.backend, self.engine = s["mode"], s["backend"], s["engine"]
         if bool(s.get("cli_google")) != self.cli_google:
             self.cli_google = bool(s.get("cli_google"))
-            self.assistant.optin = {} if self.cli_google else {"agy": CLI_NOTE}
+            self.assistant.blocked = {} if self.cli_google else {"agy": AGY_CHAT_NOTE}
             if not self._fixed_providers:
                 self.images.set_providers(self._providers())
+            self.rescan()
         self.log.log("settings", mode=s["mode"], backend=s["backend"], engine=s["engine"], cli_google=self.cli_google)
 
     # ---------------------------------------------------------------- hooks (GL thread)
@@ -80,7 +136,13 @@ class OnlinePlugin:
         op = c["op"]
         a = self.assistant
         if op == "ask":
-            a.ask(ctl, c["text"], c.get("backend"))
+            a.ask(ctl, c["text"], c.get("backend"), see_out=bool(c.get("see")), loop=int(c.get("loop", 0)))
+        elif op == "see_ok":
+            a.see_ok(ctl, c["id"])
+        elif op == "see_drop":
+            a.see_drop(c["id"])
+        elif op == "loop_stop":
+            a.loop_stop()
         elif op == "apply":
             a.apply(ctl, c["id"])
         elif op == "dismiss":
@@ -94,7 +156,7 @@ class OnlinePlugin:
             a.clear()
         elif op == "key":
             ok = self.keys.set(c["key"])
-            self.images.set_providers(self.images.providers)          # availability changed
+            self.rescan()                                             # availability changed
             self.log.log("key", saved=bool(c["key"]) and ok, forgotten=not c["key"])   # never the key itself
 
     def tick(self, ctl):
@@ -116,8 +178,13 @@ class OnlinePlugin:
     def cancel_gen(self):
         self.images.cancel()
 
+    def refused(self, what, why):
+        self.notice = f"{what} refused: {why}"
+        self.log.log("refused", what=what, why=why)
+
     def on_panic(self, ctl):
         self.assistant.on_panic()
+        self.images.cancel()                             # an image in flight must not cross-fade in after PANIC
         s = protocol.settings(ctl)
         s["mode"] = "suggest"
         ctl.ext["online"] = s
@@ -125,7 +192,8 @@ class OnlinePlugin:
     def state(self):
         st = self.assistant.state()
         st.update(on=True, engine=self.engine, nano=self.images.state(), privacy=PRIVACY_NOTE,
-                  cli_google=self.cli_google, cli_note=CLI_NOTE, has_key=self.keys.has())
+                  cli_google=self.cli_google, cli_note=CLI_NOTE, has_key=bool(self.keys._key),
+                  agy_chat=AGY_CHAT_NOTE, notice=self.notice)
         return st
 
     def close(self):

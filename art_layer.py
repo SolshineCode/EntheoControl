@@ -457,7 +457,8 @@ uniform float u_mix, u_wA, u_wB, u_asp, u_t;
 uniform float u_twirl, u_fold, u_folds, u_foldrot, u_droste, u_dls, u_dzoom, u_feather;
 const float PI = 3.14159265, TAU = 6.2831853;
 
-float hash21(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+// hash21 = hash12 of "Hash without Sine", Copyright (c) 2014 David Hoskins, MIT License (THIRD_PARTY_NOTICES.md)
+float hash21(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
 float vnoise(vec2 p){
   vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
   return mix(mix(hash21(i), hash21(i+vec2(1,0)), f.x), mix(hash21(i+vec2(0,1)), hash21(i+vec2(1,1)), f.x), f.y);
@@ -888,6 +889,34 @@ def _clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
+ART_MODES = ("relief", "stencil", "kaleido", "tunnel", "displace", "melt")   # index = art_use value
+ART_MIX = tuple("art_mix_" + m for m in ART_MODES)                            # their amounts while art_combine is on
+
+
+def _num(values, name, default=0.0):
+    try:
+        v = float(values.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def art_weights(values):
+    """-> (relief, stencil, kaleido, tunnel, displace, melt) amounts 0..1 for the compositor (uniform artW[6]).
+    art_combine off: one-hot from art_use (rounded floor(x + 0.5), exactly as the shader always did), so every
+    single mode renders as before; on: the six art_mix_* amounts, clamped."""
+    if _num(values, "art_combine") > 0.5:
+        return tuple(_clamp(_num(values, k), 0.0, 1.0) for k in ART_MIX)
+    use = int(_clamp(math.floor(_num(values, "art_use") + 0.5), 0, len(ART_MODES) - 1))
+    return tuple(1.0 if i == use else 0.0 for i in range(len(ART_MODES)))
+
+
+def mode_sets(use):
+    """What a mode button sets: art_use plus the amounts one-hot, so switching COMBINE on starts from that mode."""
+    use = int(_clamp(math.floor(_num(dict(u=use), "u") + 0.5), 0, len(ART_MODES) - 1))
+    return dict(art_use=float(use), **{k: (1.0 if i == use else 0.0) for i, k in enumerate(ART_MIX)})
+
+
 DISPLACERS = ("art_melt", "art_liquify", "art_slices", "art_smear")   # they move pixels: their sum is what turns to mush
 REMAPS = ("art_fold", "art_droste")                                   # structural: they re-map the picture, kept as set
 
@@ -1090,17 +1119,28 @@ class ArtPass:
                 self._busy = None
 
     def source(self, values, dt):
-        """Keep the library / uploads going without drawing the relief -> (colour texture, aspect) of the piece
-        on show, or None while there is none. For the compositor's other ways of using the image (art_use)."""
+        """Keep the library / uploads going without drawing the relief -> (colour texture, aspect, fade) of the
+        piece on show, or None while there is none. `fade` dips 1 -> 0 -> 1 through a piece switch (the texture
+        changes at the bottom of the dip), so the compositor's other ways of using the image never cut hard."""
         try:
             dt = _clamp(float(dt) if math.isfinite(float(dt)) else 0.0, 0.0, 0.25)
             self._update_library(values, dt)
+            self._hist_valid = 0                                   # the relief's slit-scan history is stale when it comes back
+            return self.current()
+        except Exception as ex:
+            self.stats["error"] = repr(ex)
+            return None
+
+    def current(self):
+        """(colour texture, aspect, fade) of the piece on show, or None; no library update and the relief's history
+        is kept. For combined art modes: render() ran the relief this frame, the flat modes use the same piece."""
+        try:
             key = self._b if (self._fading and self._b and self._mixv > 0.5) else self._a
             piece = self._cache.get(key) if key else None
             if piece is None and self._a:
                 piece = self._cache.get(self._a)
-            self._hist_valid = 0                                   # the relief's slit-scan history is stale when it comes back
-            return (piece.color, float(piece.aspect)) if piece is not None else None
+            fade = abs(2.0 * _clamp(self._mixv, 0.0, 1.0) - 1.0) if (self._fading and self._b) else 1.0
+            return (piece.color, float(piece.aspect), fade * fade * (3.0 - 2.0 * fade)) if piece is not None else None
         except Exception as ex:
             self.stats["error"] = repr(ex)
             return None

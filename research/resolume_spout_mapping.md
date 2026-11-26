@@ -51,7 +51,7 @@ Official docs: [https://resolume.com/support/en/syphon-and-spout](https://resolu
 4. Drag **`PsyProjector`** into any empty Clip Slot on a Layer and trigger it.
    - *Tip:* Set that clip's **Resize** mode to `Fill` or `Stretch` if the composition resolution differs from the Spout feed, and stack Resolume's built-in **Mirror / Kaleidoscope / Hue Rotate / Feedback** effects right on top!
 5. **Sending Spout OUT of Arena:** `Output → Texture Sharing (Spout)` (or assign a Virtual Screen to Spout inside Advanced Output) if you ever want to feed Resolume into TouchDesigner/StreamTurbo.
-6. **Hybrid-GPU (ThinkPad Optimus) Requirement:** Just like TouchDesigner, pin **both** `Arena.exe` and `.venv\Scripts\python.exe` to **High Performance (NVIDIA GTX 1650 Ti)** in *Windows Settings → System → Display → Graphics*, otherwise Spout frames will appear black.
+6. **Hybrid-GPU (Optimus laptop) Requirement:** Just like TouchDesigner, pin **both** `Arena.exe` and `.venv\Scripts\python.exe` to **High Performance (NVIDIA GTX 1650 Ti)** in *Windows Settings → System → Display → Graphics*, otherwise Spout frames will appear black.
 
 ---
 

@@ -70,7 +70,7 @@ PARAMS = {
     "trails":     (0.0, 0.98, 0.85, "color", "Trails"),
 
     # ---- layers (opacity)
-    "l_kene":     (0.0, 1.0, 1.0, "layers", "Kene patterns"),  # crawling labyrinth / Shipibo-Huni Kuin-inspired line fields
+    "l_kene":     (0.0, 1.0, 1.0, "layers", "Folding Blocks"),  # crawling stepped labyrinth (renamed 2026-11-25: it is NOT real kene; internal name kept for MIDI/state compat)
     "l_beads":    (0.0, 1.0, 0.7, "layers", "Beadwork"),
     "l_lines":    (0.0, 1.0, 0.5, "layers", "Sacred lines"),
     "l_ai":       (0.0, 1.0, 0.5, "layers", "AI textures"),
@@ -145,7 +145,7 @@ PARAMS = {
     # ---- beings layer (beings.BeingsPass), APPENDED 2026-11-25: living / supernatural creatures as luminous line-art.
     #      Off by default (l_beings 0 = the pass is not rendered). Form names: OPTIONS["being"] below.
     "l_beings":     (0.0, 1.0, 0.0, "layers", "Beings"),
-    "being":        (0.0, 16.0, 0.0, "beings", "Being"),        # rounded index into OPTIONS["being"]
+    "being":        (0.0, 17.0, 0.0, "beings", "Being"),        # rounded index into OPTIONS["being"]
     "being_count":  (1.0, 8.0, 3.0, "beings", "How many"),      # rounded
     "being_size":   (0.0, 1.0, 0.5, "beings", "Size"),
     "being_speed":  (0.0, 1.0, 0.4, "beings", "Speed"),         # travel + body rhythm (0 = they stay put, still breathing)
@@ -196,26 +196,247 @@ PARAMS = {
     "serpent_hue2":  (0.0, 1.0, 0.85, "motion", "Serpent hue 2 (tail)"),
     "serpent_sat":   (0.0, 1.0, 1.0, "motion", "Serpent colour depth"),
     "serpent_bright": (0.0, 2.0, 1.0, "motion", "Serpent brightness"),
+
+    # ---- math stack (stack.StackPass), APPENDED 2026-11-25: master amount of the hand-built procedural layers.
+    #      The layers themselves are structured state (control command "stack", see HANDOFF.md), not params.
+    #      Default 1 with an EMPTY stack: nothing is drawn (the pass is not even run), so the default look is unchanged.
+    "l_stack":       (0.0, 1.0, 1.0, "layers", "Math stack"),
+
+    # ---- post-FX filter chain (filters.FilterPass), APPENDED 2026-11-25. Display only, between the scene composite
+    #      and the brightness limiter, before mapping. Six ordered slots (flt_slotN = 0 empty, else 1 + index into
+    #      FILTER_TYPES); each filter type has its own amount + 2-3 params, so a MIDI knob / mod keeps its meaning
+    #      whatever slot the filter sits in. A type in two slots runs once (first slot). Every amount defaults to 0:
+    #      with nothing on, the pass is skipped entirely (zero cost, pixel-identical show). Names: OPTIONS below.
+    "flt_slot1":       (0.0, 10.0, 0.0, "filters", "Slot 1"),
+    "flt_slot2":       (0.0, 10.0, 0.0, "filters", "Slot 2"),
+    "flt_slot3":       (0.0, 10.0, 0.0, "filters", "Slot 3"),
+    "flt_slot4":       (0.0, 10.0, 0.0, "filters", "Slot 4"),
+    "flt_slot5":       (0.0, 10.0, 0.0, "filters", "Slot 5"),
+    "flt_slot6":       (0.0, 10.0, 0.0, "filters", "Slot 6"),
+    "flt_dream":       (0.0, 1.0, 0.0, "filters", "Deep dream"),
+    "flt_dream_scale": (0.0, 1.0, 0.5, "filters", "Dream motif size"),
+    "flt_dream_swirl": (0.0, 1.0, 0.5, "filters", "Dream swirl"),       # feedback flow + persistence (recursion)
+    "flt_dream_motif": (0.0, 1.0, 0.3, "filters", "Dream motifs"),      # 0 eyes .. 0.5 fur / dog-slugs .. 1 scales / arches
+    "flt_oil":         (0.0, 1.0, 0.0, "filters", "Oil paint"),
+    "flt_oil_size":    (0.0, 1.0, 0.5, "filters", "Brush size"),
+    "flt_oil_relief":  (0.0, 1.0, 0.4, "filters", "Impasto"),
+    "flt_halftone":    (0.0, 1.0, 0.0, "filters", "Halftone"),
+    "flt_ht_size":     (0.0, 1.0, 0.35, "filters", "Dot size"),
+    "flt_ht_angle":    (0.0, 1.0, 0.125, "filters", "Screen angle"),
+    "flt_ht_style":    (0.0, 2.0, 0.0, "filters", "Screen"),              # rounded: OPTIONS["flt_ht_style"]
+    "flt_neon":        (0.0, 1.0, 0.0, "filters", "Neon edges"),
+    "flt_neon_glow":   (0.0, 1.0, 0.5, "filters", "Neon glow"),
+    "flt_neon_keep":   (0.0, 1.0, 0.25, "filters", "Neon keeps picture"),
+    "flt_neon_color":  (0.0, 1.0, 0.0, "filters", "Neon colour"),        # 0 the picture's own hue .. 1 show palette
+    "flt_chroma":      (0.0, 1.0, 0.0, "filters", "Prism split"),
+    "flt_chroma_mode": (0.0, 2.0, 0.0, "filters", "Prism mode"),         # rounded: OPTIONS["flt_chroma_mode"]
+    "flt_chroma_angle": (0.0, 1.0, 0.0, "filters", "Prism angle"),
+    "flt_posterize":   (0.0, 1.0, 0.0, "filters", "Posterize"),
+    "flt_post_levels": (2.0, 12.0, 4.0, "filters", "Levels"),
+    "flt_post_palette": (0.0, 1.0, 0.0, "filters", "To show palette"),
+    "flt_sort":        (0.0, 1.0, 0.0, "filters", "Pixel sort"),
+    "flt_sort_thresh": (0.0, 1.0, 0.35, "filters", "Sort threshold"),
+    "flt_sort_len":    (0.0, 1.0, 0.5, "filters", "Sort length"),
+    "flt_sort_angle":  (0.0, 1.0, 0.25, "filters", "Sort angle"),        # 0..1 -> 0..180 degrees (0.25 = down)
+    "flt_glitch":      (0.0, 1.0, 0.0, "filters", "Glitch"),
+    "flt_glitch_rate": (0.0, 1.0, 0.3, "filters", "Glitch rate"),        # 0.2 .. 2.5 events / s (photosensitive cap)
+    "flt_glitch_block": (0.0, 1.0, 0.4, "filters", "Glitch blocks"),
+    "flt_bloom":       (0.0, 1.0, 0.0, "filters", "Bloom"),
+    "flt_bloom_thresh": (0.0, 1.0, 0.55, "filters", "Bloom threshold"),
+    "flt_bloom_radius": (0.0, 1.0, 0.5, "filters", "Bloom radius"),
+    "flt_kaleido":     (0.0, 1.0, 0.0, "filters", "Mirror / kaleido"),
+    "flt_kal_mode":    (0.0, 2.0, 2.0, "filters", "Mirror mode"),        # rounded: OPTIONS["flt_kal_mode"]
+    "flt_kal_folds":   (2.0, 16.0, 6.0, "filters", "Kaleido folds"),     # rounded in the shader
+    "flt_kal_spin":    (-1.0, 1.0, 0.1, "filters", "Kaleido spin"),
+
+    # ---- crowd camera (camera_layer.CameraLayer + camera_worker.py), APPENDED 2026-11-25: webcam silhouettes, motion
+    #      and dancer pose woven into the visuals. The CAMERA itself is switched on in the panel (command "camera");
+    #      while it is off these do nothing and cost nothing. Mode names: OPTIONS["crowd_mode"] below.
+    "l_camera":      (0.0, 1.0, 0.0, "layers", "Crowd camera"),
+    "crowd_mode":    (0.0, 5.0, 1.0, "camera", "Integration"),     # rounded: 0 bodies reveal the visuals, 1 glowing outline,
+                                                                   #  2 patterns flow inside bodies, 3 knockout (bodies black),
+                                                                   #  4 motion trails (into the echo), 5 crowd pushes the pattern
+    "crowd_glow":    (0.0, 1.0, 0.6, "camera", "Silhouette glow"),
+    "crowd_hue":     (0.0, 1.0, 0.0, "camera", "Silhouette hue"),  # hue shift of the light inside / around bodies
+    "crowd_soft":    (0.0, 1.0, 0.4, "camera", "Smoothing"),       # temporal smoothing of the silhouettes (slower = calmer)
+    "crowd_push":    (0.0, 1.0, 0.0, "camera", "Flow push"),       # crowd movement pushes the pattern (works in every mode)
+    "crowd_swarm":   (0.0, 1.0, 0.0, "camera", "Hands pull swarm"),
+    "crowd_beings":  (-1.0, 1.0, 0.0, "camera", "Beings follow hands"),   # + follow, - flee
+    "crowd_ripples": (0.0, 1.0, 0.0, "camera", "Hand ripples"),    # fast hand moves spawn ripples (max 2 per second)
+    "crowd_serpent": (0.0, 1.0, 0.0, "camera", "Serpent on arm"),  # serpent 1 rides the dancer's arm, head at the hand
+    # ---- image cycling (APPENDED 2026-11-25): the AI/image layer used to step to the next image every 12 s.
+    #      Default now HOLDS the current image; cycling only when the performer switches it on.
+    "img_auto":      (0.0, 1.0, 0.0, "layers", "Cycle images"),    # rounded: 0 hold the current image, 1 auto-cycle
+    "img_hold":      (5.0, 600.0, 60.0, "layers", "Image hold (s)"),  # seconds per image while cycling
 }
 
 # Option names for selectable (rounded) params that live here; index = rounded value - min. The panel shows them as a
 # dropdown / tiles (control.py merges this into its own OPTIONS table when it builds the panel meta).
 OPTIONS = {
+    "img_auto": ["Hold", "Cycle"],
     "being": ["Anaconda spirit", "Feathered dragon", "Jaguar spirit", "Hummingbird", "Butterflies & moths", "Jellyfish",
               "Manta rays", "Koi", "Firebird", "All-seeing eyes", "Light beings", "Jester sprites", "Octopus",
-              "Spirit vine", "Fireflies", "Whale", "Kittens"],
+              "Spirit vine", "Fireflies", "Whale", "Kittens", "Sprite (your image)"],
     "being_color": ["Show palette", "Single hue", "Two-tone", "Rainbow", "Each its own hue", "Light chase"],
     "serpent_color": ["Show palette", "Single hue", "Two-tone", "Rainbow", "Each its own hue", "Light chase"],
     "text_color": ["Show palette", "Fixed colour", "Rainbow letters", "Light chase"],
     "text_move": ["Static", "Drift", "Orbit ring", "Marquee", "Letter wave", "Tunnel spiral", "Beat bounce"],
     "text_mode": ["Overlay", "Woven", "Stencil mask", "Knockout", "Displace", "Rides the scene", "Kaleidoscope",
                   "Echo trails"],
+    "crowd_mode": ["Bodies reveal", "Glow outline", "Patterns inside", "Knockout", "Motion trails", "Flow push"],
 }
+
+# ---- generative kené / kenê kuin STUDY layers (kene_real.KenePass), APPENDED 2026-11-25. Both layers default to 0
+#      (off = the pass is not rendered, the show is pixel-identical). These are procedural studies of the visual
+#      grammar documented in research/kene_reference/README.md, NOT kené: never label them as authentic. For public
+#      shows, credit and collaborate with the originating communities. ("l_kene" above is the unrelated Folding Blocks.)
+PARAMS.update({
+    "l_kene_shipibo":  (0.0, 1.0, 0.0, "layers", "Kené study (Shipibo-Konibo inspired)"),
+    "l_kene_hunikuin": (0.0, 1.0, 0.0, "layers", "Bead study (Huni Kuin / Yawanawá inspired)"),
+    "kene_style":   (0.0, 7.0, 0.0, "kene", "Medium"),            # rounded: OPTIONS (light on black, mud-dyed cloth, ...)
+    "kene_colors":  (0.0, 5.0, 2.0, "kene", "Colours"),           # rounded: 0 follows the show palette
+    "kene_layout":  (0.0, 4.0, 0.0, "kene", "Field"),             # rounded: single panel, panels, band, medallion, follow the show
+    "kene_seed":    (0.0, 31.0, 0.0, "kene", "Design"),           # rounded: every number is a different generated design
+    "kene_scale":   (0.0, 1.0, 0.5, "kene", "Line density"),      # how many cells the field has
+    "kene_curve":   (0.0, 1.0, 0.25, "kene", "Straight / curving"),   # 0 rectilinear stepped lines .. 1 rounded, swirling
+    "kene_weight":  (0.0, 1.0, 0.5, "kene", "Line weight"),
+    "kene_fill":    (0.0, 1.0, 0.85, "kene", "Fine fill"),        # the third tier: fine lines filling every cell
+    "kene_draw":    (0.0, 1.0, 1.0, "kene", "Drawn"),             # 0 = empty field .. 1 = whole design (a pen draws it in)
+    "kene_pen":     (0.0, 4.0, 0.0, "kene", "Pen"),               # rounded: draw the design in over N bars, again and again
+    "kene_pen_new": (0.0, 1.0, 1.0, "kene", "Pen: next design"),  # rounded: a new design each time the pen starts over
+    "kene_flow":    (0.0, 1.0, 0.35, "kene", "Flowing light"),    # light travelling the primary lines, one train per bar
+    "kene_breathe": (0.0, 1.0, 0.3, "kene", "Breathing"),
+    "kene_glow":    (0.0, 1.0, 0.4, "kene", "Glow"),
+    "kene_chase":   (0.0, 1.0, 0.0, "kene", "Follow light chase"),
+    "hk_motif":     (0.0, 8.0, 0.0, "kene", "Bead motif (study)"),        # rounded: OPTIONS (names as in the reference README)
+    "hk_medium":    (0.0, 3.0, 0.0, "kene", "Bead medium"),       # rounded: glass beads, woven, painted
+    "hk_colors":    (0.0, 9.0, 1.0, "kene", "Bead colours"),      # rounded: 5 follows the show palette
+    "hk_cycle":     (0.0, 3.0, 0.0, "kene", "Motif morph"),       # rounded: morph to the next motif every N bars
+    "hk_size":      (0.0, 1.0, 0.5, "kene", "Bead count"),
+    "hk_seq":       (0.0, 1.0, 0.5, "kene", "Beads light in sequence"),
+    "hk_glow":      (0.0, 1.0, 0.4, "kene", "Bead glow"),
+    # appended 2026-11-26
+    "kene_form":    (0.0, 1.0, 1.0, "kene", "Line forms"),         # rounded: 0 outlined regions only, 1 + free arms with
+                                                                   #          terminals (arrowhead, T-bar, end-cap) and accent blocks
+    "hk_ombre":     (0.0, 1.0, 0.0, "kene", "Ombré cycling"),      # the bead colour ramp slides ring by ring (1 = a step per 2 bars)
+})
+OPTIONS.update({     # the same lists as kene_real.OPTIONS (tests/test_kene_real.py keeps them equal)
+    "kene_style": ["Light on black", "Mud-dyed cloth", "Embroidery", "Ceramic", "Beadwork",
+                   "Painted kené (study)", "Cloth kené (study)", "Embroidered kené (study)"],
+    "kene_form": ["Outlined regions", "Regions + arms and terminals"],
+    "kene_colors": ["Follow show palette", "Cotton white", "Magenta / gold / red", "Gold / white / green",
+                    "Turquoise / white / magenta", "Red / violet / lime"],
+    "kene_layout": ["Single panel", "Panels", "Band", "Medallion", "Follow the show"],
+    "kene_seed": [str(i + 1) for i in range(32)],
+    "kene_pen": ["Off (Drawn fader)", "Draw in: 4 bars", "Draw in: 8 bars", "Draw in: 16 bars", "Draw in: 32 bars"],
+    "kene_pen_new": ["Same design", "New design each time"],
+    "hk_motif": ["txede bedu (study)", "dunu kenê (study)", "inu tae (study)", "inu tae txede bedu (study)",
+                 "kapë hina (study)", "Woven band (Huni Kuin-inspired study)", "Bead tiles (Huni Kuin-inspired study)",
+                 "Bead straps (Yawanawá-inspired study)", "Key-fret beadwork (study)"],
+    "hk_medium": ["Glass beads", "Woven", "Painted", "Glass beads, staggered rows"],
+    "hk_colors": ["Black & white", "Red / yellow / white", "Blue / turquoise / orange", "Green / yellow / red",
+                  "All eight bead colours", "Follow show palette", "Rainbow ombré", "Blue ombré", "Green ombré",
+                  "Black / white / orange"],
+    "hk_cycle": ["Hold", "Morph every 8 bars", "Morph every 16 bars", "Morph every 32 bars"],
+})
+
+# ---- beings: the SPRITE creature (form "Sprite (your image)") + dance motion, APPENDED 2026-11-26. The image comes
+#      from the user's own art/ library (skin slot beings:sprite, see beings.py); defaults leave every older form as it was.
+PARAMS.update({
+    "being_dance":  (0.0, 5.0, 0.0, "beings", "Dance"),           # rounded: OPTIONS["being_dance"] (sprites only)
+    "being_bounce": (0.0, 1.0, 0.5, "beings", "Bounce"),          # hop + squash / stretch on the beat
+    "being_spin":   (0.0, 1.0, 0.2, "beings", "Spins"),           # how often a creature spins round (0 = never)
+    "being_look":   (0.0, 3.0, 0.0, "beings", "Sprite look"),     # rounded: OPTIONS["being_look"]
+    "being_tint":   (0.0, 1.0, 0.0, "beings", "Sprite tint"),     # image look: 0 = its own colours, 1 = the colour mode
+    "being_frames": (0.0, 3.0, 0.0, "beings", "Pose step"),       # rounded: OPTIONS["being_frames"] (multi-pose images)
+    "being_xfade":  (0.0, 1.0, 0.0, "beings", "Pose crossfade"),  # 0 = poses cut on the step, 1 = morph all the way
+    "being_faces":  (0.0, 2.0, 0.0, "beings", "Image faces"),     # rounded: OPTIONS["being_faces"]
+    "being_sheet":  (1.0, 8.0, 1.0, "beings", "Poses in a sheet"),  # rounded: 1 = one image, N = N poses side by side
+})
+OPTIONS.update({
+    "being_dance": ["Free dance", "March in a line", "Conga line", "Mirror pairs", "Bounce in place", "Flock"],
+    "being_look": ["Image", "Glowing outline", "Solid silhouette", "Skinned fill"],
+    "being_frames": ["Every beat", "Every half-beat", "Every bar", "Every two beats"],
+    "being_faces": ["Faces right", "Faces left", "Never flip"],
+})
+
+# ---- kené study layers: SEMANTIC GATING of the four line-layer channels (primary lines, fine fill, ground, accents),
+#      APPENDED 2026-11-26 (kene_real.gate_state). Defaults reproduce the earlier look (preset 0, every gain 1).
+PARAMS.update({
+    "kene_gate":    (0.0, 5.0, 0.0, "kene", "Layer gate"),         # rounded: OPTIONS["kene_gate"] (presets)
+    "kene_g_line":  (0.0, 1.0, 1.0, "kene", "Gain: primary lines"),
+    "kene_g_fill":  (0.0, 1.0, 1.0, "kene", "Gain: fine fill"),
+    "kene_g_ground": (0.0, 1.0, 1.0, "kene", "Gain: cloth ground"),
+    "kene_g_jewel": (0.0, 1.0, 1.0, "kene", "Gain: accents"),
+})
+OPTIONS.update({
+    "kene_gate": ["Gains as set", "Linework only", "White engraving", "Floating ground patches", "Cell by cell fill",
+                  "Full cloth, stitched"],
+})
+
+# ---- kené / bead studies: their OWN MOTION, on by default (user, live demo 2026-11-26: "should be moving"), APPENDED.
+#      kene_motion scales all of it (0 = the earlier still look); the global flow / travel / rotate / spin / zoom / swim
+#      faders drive the studies too, in every field layout.
+PARAMS.update({
+    "kene_motion":  (0.0, 1.0, 1.0, "kene", "Study motion"),       # master of the studies' own motion below
+    "kene_crawl":   (0.0, 1.0, 0.35, "kene", "Study crawl"),       # the field scrolls (seamless mirror wrap), beat-synced
+    "kene_swim":    (0.0, 1.0, 0.4, "kene", "Study swim"),         # gentle flowing warp: lines undulate, widths stay crisp
+    "kene_sway":    (0.0, 1.0, 0.5, "kene", "Rotate / zoom breathing"),
+    "kene_autopen": (0.0, 3.0, 2.0, "kene", "Pen when Pen is off"),   # rounded: OPTIONS (draws in again and again)
+    "hk_auto":      (0.0, 1.0, 1.0, "kene", "Bead colour cycling"),   # ring-by-ring ombré cycling when Ombré cycling is 0
+})
+OPTIONS.update({
+    "kene_autopen": ["Off (Drawn fader)", "Draw in: 16 bars", "Draw in: 32 bars", "Draw in: 64 bars"],
+})
+
+# ---- COIL NEST (coilnest.CoilNestPass), APPENDED 2026-11-26: a frame-filling nest of 6-14 skinned serpent tubes with
+#      a beat-synced 4-channel gating programme. Off by default (l_coilnest 0 = the pass is not rendered). Option names
+#      are coilnest.OPTIONS (tests/test_coilnest.py keeps them equal).
+PARAMS.update({
+    "l_coilnest":    (0.0, 1.0, 0.0, "layers", "Coil nest (serpent bodies)"),
+    "coil_count":    (6.0, 14.0, 10.0, "coilnest", "Bodies"),          # rounded; the governor halves it under load
+    "coil_thick":    (0.0, 1.0, 0.5, "coilnest", "Thickness"),
+    "coil_writhe":   (0.0, 1.0, 0.45, "coilnest", "Writhe / breathe"),
+    "coil_slither":  (0.0, 1.0, 0.4, "coilnest", "Skin slither"),      # skins glide along the bodies, neighbours opposite
+    "coil_dolly":    (0.0, 1.0, 0.6, "coilnest", "Camera breathing"),
+    "coil_heads":    (0.0, 1.0, 0.0, "coilnest", "Heads"),             # rounded: OPTIONS
+    "coil_caps":     (0.0, 1.0, 1.0, "coilnest", "End caps"),          # rounded: OPTIONS
+    "coil_skin":     (0.0, 3.0, 0.0, "coilnest", "Skin source"),       # rounded: OPTIONS
+    "coil_layer":    (0.0, 11.0, 0.0, "coilnest", "Layer as skin"),    # rounded: OPTIONS (materials.LayerHub source)
+    "coil_prog":     (0.0, 1.0, 1.0, "coilnest", "Gating"),            # rounded: 0 manual stage, 1 programme on the bar
+    "coil_bars":     (0.0, 3.0, 1.0, "coilnest", "Bars per stage"),    # rounded: OPTIONS
+    "coil_stage":    (0.0, 4.0, 3.0, "coilnest", "Stage"),             # rounded: OPTIONS (manual / timeline / clips)
+    "coil_prog_amt": (0.0, 1.0, 1.0, "coilnest", "Gating depth"),      # 0 = always the full cloth
+    "coil_g_line":   (0.0, 1.5, 1.0, "coilnest", "Primary lines"),
+    "coil_g_fill":   (0.0, 1.5, 1.0, "coilnest", "Fine fill"),
+    "coil_g_ground": (0.0, 1.5, 1.0, "coilnest", "Cloth ground"),
+    "coil_g_accent": (0.0, 1.5, 1.0, "coilnest", "Jewel accents"),
+    "coil_rim":      (0.0, 1.0, 0.6, "coilnest", "Rim sweep"),
+    "coil_palette":  (0.0, 1.0, 0.0, "coilnest", "Follow show palette"),
+    "coil_glow":     (0.0, 1.0, 0.4, "coilnest", "Line glow"),
+    "coil_floor":    (0.0, 1.0, 1.0, "coilnest", "Black crevices"),    # 1 = the nest hides everything, 0 = see through gaps
+    "coilnest_res":  (0.35, 1.0, 1.0, "coilnest", "Render scale"),
+    "serpent_skin":  (0.0, 1.0, 0.0, "motion", "Serpent skin (coil nest)"),   # the scene's serpents wear the coil nest skin
+})
+OPTIONS.update({
+    "coil_heads": ["No heads (endless coils)", "Heads"],
+    "coil_caps": ["Plain ends", "Medallion caps"],
+    "coil_skin": ["Procedural kené", "SKINS slot (image / AI)", "Kené study channels (4-channel layer)",
+                  "Engine layer (colour)"],
+    "coil_layer": ["Kené study", "Bead study", "Folding Blocks", "Beadwork", "Sacred lines", "Beings", "Math stack",
+                   "Math fractals", "Text", "Crowd camera", "Video loops", "Filtered output"],
+    "coil_prog": ["Manual stage (timeline / clips)", "Gating programme on the bar"],
+    "coil_bars": ["2 bars a stage", "4 bars a stage", "8 bars a stage", "16 bars a stage"],
+    "coil_stage": ["Linework only", "White engraving", "Floating ground patches", "Full embroidered cloth", "Rim sweep"],
+})
 
 TRIGGERS = ["flash", "strobe", "invert", "freeze", "blackout", "punch"]   # momentary buttons in the panel / MIDI
 EVENTS = ["ripple"]                                                        # ("ripple", x, y)
 MOD_SOURCES = ["none", "bass", "mid", "high", "lfo_sine", "lfo_tri", "lfo_saw", "lfo_square", "random",
-               "seq", "seq_gate"]     # 16-step sequencer (control.Controller.seq): step value 0..1 / gate envelope
+               "seq", "seq_gate",     # 16-step sequencer (control.Controller.seq): step value 0..1 / gate envelope
+               # crowd camera (camera_layer.Signals, APPENDED): 0..1 except hip_sway -1..1; all 0 while the camera is off
+               "crowd_motion", "crowd_left", "crowd_centre", "crowd_right", "crowd_presence",
+               "hand_height", "hands_spread", "hip_sway", "hand_speed"]
 
 
 def defaults():
@@ -302,7 +523,7 @@ NEUTRAL = {     # the value at which the param does nothing
     "saturation": 1.0, "chase": 0.0,
     # layers: opacity 0
     "l_kene": 0.0, "l_beads": 0.0, "l_lines": 0.0, "l_ai": 0.0, "l_echo": 0.0, "l_video": 0.0, "l_fractal": 0.0,
-    "l_art": 0.0, "l_land": 0.0, "l_swarm": 0.0, "l_beings": 0.0, "l_text": 0.0,
+    "l_art": 0.0, "l_land": 0.0, "l_swarm": 0.0, "l_beings": 0.0, "l_text": 0.0, "l_stack": 0.0,
     # art fly-through + distortion
     "cam_yaw": 0.0, "cam_pitch": 0.0, "cam_roll": 0.0, "cam_dolly": 0.0, "cam_drift": 0.0, "art_melt": 0.0,
     "art_liquify": 0.0, "art_slices": 0.0, "art_breathe": 0.0, "art_fold": 0.0, "art_droste": 0.0, "art_smear": 0.0,
@@ -312,6 +533,7 @@ NEUTRAL = {     # the value at which the param does nothing
 }
 NEUTRAL = {k: v for k, v in NEUTRAL.items() if k in PARAMS}
 BYPASS_KEEP = {  # bypass leaves these alone: "off" has no meaning (selectors, counts, sizes, colours, quality, triggers)
+    "img_auto", "img_hold",
     "master", "flash", "strobe", "invert", "freeze", "blackout", "punch",
     "symmetry", "folds", "speed", "flow_dir",
     "travel_mode", "depth_fog", "serpent_mode", "serpent_count", "serpent_segments", "serpent_speed", "serpent_wiggle",
@@ -331,10 +553,60 @@ BYPASS_KEEP = {  # bypass leaves these alone: "off" has no meaning (selectors, c
     "text_weave", "text_dissolve",
 }
 BYPASS_KEEP = {k for k in BYPASS_KEEP if k in PARAMS}
+# post-FX filter chain (filters.py): slot value i (1..10) = FILTER_TYPES[i-1]; the type's amount param is flt_<type>.
+# Bypass: the amounts go to 0 (the FILTERS tab's power button, and ALL FX), everything else is kept.
+FILTER_TYPES = ["dream", "oil", "halftone", "neon", "chroma", "posterize", "sort", "glitch", "bloom", "kaleido"]
+FILTER_NAMES = ["Deep dream", "Oil paint", "Halftone", "Neon edges", "Prism split", "Posterize", "Pixel sort", "Glitch",
+                "Bloom", "Mirror / kaleido"]
+OPTIONS.update({f"flt_slot{i}": ["Empty"] + FILTER_NAMES for i in range(1, 7)})
+OPTIONS.update({"flt_ht_style": ["Colour dots", "RGB screen", "Line engraving"],
+                "flt_chroma_mode": ["Radial", "Linear", "Prism ghosts"],
+                "flt_kal_mode": ["Mirror", "Quad mirror", "Kaleidoscope"]})
+NEUTRAL.update({f"flt_{t}": 0.0 for t in FILTER_TYPES if f"flt_{t}" in PARAMS})
+BYPASS_KEEP |= {n for n, v in PARAMS.items() if v[3] == "filters" and n not in NEUTRAL}
 BYPASS_GROUP_KEY = {"space": "shape"}            # the SHAPE tab holds two groups: one switch for both
 BYPASS_LINKS = {                                 # switching a tab off also switches its layer(s) off
     "fractal": ["l_fractal"], "art": ["l_art"], "land": ["l_land", "l_swarm"], "beings": ["l_beings"], "text": ["l_text"],
 }
+# crowd camera (camera_layer.py): amounts go to 0, the look settings are kept; the CAMERA tab's switch also drops
+# l_camera. (Bypass never switches the webcam itself off: that is the CAMERA ON / OFF switch.)
+NEUTRAL.update({n: 0.0 for n in ("l_camera", "crowd_push", "crowd_swarm", "crowd_beings", "crowd_ripples",
+                                 "crowd_serpent") if n in PARAMS})
+BYPASS_KEEP |= {n for n in ("crowd_mode", "crowd_glow", "crowd_hue", "crowd_soft") if n in PARAMS}
+BYPASS_LINKS["camera"] = ["l_camera"]
+# generative kené / kenê kuin study layers (kene_real.py): the two layer amounts go to 0, every look setting is kept;
+# the tab's switch drops both layers.
+NEUTRAL.update({n: 0.0 for n in ("l_kene_shipibo", "l_kene_hunikuin") if n in PARAMS})
+BYPASS_KEEP |= {n for n, v in PARAMS.items() if v[3] == "kene"}
+BYPASS_LINKS["kene"] = ["l_kene_shipibo", "l_kene_hunikuin"]
+# sprite creature (2026-11-26): look / motion settings, kept by a bypass (the BEINGS switch drops l_beings)
+BYPASS_KEEP |= {n for n in ("being_dance", "being_bounce", "being_spin", "being_look", "being_tint", "being_frames",
+                            "being_xfade", "being_faces", "being_sheet") if n in PARAMS}
+# coil nest (coilnest.py): the layer amount goes to 0, every look / programme setting is kept; the tab's switch drops it
+NEUTRAL.update({n: 0.0 for n in ("l_coilnest",) if n in PARAMS})
+BYPASS_KEEP |= {n for n, v in PARAMS.items() if v[3] == "coilnest"} | ({"serpent_skin"} & set(PARAMS))
+BYPASS_LINKS["coilnest"] = ["l_coilnest"]
+
+# ---- combinable art modes (APPENDED 2026-11-26). art_combine 0 = the one-mode art_use selector (as before; the
+#      amounts below are ignored); 1 = every art_mix_* amount is its own mode, any number at once (order of
+#      composition: HANDOFF.md "Combinable art modes"). Amounts 0..1, multiplied by l_art. Weights: art_layer.art_weights.
+PARAMS.update({
+    "art_combine":      (0.0, 1.0, 0.0, "art", "Combine modes"),     # rounded: 0 one mode (art_use), 1 the amounts below
+    "art_mix_relief":   (0.0, 1.0, 0.0, "art", "Mix: relief"),       # the 3D fly-through pass
+    "art_mix_stencil":  (0.0, 1.0, 0.0, "art", "Mix: inside lines"), # the pattern lines are windows onto the image
+    "art_mix_kaleido":  (0.0, 1.0, 0.0, "art", "Mix: kaleidoscope"), # maps the image (with tunnel: kaleidoscopic tunnel)
+    "art_mix_tunnel":   (0.0, 1.0, 0.0, "art", "Mix: tunnel walls"),
+    "art_mix_displace": (0.0, 1.0, 0.0, "art", "Mix: displace"),     # the (mapped) image pushes the lattice aside
+    "art_mix_melt":     (0.0, 1.0, 0.0, "art", "Mix: melt"),         # full frame light + the echo runs like wet paint
+})
+OPTIONS.update({"art_combine": ["One mode", "Combine"]})
+NEUTRAL.update({n: 0.0 for n in PARAMS if n.startswith("art_mix_")})
+BYPASS_KEEP |= {"art_combine"}
+
+# ---- one image library (APPENDED 2026-11-26, image_library.py): which images the AI-texture layer cycles through
+PARAMS["img_set"] = (0.0, 3.0, 0.0, "layers", "Image set")   # rounded: 0 AI images (as before), 1 art uploads, 2 both,
+OPTIONS["img_set"] = ["AI images", "Art uploads", "AI + art", "Picked set"]   # 3 the hand-picked set (Sources picker)
+BYPASS_KEEP |= {"img_set"}
 
 
 def bypass_cover():
