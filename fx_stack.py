@@ -284,61 +284,64 @@ try:
 except Exception:                                  # the module is optional: without it the decks are as they were
     _mat = None
 
+# The skin runs AFTER the march loop: inside the loop the hook only RECORDS the hit (mapping inputs, normal, line
+# mask, shade, the world's own depth scale k); the fetch, the light, the mix and the overlay layers run once, after
+# the loop. Code inside the loop body costs registers for all ~46 march steps (occupancy), code after it does not.
 # f = one pixel's footprint on the surface (grown with distance: far detail is filtered a little harder than
 # strictly needed, which is what stops far-wall sparkle), zr = distance along the travel axis
 _SK_PX = "float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t), zr = p.z - uCam.z;"
-_SK_SCREEN = "skTap(%s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0) + N.xy*0.14, vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y))"
+SKIN_DECL_ANCHOR = "  vec3 ro = uCam, rd = rayDir(v_uv), col = vec3(0.0);\n"
+SKIN_DECL = ("  int hkS = 0; float hkT = -1.0, hkI = 0.0, hkF = 0.0, hkLn = 0.0, hkSh = 1.0, hkLm = 1.0, hkK = 1.0;\n"
+             "  vec3 hkN = vec3(0.0, 0.0, 1.0), hkTN = hkN, hkP = vec3(0.0); vec2 hkUV = vec2(0.0), hkGX = hkUV, hkGY = hkUV;\n")
+SKIN_POST = """
+  if (hkT >= 0.0) {                                    // [skins] one hit recorded in the loop: skin it once, here
+    float mp = skB[hkS].x, lit = skLight(hkN, rd, hkT, hkI)*hkLm; vec3 S;
+    if (mp > 1.5) S = skTap(hkS, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0) + hkN.xy*0.35, vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
+    else if (mp > 0.5) S = skTri(hkS, hkP, hkTN, hkF);
+    else S = skTap(hkS, hkUV, hkGX, hkGY);
+    col = skMix(hkS, col/hkK, S, hkLn, hkSh*lit)*hkK;
+  }"""
 SKIN_HOOKS = [
     # corridor: slot 0 = the vault, slot 1 = floor + ceiling
     ("      col = mix(pc*facets*0.55, mix(pc*1.5, vec3(1.0, 0.86, 0.5), 0.4), lines);\n", """
       { bool fl = (1.65 - abs(p.y)) < (rad - length(p.xy)); int s = fl ? 1 : 0;
         if (skA[s].w > 0.0005) {
-          """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
-          vec3 N = fl ? vec3(0.0, -sign(p.y), 0.0) : vec3(-normalize(p.xy), 0.0);
-          float lit = skLight(N, rd, t, float(i));
-          if (mp > 1.5) S = """ + _SK_SCREEN % "s" + """;
-          else if (mp > 0.5) S = skTri(s, vec3(p.xy, zr), N, f);
-          else if (fl) S = skTap(s, vec2(p.x + step(0.0, p.y)*1.7, zr), vec2(f, 0.0), vec2(0.0, f*clamp(t/1.65, 1.0, 64.0)));
-          else S = skTap(s, vec2(ang/TAU, zr), vec2(f/(TAU*rad), 0.0), vec2(0.0, f*clamp(t/rad, 1.0, 64.0)));
-          col = skMix(s, col, S, lines, (0.66 + 0.34*facets)*lit);
+          """ + _SK_PX + """
+          hkS = s; hkT = t; hkI = float(i); hkF = f; hkLn = lines; hkSh = 0.66 + 0.34*facets; hkK = (0.85 + uMid*0.65)*exp(-t*0.06);
+          hkN = fl ? vec3(0.0, -sign(p.y), 0.0) : vec3(-normalize(p.xy), 0.0); hkTN = hkN; hkP = vec3(p.xy, zr);
+          if (fl) { hkUV = vec2(p.x + step(0.0, p.y)*1.7, zr); hkGX = vec2(f, 0.0); hkGY = vec2(0.0, f*clamp(t/1.65, 1.0, 64.0)); }
+          else { hkUV = vec2(ang/TAU, zr); hkGX = vec2(f/(TAU*rad), 0.0); hkGY = vec2(0.0, f*clamp(t/rad, 1.0, 64.0)); }
         } }
 """, "after"),
     # torus: slot 0 = the tube, slot 1 = the torus side chambers
     ("      col *= (0.85 + uLow*0.55)*exp(-t*0.07);\n", """
       { int s = dTor > dTube ? 1 : 0;
         if (skA[s].w > 0.0005) {
-          """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
-          vec3 N = vec3(-normalize(q.xy - (s == 0 ? ctr : vec2(0.0))), 0.0);
-          float lit = skLight(N, rd, t, float(i));
-          if (mp > 1.5) S = """ + _SK_SCREEN % "s" + """;
-          else if (mp > 0.5) S = skTri(s, vec3(q.xy, zr), N, f);
-          else S = skTap(s, vec2(atan(q.y, q.x)/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
-          col = skMix(s, col, S, edge, (0.60 + 0.40*lead)*lit);
+          """ + _SK_PX + """
+          hkS = s; hkT = t; hkI = float(i); hkF = f; hkLn = edge; hkSh = 0.60 + 0.40*lead; hkK = (0.85 + uLow*0.55)*exp(-t*0.07);
+          hkN = vec3(-normalize(q.xy - (s == 0 ? ctr : vec2(0.0))), 0.0); hkTN = hkN; hkP = vec3(q.xy, zr);
+          hkUV = vec2(atan(q.y, q.x)/TAU, zr); hkGX = vec2(f/(TAU*1.9), 0.0); hkGY = vec2(0.0, f*clamp(t/1.9, 1.0, 64.0));
         } }
 """, "before"),
     # vortex: the stained-glass panes are the "lines" (the lead between them stays dark)
     ("      col *= exp(-t*0.06);\n", """
       if (skA[0].w > 0.0005) {
-        """ + _SK_PX + """ vec3 S; float mp = skB[0].x;
-        vec3 N = vec3(-normalize(p.xy), 0.0);
-        float lit = skLight(N, rd, t, float(i));
-        if (mp > 1.5) S = """ + _SK_SCREEN % "0" + """;
-        else if (mp > 0.5) S = skTri(0, vec3(p.xy, zr), N, f);
-        else S = skTap(0, vec2(ang/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
-        col = skMix(0, col, S, lead*(0.35 + 0.65*step(0.3, vG.z)), (0.40 + 0.60*lead)*(1.0 - 0.35*smoothstep(0.1, 0.6, vG.x))*lit);
+        """ + _SK_PX + """
+        hkS = 0; hkT = t; hkI = float(i); hkF = f; hkLn = 1.0 - lead; hkK = exp(-t*0.06);   // lines = the lead network
+        hkSh = (0.40 + 0.60*lead)*(1.0 - 0.35*smoothstep(0.1, 0.6, vG.x));
+        hkN = vec3(-normalize(p.xy), 0.0); hkTN = hkN; hkP = vec3(p.xy, zr);
+        hkUV = vec2(ang/TAU, zr); hkGX = vec2(f/(TAU*1.9), 0.0); hkGY = vec2(0.0, f*clamp(t/1.9, 1.0, 64.0));
       }
 """, "before"),
     # hex domes: ONE image per honeycomb cell (cell-local coordinates: no polar stretch, the rims hide the joins);
     # the domes are fixed in the world, so there is no travel follow
     ("      col *= (0.85 + uMid*0.5)*exp(-t*0.07);\n", """
       if (skA[0].w > 0.0005) {
-        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t); vec3 S; float mp = skB[0].x;
-        vec3 N = -n*sign(dot(n, -rd) + 1e-4);
-        float lit = skLight(N, rd, t, float(i))*smoothstep(0.0, 0.15, abs(dot(n, rd)));   // silhouettes fall to black
-        if (mp > 1.5) S = """ + _SK_SCREEN % "0" + """;
-        else if (mp > 0.5) S = skTri(0, q, n, f);
-        else S = skTap(0, suv + vec2(uSh, 0.0) - hx.zw + 0.5, vec2(f*nx/(TAU*2.4), 0.0), vec2(0.0, f*ny/(PI*2.65)));
-        col = skMix(0, col, S, rim, (0.50 + 0.50*cell)*lit);
+        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t);
+        hkS = 0; hkT = t; hkI = float(i); hkF = f; hkLn = rim; hkSh = 0.50 + 0.50*cell; hkK = (0.85 + uMid*0.5)*exp(-t*0.07);
+        hkN = -n*sign(dot(n, -rd) + 1e-4); hkTN = n; hkP = q;
+        hkLm = smoothstep(0.0, 0.15, abs(dot(n, rd)));   // silhouettes fall to black
+        hkUV = suv + vec2(uSh, 0.0) - hx.zw + 0.5 + vec2(ch, fract(ch*7.31))*4.0; hkGX = vec2(f*nx/(TAU*2.4), 0.0); hkGY = vec2(0.0, f*ny/(PI*2.65));
       }
 """, "before"),
 ]
@@ -346,15 +349,17 @@ GLOW_ANCHOR = "\n  col += palC("          # each world adds its own coloured haz
 
 
 def skinned_source(mode):
-    """LAND_FS[mode] with the skin chunk + hook. Raises if an anchor moved (a test pins this)."""
+    """LAND_FS[mode] with the skin chunk, the declarations, the in-loop recorder and the post-loop skin block.
+    Raises if an anchor moved (a test pins this)."""
     anchor, add, where = SKIN_HOOKS[mode]
     fs = LAND_FS[mode]
     if fs.count(anchor) != 1 or fs.count(HEADER) != 1:
         raise ValueError(f"skin hook anchor not found in landscape {mode}")
-    if fs.count(GLOW_ANCHOR) != 1:
-        raise ValueError(f"glow anchor not found in landscape {mode}")
+    if fs.count(GLOW_ANCHOR) != 1 or fs.count(SKIN_DECL_ANCHOR) != 1:
+        raise ValueError(f"glow / declaration anchor not found in landscape {mode}")
     fs = fs.replace(HEADER, HEADER + _mat.GLSL)
-    fs = fs.replace(GLOW_ANCHOR, "\n  col += skDim*palC(")       # a skinned surface dims the world's coloured haze
+    fs = fs.replace(SKIN_DECL_ANCHOR, SKIN_DECL_ANCHOR + SKIN_DECL)
+    fs = fs.replace(GLOW_ANCHOR, SKIN_POST + "\n  col += skDim*palC(")   # a skinned surface dims the world's coloured haze
     return fs.replace(anchor, add + anchor if where == "before" else anchor + add)
 
 TRAIL_FS = """
@@ -914,6 +919,19 @@ class PreviewTap:
     def capture(self, tex, sink, wait=False):
         """Read `tex` now and hand the JPEG to sink(bytes) from a worker thread. Skips if an encode is running."""
         return self._grab(lambda: self.read(tex), sink, wait, False)
+
+    def snap(self, tex, sink):
+        """One picture of `tex` for a caller that is not the panel monitor (the ONLINE assistant's SEE THE OUTPUT):
+        a small blit + a readback into the pixel buffer NOW (no GPU stall), the bytes collected by a later
+        collect() and JPEG-encoded on a worker thread, then sink(bytes). False if one is still in flight."""
+        self.collect()
+        if self._pending is not None or self._busy.locked():
+            return False
+        self._blit(tex)
+        self._fbo.read_into(self._pbo, components=3)
+        self._pending = (sink, False)
+        self.captures += 1
+        return True
 
     # ---- preview-only layer mix: the scene shader drawn once more, small, with some layers muted
     def render_mix(self, scene_prog, scene_vao, uni, mask, bright=False):

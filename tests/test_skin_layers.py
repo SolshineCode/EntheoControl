@@ -131,7 +131,7 @@ class FakeBackend:
     def use(self, unit):
         pass
 
-    def vram_bytes(self):
+    def vram_bytes(self, layers=4):
         return 0 if self.size is None else self.size * self.size * 4 * 4
 
 
@@ -439,9 +439,9 @@ def test_gl_hub_copies_a_source_with_mips_into_its_layer(ctx):
         hub.end_frame()
         i = hub.request("solid")
         assert i == 0
-        px = hub.read_layer(i, level=0)
-        assert px.shape == (512, 512, 4) and np.abs(px[..., :3].astype(int) - (200, 40, 10)).max() <= 2
-        lo = hub.read_layer(i, level=6)
+        px = hub.probe(i, level=0)
+        assert px.shape == (8, 8, 4) and np.abs(px[..., :3].astype(int) - (200, 40, 10)).max() <= 2
+        lo = hub.probe(i, level=6)
         assert np.abs(lo[..., :3].astype(int) - (200, 40, 10)).max() <= 2, "mip chain filled"
     finally:
         hub.release()
@@ -528,16 +528,77 @@ def test_gl_stacks_draw_on_every_world_and_cost_is_in_budget(ctx):
                 settle(eng, st, hub)
                 assert eng.active(env), (env, label)
                 pre, on = gpu_ms2(ctx, lambda: draw(lp0), lambda: draw(lp))
-                img = np.frombuffer(lp.out_tex.read(), dtype="u1") if hasattr(lp, "out_tex") else None
                 rows.append((env, label, pre, on))
         print()
         for env, label, pre, on in rows:
             print(f"[stack cost] {env:9s} {label:10s} pre-skin {pre:.3f} ms  skinned {on:.3f} ms  (+{on - pre:.3f})")
         for env, label, pre, on in rows:
-            if label in ("base", "base+1", "lines only"):
+            if True:
                 assert on - pre <= 0.30, f"{env} {label}: +{on - pre:.3f} ms"
     finally:
         lp.release()
         lp0.release()
         eng.release()
         hub.release()
+
+
+def test_expensive_sources_refresh_every_n_frames():
+    hub, be, clk = make_hub()
+    calls = []
+    hub.register("blocks", draw=lambda size: calls.append(1) or "B", every=2)
+    for _ in range(10):
+        hub.request("blocks")
+        hub.run("scene")
+        hub.end_frame()
+    assert len(calls) == 5
+
+
+def test_gl_engine_layers_as_skins_end_to_end(tmp_path):
+    """Headless engine: no layer requested = the hub does nothing (0 copies, 0 MB); a tunnel skinned by the kené study
+    (layer OFF in the mix: its own 512 px instance), the 4-channel line layer and Folding Blocks (scene-only, 256 px)
+    changes the picture and stays finite."""
+    import json
+    import subprocess
+    sk = dict(slots={"tunnel:walls": dict(src=dict(kind="layer", name="kene"), layers=[
+        dict(src=dict(kind="layer", name="lines4"), remap=1, noise=0.5),
+        dict(src=dict(kind="layer", name="blocks"), blend=1, opacity=0.7)])})
+    (tmp_path / "skins.json").write_text(json.dumps(sk))
+    outs = []
+    for tag, extra in (("plain", []), ("skin", ["--skins", str(tmp_path / "skins.json")])):
+        r = subprocess.run([sys.executable, str(ROOT / "live_visuals.py"), "--test", "24", "--out", str(tmp_path / tag),
+                            "--set", "travel=0.6", "--set", "travel_mode=1", "--test-audio", "silent"] + extra,
+                           capture_output=True, text=True, timeout=180, cwd=str(ROOT))
+        assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+        outs.append(r.stdout)
+    line = [x for x in outs[0].splitlines() if x.startswith("[skin layers]")]
+    assert line and "copies=0" in line[0] and "vram_mb=0" in line[0], line
+    line = [x for x in outs[1].splitlines() if x.startswith("[skin layers]")][0]
+    print("\n" + line)
+    assert "copies=0" not in line and "own=0" not in line and "'kene'" in line and "fails={}" in line, line
+    assert "nonfinite=0" in outs[1]
+    from PIL import Image
+    a = np.asarray(Image.open(sorted((tmp_path / "plain").glob("frame_*.png"))[-1]).convert("RGB")).astype("f4")
+    b = np.asarray(Image.open(sorted((tmp_path / "skin").glob("frame_*.png"))[-1]).convert("RGB")).astype("f4")
+    assert np.abs(a - b).mean() > 1.0
+
+
+def test_example_command_loads_the_preset():
+    st = mt.SkinState()
+    sdo(st, op="example", name="kene_cloth_world")
+    assert st.to_json()["slots"] == mt.EXAMPLES["kene_cloth_world"]["slots"]
+    with pytest.raises(ValueError):
+        mt.validate(dict(cmd="skin", op="example", name="nope"))
+
+
+def test_freeing_the_live_array_never_refades_image_skins(tmp_path):
+    eng, lib, hub = make_engine(tmp_path)
+    st = mt.SkinState()
+    st.assign("corridor", "walls", "ai", "t0.png")
+    st.assign("corridor", "floor", "layer", "kene")
+    frames(eng, st, hub)
+    walls, floor = eng._slots["corridor"]
+    assert walls.amt == 1.0 and floor.cur >= 100
+    hub.gen += 1                                  # the hub freed its array
+    eng.update(st.step(1 / 60), 1 / 60, dict(bpm=120.0))
+    assert walls.amt == 1.0 and walls.cur >= 0, "the image skin stays"
+    assert floor.cur_key is None or floor.cur >= 100

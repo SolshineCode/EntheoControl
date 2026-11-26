@@ -11,9 +11,11 @@ from . import protocol
 from .assistant import Assistant, OnlineLog
 from .backends import AgyBackend, ClaudeBackend
 from .images import AgyImageProvider, GeminiApiProvider, KeyStore, NanoBanana, default_key_path
+from .vision import GeminiChatBackend
 
 PRIVACY_NOTE = ("ONLINE is on: chat messages + the current settings go to the chosen assistant (Anthropic / Google); "
-                "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.")
+                "image prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply. With "
+                "\"Show the assistant the output\" one small picture of the output goes with that message.")
 CLI_NOTE = ("Allow Google CLI tools lets this plugin drive the agy CLI (chat, Nano Banana images, AUTO MAP vision) with "
             "your agy login. agy is a coding AGENT: it runs in read-only plan mode inside a throw-away folder and is "
             "told to answer only, but it is not a tool-less model. Antigravity's terms (antigravity.google/terms) may "
@@ -57,7 +59,8 @@ class OnlinePlugin:
         work = Path(work_root) if work_root else self.root / "logs" / "online_work"
         if backends is None:                                       # Claude Code is the default; agy is opt-in
             backends = {"claude": ClaudeBackend(work, model=os.environ.get("ONLINE_CLAUDE_MODEL") or "sonnet"),
-                        "agy": AgyBackend(model=os.environ.get("ONLINE_AGY_MODEL") or None)}
+                        "agy": AgyBackend(model=os.environ.get("ONLINE_AGY_MODEL") or None),
+                        "gemini": GeminiChatBackend(self.keys)}           # the user's own key (AI DREAM tab)
         self.assistant = Assistant(backends, log=self.log, lister=self._lister, clock=clock, sync=sync,
                                    mode=s["mode"], backend=s["backend"])
         self.images = NanoBanana(self.tex_dir, Path(snapshot) if snapshot else self.root / "snapshots" / "current.png",
@@ -65,9 +68,27 @@ class OnlinePlugin:
                                  log=self.log, clock=clock, sync=sync)
         self.assistant.blocked = {} if self.cli_google else {"agy": AGY_CHAT_NOTE}
         self.assistant.rescan = self._scan_lists
+        self.assistant.capture = self._capture                     # SEE THE OUTPUT: one picture from the engine
         self.images.rescan = self._scan_lists
         self.log.log("online", on=True, mode=s["mode"], backend=s["backend"], engine=s["engine"])
         self.rescan()
+
+    @property
+    def snaps(self):
+        return self.assistant.snaps
+
+    @staticmethod
+    def _capture(ctl):
+        """GL thread: ask the engine for ONE picture of the guarded output (live_visuals `[online-see>`)."""
+        import control
+        ctl._out.append(control.passthrough("assist_snap"))
+        return True
+
+    def snapshot_in(self, jpg):
+        self.assistant.snapshot_in(jpg)
+
+    def snap_jpeg(self, i):
+        return self.assistant.snaps.get(i)
 
     def _lister(self):
         return self._lists                                         # cached: the render thread never lists folders
@@ -115,7 +136,13 @@ class OnlinePlugin:
         op = c["op"]
         a = self.assistant
         if op == "ask":
-            a.ask(ctl, c["text"], c.get("backend"))
+            a.ask(ctl, c["text"], c.get("backend"), see_out=bool(c.get("see")), loop=int(c.get("loop", 0)))
+        elif op == "see_ok":
+            a.see_ok(ctl, c["id"])
+        elif op == "see_drop":
+            a.see_drop(c["id"])
+        elif op == "loop_stop":
+            a.loop_stop()
         elif op == "apply":
             a.apply(ctl, c["id"])
         elif op == "dismiss":

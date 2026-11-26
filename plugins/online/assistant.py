@@ -7,6 +7,12 @@ or applies it (AUTOPILOT). Only queues cross threads; the controller is only eve
 is capped, scrubbed and parsed on the worker thread, and folder listings / CLI checks never run on the GL thread.
 
 Every applied batch records what it replaced, so it can be undone from the history list.
+
+SEE THE OUTPUT (see.py): with `see`, the GL thread asks the engine for ONE picture of the guarded output (`capture`
+hook -> {"cmd": "assist_snap"}); it arrives through `snapshot_in` (any thread, a queue) and is attached to the request
+in `tick`. A picture that could show people is held until the performer confirms it. The LOOK-AND-ADJUST loop is a
+small state machine in `tick`: look -> ask -> apply (SUGGEST: the performer; AUTOPILOT: at once) -> settle -> look ...
+at most n model calls, each one through the same request limit, allowlist, clamps and undo history.
 """
 import collections
 import copy
@@ -20,7 +26,7 @@ from pathlib import Path
 import control
 from params import PARAMS, TRIGGERS
 
-from . import safety
+from . import safety, see
 
 MIN_APPLY_S = 1.0            # s between applied batches (with one value per param per batch: <= 1 change / s / param)
 ASK_LIMIT = (6, 60.0)        # chat requests per window
@@ -122,7 +128,7 @@ def describe_params(base):
     return "\n".join(lines)
 
 
-def build_prompt(ctl, user_text, tex=(), art=(), chat=()):
+def build_prompt(ctl, user_text, tex=(), art=(), chat=(), see_txt=""):
     """The whole request as one text: role, strict schema, params registry + current values, scenes, libraries."""
     scenes = [f'{i + 1} "{(s.get("name") or "").strip() or "unnamed"}"' for i, s in enumerate(ctl.scenes) if s]
     groups = sorted(k for k in control.BYPASS_COVER if k not in PARAMS)
@@ -152,6 +158,8 @@ def build_prompt(ctl, user_text, tex=(), art=(), chat=()):
     if recent:
         parts.append("EARLIER IN THIS CHAT:\n" + "\n".join(recent))
     parts.append("PERFORMER: " + user_text.strip())
+    if see_txt:
+        parts.append(see_txt)
     return "\n\n".join(parts)
 
 
@@ -337,6 +345,13 @@ class Assistant:
         self._avail = None                             # name -> bool, filled off the render thread (refresh)
         self._stop = False
         self._thread = None
+        # SEE THE OUTPUT
+        self.snaps = see.SnapStore()                   # pictures, memory only (the panel shows the exact bytes sent)
+        self.capture = lambda ctl: False               # plugin hook (GL thread): ask the engine for one picture
+        self._snap_q = queue.Queue(maxsize=4)          # engine -> GL thread
+        self._await = None                             # the request waiting for its picture
+        self._held = {}                                # confirm id -> request held back (people could be in it)
+        self.loop = None                               # the look-and-adjust loop, or None
 
     # ---------------------------------------------------------------- helpers
     def _next(self):
@@ -363,9 +378,9 @@ class Assistant:
         return bool((self._avail or {}).get(name))
 
     # ---------------------------------------------------------------- GL thread: requests
-    def ask(self, ctl, text, backend=None):
+    def ask(self, ctl, text, backend=None, see_out=False, loop=0):
         name = backend or self.backend
-        self._msg("user", text)
+        um = self._msg("user", text)
         if name not in self.backends:
             self._msg("system", f"Unknown backend '{name}'.")
             return False
@@ -382,16 +397,41 @@ class Assistant:
         if self._queued >= MAX_QUEUE:
             self._msg("system", "Still working on earlier requests: wait or press CANCEL.")
             return False
+        be = self.backends[name]
+        if see_out and not getattr(be, "sees", False):
+            self._msg("system", f"{be.label} is text only here (it cannot be shown a picture without tools): this "
+                                "message goes without the picture" + (" and without the look-and-adjust loop." if loop > 1 else "."))
+            see_out, loop = False, 0
+        if see_out and (self._await is not None or self.loop is not None or self._held):
+            self._msg("system", "The assistant is still looking at the output (or a loop is running): wait, or press "
+                                "STOP LOOP / CANCEL.")
+            return False
         if not self._ask_rate.allow():
             self._msg("system", f"Slow down: at most {ASK_LIMIT[0]} requests a minute.")
             self.log.log("rate_limited", what="ask")
             return False
+        if see_out:
+            n = max(1, min(int(loop or 1), see.LOOP_MAX))
+            if n > 1:
+                um["step"] = 1
+                self.loop = dict(id=self._next(), n=n, step=1, text=text, backend=name, phase="look", t=self.clock(),
+                                 pid=None, before=None, prev="", sig=None, why="", ev=None)
+                self.log.log("loop", what="start", n=n, backend=name)
+            return self._look(ctl, dict(text=text, backend=name, step=1, n=n, msg=um, chat=list(self.msgs)[:-1]))
+        return self._queue(ctl, text, name, chat=list(self.msgs)[:-1])
+
+    def _queue(self, ctl, text, name, chat=(), images=None, see_txt="", loop_id=None):
+        """Build the prompt from the state RIGHT NOW and hand the job to the worker."""
         tex, art = self.lister()                       # cached listing: no disk access on this thread
-        prompt = build_prompt(ctl, text, tex, art, chat=list(self.msgs)[:-1])
+        prompt = build_prompt(ctl, text, tex, art, chat=chat, see_txt=see_txt)
         ev = threading.Event()
-        job = dict(id=self._next(), text=text, backend=name, prompt=prompt, gen=self._gen, cancel=ev)
+        job = dict(id=self._next(), text=text, backend=name, prompt=prompt, gen=self._gen, cancel=ev,
+                   images=list(images or []), loop=loop_id)
+        if loop_id is not None and self.loop is not None:
+            self.loop["ev"] = ev
         self._events.add(ev)
-        self.log.log("request", id=job["id"], backend=name, text=text, prompt_chars=len(prompt))
+        self.log.log("request", id=job["id"], backend=name, text=text, prompt_chars=len(prompt),
+                     pictures=[(n, len(b)) for n, b in job["images"]], loop=loop_id)      # sizes only, never the picture
         self._queued += 1
         if self.sync:
             self._run_job(job)
@@ -419,8 +459,9 @@ class Assistant:
         self._busy = busy
         parsed = err = None
         try:
+            kw = dict(images=job["images"]) if job.get("images") else {}      # text-only call: the old signature
             raw = self.backends[job["backend"]].ask(job["prompt"], cancel=ev,
-                                                   progress=lambda n: busy.__setitem__("chars", n))
+                                                   progress=lambda n: busy.__setitem__("chars", n), **kw)
             raw = redact(str(raw)[:safety.MAX_REPLY])         # bounded, scrubbed, and parsed here: not on the render thread
             parsed = (raw,) + tuple(safety.parse_reply(raw))
         except Exception as ex:
@@ -443,6 +484,8 @@ class Assistant:
             self._queued = max(0, self._queued - 1)
             self._events.discard(job["cancel"])
             self._handle(ctl, job, parsed, err, secs)
+        if self._await is not None or self.loop is not None or not self._snap_q.empty():
+            self._see_tick(ctl)
         fb = self._fade_back
         if fb and self.clock() >= fb[0]:
             self._fade_back = None
@@ -461,6 +504,7 @@ class Assistant:
         if err:
             self.log.log("error", id=job["id"], backend=job["backend"], secs=round(secs, 2), error=err)
             self._msg("system", f"{label} failed after {secs:.1f} s: {err}", backend=job["backend"], secs=round(secs, 1))
+            self._loop_reply(ctl, job, None, [], err)
             return
         text, say, raw, perr = parsed
         tex, art = self.lister()
@@ -474,6 +518,7 @@ class Assistant:
         if perr and not ok:
             m["warn"] = perr
         if not ok and not rejected:
+            self._loop_reply(ctl, job, None, ok, "")
             return
         pid = self._next()
         self.props[pid] = dict(id=pid, status="pending" if ok else "rejected", cmds=ok, diff=describe(ctl, ok),
@@ -482,6 +527,7 @@ class Assistant:
         m["prop"] = pid
         for old in sorted(self.props)[:-MAX_MSGS]:
             del self.props[old]
+        self._loop_reply(ctl, job, pid, ok, "")
         if ok and self.mode == "autopilot":
             self.apply(ctl, pid, by="autopilot")
 
@@ -545,6 +591,9 @@ class Assistant:
         self.history.append(dict(id=pid, t=time.strftime("%H:%M:%S"), summary=summary, undone=False, stale=False,
                                  before=before, by=by, n=len(cmds)))
         self.log.log("apply", prop=pid, by=by, commands=cmds, diff=p["diff"])
+        L = self.loop
+        if L is not None and L["pid"] == pid:          # the loop's own batch: let it settle, then look again
+            L.update(phase="settle", t=now, t_still=None, sig=see.touch_sig(ctl), prev="; ".join(p["diff"])[:400], why="")
         return True
 
     def dismiss(self, pid):
@@ -578,6 +627,7 @@ class Assistant:
 
     # ---------------------------------------------------------------- cancel / panic / close
     def cancel(self, why="cancelled"):
+        self._see_reset("cancelled" if why == "cancelled" else why)
         self._gen += 1
         for ev in list(self._events):                   # the running job (its CLI tree is killed) and every queued one
             ev.set()
@@ -616,6 +666,7 @@ class Assistant:
         self._stop = True
         self.cancel("closing")
         self._jobs.put(None)
+        self.snaps.clear()                             # pictures never outlive the ONLINE switch
 
     # ---------------------------------------------------------------- panel
     def state(self):
@@ -627,6 +678,7 @@ class Assistant:
         return dict(
             mode=self.mode, backend=self.backend,
             backends={n: dict(label=getattr(be, "label", n), ok=self.available(n), optin=n in getattr(self, "blocked", {}),
+                              sees=bool(getattr(be, "sees", False)),
                               why=(getattr(be, "problem", "") or "") if self._avail is not None else "checking")
                       for n, be in self.backends.items()},
             busy=dict(id=b["id"], backend=b["backend"], secs=round(time.monotonic() - b["t0"], 1), chars=b["chars"]) if b else None,
@@ -635,4 +687,200 @@ class Assistant:
             props=props,
             history=[dict(id=x["id"], t=x["t"], summary=x["summary"][:160], undone=x["undone"], by=x["by"],
                           stale=bool(x.get("stale"))) for x in list(self.history)[-SHOWN_MSGS:]],
-            note=self.note)
+            note=self.note,
+            looking=self._await is not None,
+            loop=None if self.loop is None else dict(step=self.loop["step"], n=self.loop["n"], phase=self.loop["phase"],
+                                                     why=self.loop["why"], secs=round(self.clock() - self.loop["t"], 1)))
+
+    # ================================================================ SEE THE OUTPUT
+    def snapshot_in(self, jpg):
+        """The engine's picture (encoder thread). Only a JPEG of sane size is taken; the GL thread decides the rest."""
+        if see.is_jpeg(jpg):
+            try:
+                self._snap_q.put_nowait(bytes(jpg))
+            except queue.Full:
+                pass
+
+    def _look(self, ctl, req):
+        """Ask the engine for one picture for this request (GL thread). The request waits in self._await."""
+        req["t0"] = self.clock()
+        self._await = req
+        try:
+            asked = bool(self.capture(ctl))
+        except Exception:
+            asked = False
+        if not asked:
+            self._await = None
+            self._msg("system", "No picture of the output can be taken right now (the engine is not capturing): nothing "
+                                "was sent.")
+            self._loop_end("no picture of the output")
+            return False
+        if self.loop is not None:
+            self.loop.update(phase="look", t=self.clock(), why="")
+        return True
+
+    def _see_tick(self, ctl):
+        now = self.clock()
+        while True:
+            try:
+                jpg = self._snap_q.get_nowait()
+            except queue.Empty:
+                break
+            if self._await is not None:                # otherwise nobody asked for it: dropped
+                req, self._await = self._await, None
+                self._got_picture(ctl, req, jpg)
+        if self._await is not None and now - self._await["t0"] > see.SNAP_TIMEOUT_S:
+            self._await = None
+            self._msg("system", "No picture of the output arrived (is the engine running with its preview?): nothing "
+                                "was sent.")
+            self._loop_end("no picture of the output arrived")
+        L = self.loop
+        if L is None:
+            return
+        if L["sig"] is not None and see.touch_sig(ctl) != L["sig"]:
+            self._loop_end("you took over (a fader or switch moved)")
+            return
+        ph = L["phase"]
+        if ph == "apply":
+            p = self.props.get(L["pid"])
+            if p is None or p["status"] in ("dismissed", "rejected", "undone", "locked"):
+                self._loop_end("its proposal was not applied")
+            elif now - L["t"] > see.APPLY_WAIT_S:
+                self._loop_end("nobody applied its proposal")
+        elif ph == "settle":
+            busy = ctl._morph is not None or ctl.pending is not None or self._fading(ctl)
+            if busy and now - L["t"] < see.SETTLE_MAX_S:
+                L["t_still"] = None
+                return
+            if L.get("t_still") is None:
+                L["t_still"] = now
+            if now - L["t_still"] < see.SETTLE_S and now - L["t"] < see.SETTLE_MAX_S:
+                return
+            if L["step"] >= L["n"]:
+                self._loop_end(f"all {L['n']} steps done", done=True)
+                return
+            L.update(phase="rate", t_rate=now, why="")
+            self._loop_next(ctl)
+        elif ph == "rate":
+            self._loop_next(ctl)
+
+    @staticmethod
+    def _fading(ctl):
+        byp = getattr(ctl, "_byp", None) or {}
+        return (any((k in ctl.bypass and v < 1.0) or k not in ctl.bypass for k, v in byp.items())
+                or any(k not in byp for k in ctl.bypass))
+
+    def _loop_next(self, ctl):
+        L = self.loop
+        now = self.clock()
+        if self._queued >= MAX_QUEUE or not self._ask_rate.allow():
+            L["why"] = f"request limit ({ASK_LIMIT[0]} a minute): waiting"
+            if now - L.get("t_rate", now) > see.RATE_WAIT_S:
+                self._loop_end("the request limit held it back too long")
+            return
+        L["step"] += 1
+        self._look(ctl, dict(text=L["text"], backend=L["backend"], step=L["step"], n=L["n"], before=L["before"],
+                             prev=L["prev"], chat=list(self.msgs)))
+
+    def _got_picture(self, ctl, req, jpg):
+        sid = self.snaps.put(jpg)
+        if req["step"] <= 1:
+            pics = [("output.jpg", sid)]                   # shown on the message once it is really sent
+        else:
+            imgs = [dict(id=req["before"], label="before"), dict(id=sid, label="after")]
+            req["msg"] = self._msg("loop", f"Look-and-adjust step {req['step']} of {req['n']}: the output before and "
+                                           f"after the last change goes to the assistant.", imgs=imgs, step=req["step"])
+            pics = [("before.jpg", req["before"]), ("output.jpg", sid)]
+        req["pics"], req["sid"] = pics, sid
+        risk = see.people_risk(getattr(ctl, "values", None) or ctl.base, ctl.bypass)
+        if risk:
+            hid = self._next()
+            req["confirm_msg"] = self._msg("system", "People could be in this picture (" + "; ".join(risk) + "). It is "
+                                           "NOT sent unless you press SEND THIS PICTURE.", confirm=hid, people=risk,
+                                           imgs=[dict(id=sid, label="to send")])
+            self._held[hid] = req
+            if self.loop is not None:
+                self.loop.update(phase="confirm", t=self.clock(), why="waiting for your confirmation")
+            self.log.log("see_held", people=risk)
+            return
+        self._send_picture(ctl, req)
+
+    def _send_picture(self, ctl, req):
+        images = []
+        for name, sid in req["pics"]:
+            b = self.snaps.get(sid)
+            if b is None:
+                self._msg("system", "That picture is no longer held: nothing was sent.")
+                self._loop_end("picture lost")
+                return False
+            images.append((name, b))
+        if req["step"] <= 1:
+            req["msg"]["imgs"] = [dict(id=req["sid"], label="sent")]      # exactly these bytes go out
+        txt = see.see_text(req["step"], req["n"], req.get("prev", ""))
+        lid = self.loop["id"] if self.loop is not None else None
+        if self.loop is not None:
+            self.loop.update(phase="ask", t=self.clock(), before=req["sid"], why="", sig=see.touch_sig(ctl))
+        self._queue(ctl, req["text"], req["backend"], chat=req.get("chat", ()), images=images, see_txt=txt, loop_id=lid)
+        return True
+
+    def see_ok(self, ctl, hid):
+        req = self._held.pop(hid, None)
+        if req is None:
+            return False
+        req["confirm_msg"].pop("confirm", None)
+        req["confirm_msg"]["text"] += "  (sent)"
+        self.log.log("see_confirmed")
+        return self._send_picture(ctl, req)
+
+    def see_drop(self, hid):
+        req = self._held.pop(hid, None)
+        if req is None:
+            return False
+        self.snaps.drop(req["sid"])
+        for m in (req["confirm_msg"], req["msg"]):
+            m.pop("confirm", None)
+            m["imgs"] = [i for i in m.get("imgs", []) if i["id"] != req["sid"]]
+        req["confirm_msg"]["text"] = "Picture discarded: nothing was sent."
+        self.log.log("see_dropped")
+        self._loop_end("the picture was not sent")
+        return True
+
+    def _loop_reply(self, ctl, job, pid, ok, err):
+        """A reply to one of the loop's requests arrived (GL thread)."""
+        L = self.loop
+        if L is None or job.get("loop") != L["id"]:
+            return
+        L["ev"] = None
+        if err:
+            self._loop_end("the assistant failed")
+        elif not ok:
+            self._loop_end("the assistant is happy with the look" if pid is None else "nothing it proposed could be applied",
+                           done=pid is None)
+        else:
+            L.update(pid=pid, phase="apply", t=self.clock(), why="", sig=see.touch_sig(ctl))
+
+    def _loop_end(self, why, done=False):
+        L, self.loop = self.loop, None
+        if L is None:
+            return
+        if L.get("ev") is not None:                    # its request still in flight: that reply is dropped
+            L["ev"].set()
+        if self._await is not None and self._await.get("step", 1) > 1:
+            self._await = None
+        self._msg("loop" if done else "system", ("Look-and-adjust loop finished: " if done else "Look-and-adjust loop stopped: ") + why
+                  + f" (step {L['step']} of {L['n']}). Every applied step can be undone from the list.")
+        self.log.log("loop", what="end", why=why, step=L["step"], n=L["n"])
+
+    def loop_stop(self):
+        self._loop_end("stopped by you")
+
+    def _see_reset(self, why):
+        self._loop_end(why)
+        self._await = None
+        for hid in list(self._held):
+            self.see_drop(hid)
+        try:
+            while True:
+                self._snap_q.get_nowait()
+        except queue.Empty:
+            pass

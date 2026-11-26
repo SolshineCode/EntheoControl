@@ -100,6 +100,10 @@ try:                                                 # [themes] THEMES + SOUND T
     import themes as _themes
 except ImportError:
     _themes = None
+try:                                                 # [transitions] visual scene transitions (doors, iris, portal...)
+    import transitions as _trans
+except ImportError:
+    _trans = None
 HISTORY_MAX = 50             # engine-side undo steps (Controller.history)
 HIST_GAP = 0.6               # s: moves of one control without a gesture id closer than this are one undo step
 HIST_G_GAP = 5.0             # s: a gesture id older than this starts a new step (a reloaded panel reuses ids)
@@ -195,6 +199,8 @@ def valid_target(t):
             return _clips is not None and bool(_clips.ID.match(p[1]))
         if p[0] == "theme" and len(p) == 2:          # [themes] theme:<slot>: a pad restores a tray theme
             return _themes is not None and p[1].isdigit() and 1 <= int(p[1]) <= _themes.MAX_TRAY
+        if p[0] == "transition" and len(p) == 2:     # [transitions] transition:<kind|morph|len|cancel>: a pad picks
+            return _trans is not None and (p[1] in _trans.KINDS or p[1] in ("morph", "len", "cancel"))   # the default
     except ValueError:
         pass
     return False
@@ -355,6 +361,28 @@ def _v_recall(c):
     out = {"cmd": "scene_recall", "i": _int(c, "i", 0, N_SCENES - 1)}
     if "now" in c:
         out["now"] = _bool(c, "now")
+    _v_trans_field(c, out)
+    return out
+
+
+def _v_trans_field(c, out):
+    """[transitions] optional "transition" on a recall: a kind name / spec object, or "morph" (= the plain glide)."""
+    if _trans is not None and c.get("transition") is not None:
+        t = c["transition"]
+        out["transition"] = "morph" if t == "morph" else (_trans.clean_spec(t) or "morph")
+    return out
+
+
+def _v_transition(c):
+    """[transitions] {"cmd": "transition", "op": default | scene | origin | cancel | finish, ...}"""
+    op = _name(c, ("default", "scene", "origin", "cancel", "finish"), "op")
+    out = {"cmd": "transition", "op": op}
+    if op in ("default", "scene"):
+        out["spec"] = _trans.clean_spec(c.get("spec"))
+    if op == "scene":
+        out["i"] = _int(c, "i", 0, N_SCENES - 1)
+    if op == "origin":
+        out["x"], out["y"] = _num(c, "x", 0.0, 1.0), _num(c, "y", 0.0, 1.0)
     return out
 
 
@@ -377,9 +405,17 @@ def _v_gen(c):
     if c.get("seed") is not None:
         out["seed"] = _int(c, "seed", 0, 2 ** 31 - 1)
     if c.get("init") is not None:
-        if c["init"] != "snapshot":
-            raise ValueError("'init' must be null or \"snapshot\"")
-        out["init"] = "snapshot"
+        ini = c["init"]
+        if isinstance(ini, dict):                      # dream from one library image: {kind: art | ai, name}
+            nm = ini.get("name")
+            if (ini.get("kind") not in ("art", "ai") or not isinstance(nm, str) or not _TEX_NAME.match(nm)
+                    or ".." in nm or nm.lower().endswith(".depth.png")):
+                raise ValueError("'init' image must be {kind: art | ai, name: an image file name}")
+            out["init"] = {"kind": ini["kind"], "name": nm}
+        elif ini != "snapshot":
+            raise ValueError("'init' must be null, \"snapshot\" or {kind, name}")
+        else:
+            out["init"] = "snapshot"
     if "strength" in c or out["init"]:
         out["strength"] = _num(c, "strength", 0.2, 0.9, 0.45)
     return out
@@ -503,6 +539,8 @@ if _clips is not None:                               # clips.py: clip launch / m
 _VALIDATORS["history"] = lambda c: {"cmd": "history", "op": _name(c, ("undo", "redo"), "op")}   # engine-side undo
 if _themes is not None:                              # [themes] {"cmd": "theme", "op": ...}: themes.validate
     _VALIDATORS["theme"] = _themes.validate
+if _trans is not None:                               # [transitions] default / per-scene / origin / cancel / finish
+    _VALIDATORS["transition"] = _v_transition
 if _online is not None:                              # {"cmd": "online", "op": ...}: plugins/online/protocol.py
     _VALIDATORS["online"] = _online.validate
 # ---- TIMELINE (timeline.py) + SHOWS / PRESETS (shows.py)
@@ -541,13 +579,14 @@ def _v_tl_event(c):
         return passthrough(k)
     if k == "show_texture":
         name = c.get("name")
-        if not isinstance(name, str) or not _TEX_NAME.match(name) or ".." in name:
+        bare = name[4:] if isinstance(name, str) and name.startswith("art/") else name   # art/<name>: an art upload
+        if not isinstance(name, str) or not isinstance(bare, str) or not _TEX_NAME.match(bare) or ".." in name:
             raise ValueError("'name' must be a texture file name")
         return passthrough(k, name=name)
     src, name = c.get("source", "art"), c.get("name")
-    if src not in ("art", "ai") or not isinstance(name, str) or not 0 < len(name) <= 200 or name in (".", "..") or any(
+    if src not in ("art", "ai", "any") or not isinstance(name, str) or not 0 < len(name) <= 200 or name in (".", "..") or any(
             ch in name for ch in '/\\:\0') or any(ord(ch) < 32 for ch in name) or (src == "ai" and not _TEX_NAME.match(name)):
-        raise ValueError("'art_pick' needs source art | ai and a file name")
+        raise ValueError("'art_pick' needs source art | ai | any and a file name")
     return passthrough(k, source=src, name=name)
 
 
@@ -608,6 +647,7 @@ def _v_preset(c):
     if op == "recall":
         out["groups"] = _groups(c)
         out["morph"] = _num(c, "morph", 0.0, 64.0, 0.0)
+        _v_trans_field(c, out)                     # [transitions]
     if op == "set":
         if "name" in c:
             out["name"] = _shows.clean_name(c["name"])
@@ -701,6 +741,13 @@ def _clean_scene(raw):
         out["stack"] = _stack.clean_stack(raw["stack"])               # recalling one leaves the stack alone
     if _skins is not None and isinstance(raw.get("skins"), dict):      # same rule for environment skins
         out["skins"] = _skins.clean_skins(raw["skins"])
+    if _trans is not None and raw.get("transition") is not None:       # [transitions] the scene's own default
+        try:
+            t = _trans.clean_spec(raw["transition"])
+        except ValueError:
+            t = None
+        if t is not None:
+            out["transition"] = t
     return out
 
 
@@ -745,7 +792,8 @@ def meta():
         skins=_skins.meta() if _skins is not None else None,
         clips=dict(lanes={ln: list(v) for ln, v in _clips.LANE_PARAMS.items()}, clip_lanes=list(_clips.CLIP_LANES),
                    lane_names=dict(_clips.LANE_NAMES), curves=list(_clips.CURVES), widgets=list(_clips.WIDGETS))
-        if _clips is not None else None)
+        if _clips is not None else None,
+        transitions=_trans.meta() if _trans is not None else None)
 
 
 # ------------------------------------------------------------------ factory scenes
@@ -1010,6 +1058,8 @@ class Controller:
         self.comp = {ln: dict(clip=None, macros=[], over=[]) for ln in lanes}
         self.locks = {ln: False for ln in lanes}       # PALETTE LOCK per lane (False = the palette follows the clip)
         self._lane_morph = {}                          # lane -> per-lane MORPH of a launch (src, to, names, start, dur)
+        self.trans = _trans.Transitioner(self) if _trans is not None else None   # [transitions] BLEND state machine
+        self._pend_trans = None                        # [transitions] the spec of the quantized recall in `pending`
         self._clip_pending = []                        # quantized launches / stops waiting for their beat
         self._macro_map = {}                           # param -> (lane, macro index) of the clips on air
         self._macro_writing = False                    # True while a macro writes its targets (not an override)
@@ -1210,6 +1260,9 @@ class Controller:
     def panic(self):
         """Failover: clear every trigger, cancel pending recalls / morphs, snap to the safe scene."""
         self.panics += 1                               # governor.py drops a pending suggestion / countdown
+        if self.trans is not None:                     # [transitions] no transition / queue / dip survives PANIC
+            self.trans.panic()
+        self._pend_trans = None
         for n in TRIGGERS:
             self.held[n] = False
             self.base[n] = PARAMS[n][2]
@@ -1385,6 +1438,8 @@ class Controller:
         if self.canvas_prev is None:
             self.canvas_prev = dict(base={n: self.base[n] for n in CONT}, mods=_copy_mods(self.mods),
                                     bypass=sorted(self.bypass), stack=self.stack.to_json(), auto=bool(self.auto["on"]))
+        if self.trans is not None:                     # [transitions] a canvas is not a scene: drop any BLEND
+            self.trans.cancel(revert=False)
         self.pending = self._morph = None
         self._stack_morph = False
         self.auto["on"] = False                        # a scene step must not paint over the canvas
@@ -1753,6 +1808,8 @@ class Controller:
         sb = self.scenes[xf["b"]] if 0 <= xf["b"] < N_SCENES else None
         if sa is None or sb is None:
             return
+        if self.trans is not None:                     # [transitions] the crossfader takes the look by hand
+            self.trans.cancel(revert=False)
         self.pending = self._morph = None
         self._comp_clear()
         for n in CONT:
@@ -1767,6 +1824,38 @@ class Controller:
             self._xside = side
             self.mods = _copy_mods((sb if side == "b" else sa)["mods"])
         self.cur = xf["a"] if x <= 0.0 else xf["b"] if x >= 1.0 else -1
+
+    def _trans_do(self, c):
+        """[transitions] {"cmd": "transition", "op": default | scene | origin | cancel | finish}"""
+        tr, op = self.trans, c["op"]
+        if op == "default":
+            spec = c.get("spec")
+            tr.default = _trans.clean_spec(spec) if spec is not None and not isinstance(spec, dict) else spec
+            self._changed()
+        elif op == "scene":
+            sc = self.scenes[c["i"]]
+            if sc is not None:
+                if c.get("spec") is None:
+                    sc.pop("transition", None)
+                else:
+                    sc["transition"] = c["spec"]
+                self._save_scenes()
+                self._changed()
+        elif op == "origin":
+            tr.origin = [c["x"], c["y"]]
+        elif op == "cancel":
+            tr.cancel()
+        elif op == "finish":
+            tr.finish()
+
+    def _trans_len(self, x):
+        """[transitions] a knob on the default's length: 1 / 2 / 4 / 8 / 16 beats."""
+        tr = self.trans
+        if tr.default is None:
+            return
+        beats = (1.0, 2.0, 4.0, 8.0, 16.0)[min(4, int(min(1.0, max(0.0, x)) * 5))]
+        tr.default = dict(tr.default, beats=beats)
+        tr.default.pop("secs", None)
 
     def scene_save(self, i):
         if not 0 <= i < N_SCENES:
@@ -1807,11 +1896,19 @@ class Controller:
             if self.shows is not None and self.shows.enabled:
                 self.shows.submit("scene_thumb_clear", slot=i)
 
-    def scene_recall(self, i, now=False):
-        """Recall slot i at the next quantize boundary (or immediately), morphing over morph_bars."""
+    def scene_recall(self, i, now=False, transition=None):
+        """Recall slot i at the next quantize boundary (or immediately), morphing over morph_bars.
+        [transitions] transition: a spec / kind / "morph" for this recall (else the scene's own, else the default)."""
         if not 0 <= i < N_SCENES or self.scenes[i] is None:
             return False
-        q = QUANT.get(self.quantize, 0)
+        spec = None
+        if self.trans is not None:
+            try:
+                spec = self.trans.resolve(None if transition is None else transition, self.scenes[i])
+            except ValueError:
+                spec = None
+        q = QUANT.get(spec.get("quantize", self.quantize) if spec else self.quantize, 0)
+        self._pend_trans = spec
         if now or q == 0:
             self.pending = None
             self._manual_recall(i)
@@ -1821,11 +1918,19 @@ class Controller:
 
     def _manual_recall(self, i):
         """A recall the performer asked for: autopilot waits a full period before it changes the look again."""
-        self._start_recall(i, self.morph_bars)
+        spec, self._pend_trans = self._pend_trans, None
+        if self.trans is not None:                     # [transitions] BLEND / MORPH / queued behind a running one
+            bars = self.morph_bars
+            self.trans.run(lambda: self._start_recall(i, bars), spec, f"scene {i + 1}")
+        else:
+            self._start_recall(i, self.morph_bars)
         if self.auto["on"]:
             self._auto_next = self.beat + self.auto["bars"] * 4.0
         if self.tl is not None and not self._tl_firing and self.tl.recording():
-            it = self.tl.add_item("cue", {"t": self.tl.pos, "kind": "scene", "slot": i, "morph": self.morph_bars})
+            cue = {"t": self.tl.pos, "kind": "scene", "slot": i, "morph": self.morph_bars}
+            if spec is not None:                       # [transitions] the recorded cue replays the same transition
+                cue["transition"] = spec
+            it = self.tl.add_item("cue", cue)
             if it:
                 self._rec_ids.add(it["id"])
 
@@ -1939,7 +2044,8 @@ class Controller:
                     skins=self.skins.to_json() if self.skins is not None else None,
                     skins_on=bool(self.skins.on) if self.skins is not None else False,
                     clips=[copy.deepcopy(x) for x in self.clips.values()], decks=copy.deepcopy(self.decks),
-                    comp=self._comp_json(), themes=self.themes.to_json() if self.themes is not None else None)
+                    comp=self._comp_json(), themes=self.themes.to_json() if self.themes is not None else None,
+                    trans=dict(default=self.trans.default, origin=list(self.trans.origin)) if self.trans is not None else None)
 
     def _autosave(self):
         if not self.autosave:
@@ -2018,6 +2124,14 @@ class Controller:
                     self._comp_restore(s.get("comp"))
             if self.themes is not None and isinstance(s.get("themes"), dict):
                 self.themes.restore(s["themes"])       # [themes] session tray (validated in themes.clean_tray)
+            if self.trans is not None and isinstance(s.get("trans"), dict):   # [transitions] default + origin
+                try:
+                    self.trans.default = _trans.clean_spec(s["trans"].get("default"))
+                except ValueError:
+                    self.trans.default = None
+                o = s["trans"].get("origin")
+                if isinstance(o, list) and len(o) == 2 and all(isinstance(x, (int, float)) and math.isfinite(x) for x in o):
+                    self.trans.origin = [min(1.0, max(0.0, float(x))) for x in o]
             f = s.get("bypass_fade")
             if isinstance(f, (int, float)) and not isinstance(f, bool) and math.isfinite(f):
                 self.bypass_fade = min(BYPASS_FADE_MAX, max(0.0, float(f)))
@@ -2126,7 +2240,9 @@ class Controller:
         elif cmd == "scene_save":
             self.scene_save(c["i"])
         elif cmd == "scene_recall":
-            self.scene_recall(c["i"], c.get("now", False))
+            self.scene_recall(c["i"], c.get("now", False), c.get("transition"))
+        elif cmd == "transition" and self.trans is not None:   # [transitions]
+            self._trans_do(c)
         elif cmd == "scene_clear":
             self.scene_clear(c["i"])
         elif cmd == "morph":
@@ -2430,15 +2546,25 @@ class Controller:
             self._tl_cue_t = self._tl_clock
             if it["kind"] == "scene":
                 if self.scenes[it["slot"]] is not None:
-                    self._start_recall(it["slot"], it["morph"])
+                    if self.trans is not None:             # [transitions] a cue's own transition only (old shows: MORPH)
+                        try:
+                            spec = self.trans.resolve(it["transition"]) if it.get("transition") is not None else None
+                        except ValueError:
+                            spec = None
+                        self.trans.run(lambda: self._start_recall(it["slot"], it["morph"]), spec, "cue")
+                    else:
+                        self._start_recall(it["slot"], it["morph"])
                     if self.auto["on"]:
                         self._auto_next = self.beat + self.auto["bars"] * 4.0
             elif self.shows is not None:
                 p = self.shows.cache.get(it["preset"])
+                po = {"groups": it.get("groups"), "morph": it["morph"]}
+                if it.get("transition") is not None:    # [transitions]
+                    po["transition"] = it["transition"]
                 if p is not None:
-                    self._apply_preset(p, {"groups": it.get("groups"), "morph": it["morph"]})
+                    self._apply_preset(p, po)
                 else:                                   # not prefetched (yet): load now, applied when it arrives
-                    self.shows.submit("preset_load", ref=it["preset"], opts={"groups": it.get("groups"), "morph": it["morph"]})
+                    self.shows.submit("preset_load", ref=it["preset"], opts=po)
         elif k == "event":
             c = dict(it["cmd"])
             if c["cmd"] == "bypass":                       # photosensitive: a layer cannot blink faster than 2.5 Hz
@@ -2779,6 +2905,8 @@ class Controller:
         """An opened show (cleaned on the worker) -> live. Only the asked-for parts; the rig (mapping, MIDI) only when
         asked. Commands for the engine (surfaces, recorder, camera, governor) go out validated, like the panel's."""
         m, parts = self.shows, set(plan.get("parts") or SHOW_DEFAULT_PARTS)
+        if self.trans is not None:                     # [transitions] an opened show replaces whatever was blending
+            self.trans.cancel(revert=False)
         bars = self.morph_bars                         # the performer's crossfade now, not the one the show brings
         self.pending = None
         if "timeline" in parts and self.tl is not None and plan.get("timelines"):
@@ -2860,6 +2988,8 @@ class Controller:
             m.submit("preset_save", preset=p, snap_t=snap_t)
         elif op == "recall":
             opts = {"groups": c.get("groups"), "morph": c["morph"], "ref": c["ref"]}
+            if self.trans is not None:                 # [transitions] the command's own, else the default (manual)
+                opts["transition"] = c["transition"] if c.get("transition") is not None else (self.trans.default or "morph")
             p = m.cache.get(c["ref"])
             if p is not None:
                 self._apply_preset(p, opts)
@@ -2911,6 +3041,15 @@ class Controller:
 
     def _apply_preset(self, p, opts):
         """A clean preset -> live. groups = partial recall (only those param groups); morph in bars (0 = snap)."""
+        if self.trans is not None and opts.get("transition") is not None and p.get("kind") in ("look", "layer", "fx"):
+            try:                                       # [transitions] BLEND the preset in (or queue / MORPH)
+                spec = self.trans.resolve(opts["transition"])
+            except ValueError:
+                spec = None
+            inner = dict(opts)
+            inner.pop("transition")
+            self.trans.run(lambda: self._apply_preset(p, inner), spec, "preset")
+            return
         kind, d = p["kind"], p["data"]
         groups = opts.get("groups")
         keep = (lambda n: PARAMS[n][3] in groups) if groups else (lambda n: True)
@@ -3088,6 +3227,9 @@ class Controller:
                     self.macro(lane, n, 1.0 if press else 0.0, key=("auto", "macro", lane, n))
                 elif m is not None and kind == "note_on":            # a pad toggles the macro min / max
                     self.macro(lane, n, 0.0 if on["macros"][n - 1] > 0.5 else 1.0, key=None)
+        elif p[0] == "transition" and p[1] == "len":    # [transitions] a knob: the default's length (continuous)
+            if kind == "cc" and self.trans is not None:
+                self._trans_len(val / 127.0)
         elif target == "xfade":
             if kind == "cc":                           # soft takeover: a physical fader that is somewhere else does
                 v, last, cur = val / 127.0, self._xf_cc, self.xfade["x"]     # nothing until it reaches the position
@@ -3103,6 +3245,11 @@ class Controller:
             self.clip_launch(p[1])
         elif p[0] == "theme" and self.themes is not None:   # [themes] restore; Shift + pad = capture the look there
             self.themes.midi(int(p[1]), shift=self._shift)
+        elif p[0] == "transition" and self.trans is not None:   # [transitions] a pad: pick the default / cancel
+            if p[1] == "cancel":
+                self.trans.cancel()
+            else:
+                self._trans_do({"cmd": "transition", "op": "default", "spec": None if p[1] == "morph" else p[1]})
         elif p[0] == "palette":
             self.set("palette", float(p[1]))
         elif p[0] == "morph":
@@ -3190,7 +3337,12 @@ class Controller:
                     keep = a["pal_hold"] > 0 and self.beat < self._pal_hold_until - 1e-6
                     if a["pal_hold"] > 0 and not keep:
                         self._pal_hold_until = self.beat + a["pal_hold"] * 32.0
-                    self._start_recall(i, self.morph_bars, keep_palette=keep)
+                    if self.trans is not None:         # [transitions] the default transition; never over a running one
+                        bars = self.morph_bars
+                        self.trans.run(lambda: self._start_recall(i, bars, keep_palette=keep),
+                                       self.trans.resolve(None, self.scenes[i]), "autopilot")
+                    else:
+                        self._start_recall(i, self.morph_bars, keep_palette=keep)
         if a["drift"]:
             k_ou, k_lp = dt / 10.0, 1.0 - math.exp(-dt / 1.5)
             for n in a["drift_params"]:
@@ -3237,6 +3389,8 @@ class Controller:
         self._step_morph()
         if self._lane_morph:
             self._step_lanes()
+        if self.trans is not None and (self.trans.active is not None or self.trans.dip is not None):
+            self.trans.step(dt)                        # [transitions] progress / commit / dip / queued recall
         if self.tl is not None:
             try:
                 self._step_timeline(dt)
@@ -3304,6 +3458,8 @@ class Controller:
             else:
                 v = 1.0 if hn else self.base[n]
             vals[n] = min(1.0, max(0.0, v))
+        if self.trans is not None and self.trans.dip is not None:
+            vals["master"] *= self.trans.dip_mul()     # [transitions] MORPH fallback: one dip through dark
         self.values = {n: vals[n] for n in PARAMS}     # PARAMS order
         if self.stack is not None:                     # math stack: phases (float64) + modulated fields -> stack.frame
             try:
@@ -3406,4 +3562,5 @@ class Controller:
             show=self._show_state(),
             comp=self._comp_state() if _clips is not None else None,
             themes=self.themes.state() if self.themes is not None else None,
+            trans=self.trans.state() if self.trans is not None else None,
         )

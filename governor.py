@@ -162,7 +162,8 @@ def build_steps(params=None):
                           lambda v, m=m: max(m, v * 0.5), "fade", "Fractal detail"))
     for n, gate, cost, label in (("being_count", ("l_beings",), "l_beings", "Beings count"),
                                  ("serpent_count", ("serpent",), "scene", "Serpent count"),
-                                 ("swarm_count", ("l_swarm",), "l_land", "Swarm count")):
+                                 ("swarm_count", ("l_swarm",), "l_land", "Swarm count"),
+                                 ("coil_count", ("l_coilnest",), "l_coilnest", "Coil nest bodies")):
         if n in P:
             m = lo(n)
             steps.append(Step(f"count:{n}", 1, n, gate, cost,

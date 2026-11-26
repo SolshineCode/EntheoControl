@@ -43,14 +43,14 @@ LANE_NAMES = {"base": "World", "figures": "Figures", "text": "Text", "interact":
 LANE_BY_GROUP = {
     "master": "master", "space": "base", "motion": "base", "shape": "base", "color": "base", "layers": "base",
     "fractal": "base", "art": "base", "land": "base", "kene": "base", "beings": "figures", "text": "text",
-    "camera": "interact", "filters": "master",
+    "camera": "interact", "filters": "master", "coilnest": "figures",
 }
 LANE_EXCEPT = {
     "palette": "master", "hue": "master", "saturation": "master", "trails": "master",     # colour narrative = master
     "l_echo": "master", "img_auto": "master", "img_hold": "master",
     "l_beings": "figures", "l_swarm": "figures", "swarm_vortex": "figures", "swarm_turb": "figures",
     "swarm_trail": "figures", "swarm_tint": "figures",
-    "l_text": "text", "l_camera": "interact",
+    "l_text": "text", "l_camera": "interact", "l_coilnest": "figures",
 }
 LANE_EXCEPT.update({n: "figures" for n in PARAMS if n.startswith("serpent")})          # serpent, serpent_mode, ...
 LANE_EXCEPT = {k: v for k, v in LANE_EXCEPT.items() if k in PARAMS}

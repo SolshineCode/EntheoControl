@@ -17,7 +17,8 @@ Settings live in ctl.ext["online"] = {on, mode, backend, engine, cli_google}, sa
 Commands (all {"cmd": "online", "op": ...}):
     enable {on: bool}                      the master ONLINE switch (default OFF)
     mode {mode: "suggest" | "autopilot"}   suggest = show a diff with Apply; autopilot = apply, undoable
-    backend {backend: "claude" | "agy"}    which CLI answers the chat. Claude Code is the default; agy needs cli_google
+    backend {backend: "claude" | "agy" | "gemini"}   who answers the chat. Claude Code is the default; agy needs
+                                           cli_google; gemini = the Gemini API with the user's own key (vision.py)
     engine {engine: "local" | "nano"}      AI DREAM image engine (nano = Nano Banana, only while ONLINE is on)
     cli_google {on: bool}                  "Allow Google CLI tools": opt-in (default OFF) to the agy CLI as chat backend,
                                            Nano Banana image provider and AUTO MAP vision provider. agy is a coding
@@ -29,7 +30,11 @@ Commands (all {"cmd": "online", "op": ...}):
                                            any other machine on the Wi-Fi cannot switch it.
     key {key: str}                         the user's own Gemini API key for Nano Banana ("" = forget it); kept in the
                                            user's app-data folder, never logged, never sent back to a panel
-    ask {text}                             chat message (<= MAX_ASK characters)
+    ask {text, see?, loop?}                chat message (<= MAX_ASK characters). see: true = ONE picture of the program
+                                           output goes with it (default off, per message; see.py). loop: 1..LOOP_MAX
+                                           look-and-adjust steps (needs see; > LOOP_MAX is capped)
+    see_ok {id} / see_drop {id}            send / discard a picture held back because people could be in it
+    loop_stop                              end a look-and-adjust loop (proposals already applied stay undoable)
     apply {id} / dismiss {id}              a pending proposal
     undo {id}                              an applied batch (history)
     cancel                                 stop the running request and clear the queue
@@ -40,15 +45,18 @@ import re
 from pathlib import Path
 
 MODES = ("suggest", "autopilot")
-BACKENDS = ("claude", "agy")
+BACKENDS = ("claude", "agy", "gemini")      # gemini = the Gemini API with the user's own key
 ENGINES = ("local", "nano")
 MAX_ASK = 1000
 MAX_ID = 10 ** 9
 DEFAULTS = dict(on=False, mode="suggest", backend="claude", engine="local", cli_google=False)
-OPS = ("enable", "mode", "backend", "engine", "cli_google", "key", "ask", "apply", "dismiss", "undo", "cancel", "clear")
+OPS = ("enable", "mode", "backend", "engine", "cli_google", "key", "ask", "apply", "dismiss", "undo", "cancel", "clear",
+       "see_ok", "see_drop", "loop_stop")
+LOOP_MAX = 6                 # look-and-adjust steps (model calls) per loop: see.LOOP_MAX
 KEY_RX = re.compile(r"^[A-Za-z0-9_\-]{20,200}$")
 
 
+ACTIVE = None                # the loaded plugin (for remote_control's /online-snap/<id>), None while ONLINE is off
 LOCAL = object()             # identity marker: cannot be produced by JSON, so a network client cannot forge it
 LOCAL_FILE = "online_local.json"
 
@@ -106,7 +114,17 @@ def validate(c):
             raise ValueError(f"'text' must be 1..{MAX_ASK} characters")
         if c.get("backend") is not None:
             out["backend"] = _choice(c, "backend", BACKENDS)
-    elif op in ("apply", "dismiss", "undo"):
+        see = c.get("see", False)
+        if not isinstance(see, bool):
+            raise ValueError("'see' must be true or false")
+        loop = c.get("loop", 0)
+        if isinstance(loop, bool) or not isinstance(loop, int) or loop < 0:
+            raise ValueError("'loop' must be a whole number of steps")
+        if see:
+            out["see"] = True
+            if loop > 1:
+                out["loop"] = min(int(loop), LOOP_MAX)
+    elif op in ("apply", "dismiss", "undo", "see_ok", "see_drop"):
         out["id"] = _id(c)
     return out
 
@@ -154,11 +172,16 @@ def _load(ctl):
     opts.setdefault("root", Path(__file__).resolve().parents[2])
     opts.setdefault("art_dir", getattr(ctl, "art_dir", None))
     ctl.online = OnlinePlugin(settings=s, **opts)
+    global ACTIVE
+    ACTIVE = ctl.online
     return ctl.online
 
 
 def _unload(ctl):
+    global ACTIVE
     p, ctl.online = getattr(ctl, "online", None), None
+    if ACTIVE is p:
+        ACTIVE = None
     if p is not None:
         try:
             p.close()
@@ -239,3 +262,29 @@ def on_panic(ctl):
 
 def close(ctl):
     _unload(ctl)
+
+
+def snapshot_in(ctl, jpg):
+    """The engine's picture of the output for the assistant (any thread; a cheap hand-over). Dropped while ONLINE is
+    off or when nobody asked for it."""
+    p = getattr(ctl, "online", None)
+    if p is not None:
+        try:
+            p.snapshot_in(jpg)
+        except Exception:
+            pass
+
+
+def snap_jpeg(ctl, i):
+    """A picture the assistant holds in memory (the exact bytes it sends), or None."""
+    p = getattr(ctl, "online", None)
+    return p.snap_jpeg(i) if p is not None else None
+
+
+def served_snap(key):
+    """remote_control: GET /online-snap/<id>. None (= 204) unless ONLINE is on and the picture is still held."""
+    p = ACTIVE
+    try:
+        return p.snap_jpeg(int(key)) if p is not None and str(key).isdigit() and len(str(key)) < 10 else None
+    except Exception:
+        return None

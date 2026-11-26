@@ -130,6 +130,10 @@ def clean_item(kind, raw, ctx, track=None):
                 out["groups"] = list(dict.fromkeys(g))
         else:
             raise ValueError("cue 'kind' must be scene or preset")
+        if raw.get("transition") is not None:          # [transitions] the cue's own visual transition (absent = MORPH)
+            import transitions as _trans
+            t = raw["transition"]
+            out["transition"] = "morph" if t == "morph" else (_trans.clean_spec(t) or "morph")
     elif kind == "auto":
         name = track.get("param") if isinstance(track, dict) else None
         if name not in ctx.params:

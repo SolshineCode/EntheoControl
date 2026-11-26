@@ -352,6 +352,8 @@ def validate(c):
             out["now"] = ctl._bool(c, "now")
         if c.get("bars") is not None:
             out["bars"] = ctl._num(c, "bars", 0.0, 64.0)
+        if c.get("transition") is not None:            # [transitions] doors / iris / portal ... for this restore
+            ctl._v_trans_field(c, out)
     elif op in ("star", "arm", "test"):
         if op == "star":
             out["id"] = tid()
@@ -634,22 +636,32 @@ class ThemeManager:
             self._bump()
 
     # ---- restore
-    def restore_theme(self, th, now=False, bars=None, auto=False, quant=None):
-        """Tap: quantized (performer's quantize, or the tag's) + morphed; now=True: an instant cut."""
+    def restore_theme(self, th, now=False, bars=None, auto=False, quant=None, transition=None):
+        """Tap: quantized (performer's quantize, or the tag's) + morphed; now=True: an instant cut.
+        [transitions] transition: a spec / "morph" / "default" (= the controller's default transition)."""
         ctl = self.ctl
         c = _ctl()
         q = c.QUANT.get("off" if (quant or ctl.quantize) == "none" else (quant or ctl.quantize), 0)
         if now or q == 0:
             self.pending = None
-            self.apply(th, bars=bars, cut=bool(now), auto=auto)
+            self.apply(th, bars=bars, cut=bool(now), auto=auto, transition=transition)
         else:
-            self.pending = dict(id=th["id"], fire=(math.floor(ctl.beat / q + 1e-6) + 1) * q, q=q, bars=bars, auto=auto)
+            self.pending = dict(id=th["id"], fire=(math.floor(ctl.beat / q + 1e-6) + 1) * q, q=q, bars=bars, auto=auto,
+                                transition=transition)
         return True
 
-    def apply(self, th, bars=None, cut=False, auto=False, hist=True):
-        """Write a theme's scope into the live state now (morphing over `bars`, or a cut)."""
+    def apply(self, th, bars=None, cut=False, auto=False, hist=True, transition=None):
+        """Write a theme's scope into the live state now (morphing over `bars`, or a cut).
+        [transitions] transition (not on a cut / a sound-tag auto restore): BLEND through Transitioner.run."""
         ctl = self.ctl
         c = _ctl()
+        tr = getattr(ctl, "trans", None)
+        if tr is not None and transition is not None and not cut and not auto:
+            try:
+                spec = tr.resolve(None) if transition == "default" else tr.resolve(transition)
+            except ValueError:
+                spec = None
+            return tr.run(lambda: self.apply(th, bars=bars, cut=cut, auto=auto, hist=hist), spec, "theme")
         scope, d = th["scope"], th["data"]
         bars = ctl.morph_bars if bars is None else float(bars)
         if cut:
@@ -945,11 +957,12 @@ class ThemeManager:
             self.capture(c["scope"], c.get("name"), c.get("slot"))
         elif op == "restore":
             th = self.find(c["id"]) if "id" in c else self.by_slot(c["slot"])
+            tr = c.get("transition")                         # [transitions] explicit; a manual restore uses the default
             if th is not None and self.ctl._tl_firing:       # a timeline event fires exactly where it was placed
-                self.apply(th, bars=c.get("bars"), cut=bool(c.get("now")))
+                self.apply(th, bars=c.get("bars"), cut=bool(c.get("now")), transition=tr)
             elif th is not None:
                 self._log("restore", th, note="cut" if c.get("now") else "")
-                self.restore_theme(th, now=c.get("now", False), bars=c.get("bars"))
+                self.restore_theme(th, now=c.get("now", False), bars=c.get("bars"), transition=tr if tr is not None else "default")
         elif op == "star":
             self.star(c["id"], c["on"])
         elif op == "rename":
@@ -1043,7 +1056,7 @@ class ThemeManager:
                 self.pending = None
             elif beat >= p["fire"] - 1e-9:
                 self.pending = None
-                self.apply(th, bars=p["bars"], auto=p["auto"])
+                self.apply(th, bars=p["bars"], auto=p["auto"], transition=p.get("transition"))
         eng = self.engine()
         if eng is not self._eng:
             self._eng = eng

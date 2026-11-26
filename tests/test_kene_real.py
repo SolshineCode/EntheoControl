@@ -192,7 +192,9 @@ def test_hk_colourways_use_the_documented_bead_colours():
 
 # ------------------------------------------------------------------ params / panel contract
 
-NEW = ["l_kene_shipibo", "l_kene_hunikuin"] + [n for n, v in params.PARAMS.items() if v[3] == "kene"]
+GATE_P = ["kene_gate", "kene_g_line", "kene_g_fill", "kene_g_ground", "kene_g_jewel"]       # a later appended block
+MOTION_P = ["kene_motion", "kene_crawl", "kene_swim", "kene_sway", "kene_autopen", "hk_auto"]  # and another
+NEW = ["l_kene_shipibo", "l_kene_hunikuin"] + [n for n, v in params.PARAMS.items() if v[3] == "kene" and n not in GATE_P + MOTION_P]
 
 
 def test_params_are_appended_off_by_default_and_classified():
@@ -203,6 +205,14 @@ def test_params_are_appended_off_by_default_and_classified():
     i = names.index("l_kene_shipibo")
     assert names[i:i + len(NEW)] == NEW, "the block is contiguous and in its original order (append only)"
     assert len(NEW) > 10
+    assert names[-len(GATE_P):] == GATE_P or names.index("kene_gate") > names.index("being_sheet"), "gate block appended"
+    assert names[names.index("kene_gate"):names.index("kene_gate") + 5] == GATE_P
+    assert names[names.index("kene_motion"):names.index("kene_motion") + 6] == MOTION_P
+    assert names.index("kene_motion") > names.index("kene_g_jewel"), "motion block appended after the gate block"
+    for n in MOTION_P:
+        assert n in params.BYPASS_KEEP and params.PARAMS[n][2] > 0.0, "motion is on by default"
+    for n in GATE_P:
+        assert n in params.BYPASS_KEEP and params.PARAMS[n][2] == (0.0 if n == "kene_gate" else 1.0), n
     for n in NEW:
         assert (n in params.NEUTRAL) != (n in params.BYPASS_KEEP), n
     cover = params.bypass_cover()
@@ -260,8 +270,186 @@ def test_pen_cycle_draws_then_holds_then_changes_design():
     fades = [kr.pen_state(v, beat=b)["fade"] for b in np.arange(14.0, 18.0, 1 / 30.0)]
     assert max(abs(a - b) for a, b in zip(fades, fades[1:])) < 0.2, "the pen fade has no step"
     assert kr.pen_state(v, beat=8.0)["next_seed"] == nxt["seed"], "the next design is known ahead (prebuilt)"
-    off = kr.pen_state(dict(v, kene_pen=0, kene_draw=0.4), beat=5.0)
+    off = kr.pen_state(dict(v, kene_pen=0, kene_draw=0.4, kene_motion=0.0), beat=5.0)
     assert off["progress"] == pytest.approx(0.4) and off["seed"] == 3 and off["fade"] == 1.0
+    auto = dict(params.defaults(), kene_seed=3)          # default: Pen off, motion on -> the automatic pen (32 bars)
+    assert kr.pen_state(auto, beat=0.0)["progress"] == 0.0 and 0.3 < kr.pen_state(auto, beat=64.0)["progress"] < 0.8
+    assert kr.pen_state(dict(auto, kene_autopen=0), beat=64.0)["progress"] == 1.0
+
+
+# ------------------------------------------------------------------ vector studies (kene_vector) + semantic gate
+
+kv = pytest.importorskip("kene_vector")
+
+
+@pytest.fixture(scope="module")
+def vec_designs():
+    return {(k, sd): kv.vector_design(k, sd, 0.5, 1.6, 384) for k in ("A", "B", "C") for sd in (3, 4)}
+
+
+def test_meander_is_one_unbranched_path_per_region_with_even_spacing():
+    rng = np.random.default_rng(5)
+    ok = np.ones((31, 45), bool)
+    ok[10:20, 12:22] = False                             # a hole (a motif) and a wall cutting the field in two
+    ok[:, 30] = False
+    loops, comp = kv.meander_paths(ok, rng)
+    assert len(loops) == 2, "one closed path per connected region (no stray loops, no dots)"
+    occ = np.zeros((32, 46), int)
+    for lp in loops:
+        P = np.asarray(lp)
+        d = np.abs(np.diff(np.vstack([P, P[:1]]), axis=0)).sum(axis=1)
+        assert (d == 1).all(), "unit lattice steps, closed"
+        assert len(set(map(tuple, lp))) == len(lp), "never touches itself: no branch, no crossing"
+        for r, c in lp:
+            occ[r, c] += 1
+    assert occ.max() == 1, "two paths never share a corner"
+    assert comp.max() == 2 and (comp[~ok] == 0).all()
+    # space filling: almost every usable corner is on the path
+    usable = np.zeros((32, 46), bool)
+    usable[:31, :45] |= ok
+    assert (occ > 0).sum() > 0.6 * ok.sum()
+
+
+@pytest.mark.parametrize("kind", ["A", "B", "C"])
+def test_vector_design_layers_and_channel_contract(vec_designs, kind):
+    d = vec_designs[(kind, 3)]
+    cov, prim, acc = d["cov"], d["prim"], d["acc"]
+    assert cov.dtype == prim.dtype == acc.dtype == np.uint8 and cov.shape == prim.shape == acc.shape
+    h, w, ch = cov.shape
+    assert ch == 4 and h == 384 and abs(w / h - (0.5 if kind == "B" else 1.6 * 0.955)) < 0.02, "B is a portrait cloth"
+    c = cov.astype(float) / 255.0
+    assert c[..., 2].mean() > 0.98, "the ground covers the whole panel"
+    assert 0.05 < c[..., 0].mean() < 0.40, "primary lines"
+    assert 0.04 < c[..., 1].mean() < 0.40, "fine fill"
+    assert 0.01 < c[..., 3].mean() < 0.40, "accents"
+    # premultiplied colour never exceeds its coverage (prim / acc RGB <= coverage)
+    assert (prim[..., :3].max(axis=2).astype(int) <= cov[..., 0].astype(int) + 2).all()
+    assert (acc[..., :3].max(axis=2).astype(int) <= cov[..., 3].astype(int) + 2).all()
+    assert len(np.unique(prim[..., 3])) > 8, "cell ids for the gate"
+    # the meander keeps clear of every primary line (it is clipped per cell)
+    assert ((c[..., 1] > 0.5) & (c[..., 0] > 0.5)).mean() < 0.002
+    assert not (vec_designs[(kind, 3)]["cov"] == vec_designs[(kind, 4)]["cov"]).all(), "seeds differ"
+    again = kv.vector_design(kind, 3, 0.5, 1.6, 384)
+    assert (again["cov"] == cov).all(), "repeatable"
+
+
+def test_painted_study_is_mirror_symmetric_and_accented(vec_designs):
+    c = vec_designs[("A", 3)]["cov"].astype(float) / 255.0
+    P = c[..., 0]
+    w = P.shape[1] - (P.shape[1] % 2)
+    assert np.abs(P[:, :w] - P[:, :w][:, ::-1]).mean() < 0.06, "left / right mirror (D2)"
+    assert np.abs(P - P[::-1]).mean() < 0.06, "top / bottom mirror (D2)"
+    acc = vec_designs[("A", 3)]["acc"][..., :3].astype(float)
+    red = (acc[..., 0] > 120) & (acc[..., 1] < 90)
+    ochre = (acc[..., 0] > 150) & (acc[..., 1] > 120) & (acc[..., 2] < 90)
+    assert red.mean() > 0.005 and ochre.mean() > 0.005, "red and ochre accents"
+
+
+def test_cloth_study_is_a_framed_portrait_with_a_spine(vec_designs):
+    d = vec_designs[("B", 3)]
+    c = d["cov"].astype(float) / 255.0
+    h, w = c.shape[:2]
+    assert c[:, :int(0.08 * w), 3].mean() > 0.95 and c[:int(0.04 * h), :, 3].mean() > 0.95, "wide dark border"
+    assert (c[int(0.2 * h):int(0.8 * h), w // 2, 0] > 0.5).mean() > 0.2, "a spine of primary line down the middle"
+    P = c[..., 0]
+    assert np.abs(P - P[:, ::-1]).mean() < 0.06 and np.abs(P - P[::-1]).mean() < 0.06, "mirrored both ways"
+
+
+def test_embroidered_study_has_double_outlines_navy_and_twigs(vec_designs):
+    pr = vec_designs[("C", 3)]["prim"][..., :3].astype(int)
+    near = lambda col, tol=40: (np.abs(pr - np.array(col)).sum(axis=2) < tol).mean()
+    assert near(kv.C_ORANGE) > 0.02 and near(kv.C_YELLOW) > 0.02 and near(kv.C_NAVY) > 0.01
+    ac = vec_designs[("C", 3)]["acc"][..., :3].astype(int)
+    twig = sum((np.abs(ac - np.array(t)).sum(axis=2) < 40).mean() for t in kv.C_TWIGS)
+    assert twig > 0.001, "coloured twigs"
+
+
+def test_gate_presets_and_gains():
+    g0 = kr.gate_state(params.defaults())
+    assert g0["gains"] == (1.0, 1.0, 1.0, 1.0) and g0["mode"] == 0.0 and g0["mono"] == 0.0, "defaults = the old look"
+    assert kr.gate_state(dict(params.defaults(), kene_gate=1))["gains"] == (1.0, 0.0, 0.0, 1.0)
+    eng = kr.gate_state(dict(params.defaults(), kene_gate=2))
+    assert eng["gains"] == (1.0, 1.0, 0.0, 0.0) and eng["mono"] == 1.0
+    assert kr.gate_state(dict(params.defaults(), kene_gate=3))["mode"] == 3.0
+    half = kr.gate_state(dict(params.defaults(), kene_g_fill=0.5, kene_g_jewel=0.25))
+    assert half["gains"] == (1.0, 0.5, 1.0, 0.25)
+    assert kr.style_uniforms(dict(params.defaults(), kene_style=5), None)["vec"] == "A"
+    assert kr.style_uniforms(dict(params.defaults(), kene_style=7), None)["vec"] == "C"
+    assert kr.style_uniforms(dict(params.defaults(), kene_style=6), None)["vec"] == "B"
+    assert kr.style_uniforms(dict(params.defaults(), kene_style=1), None)["vec"] is None
+
+
+def test_builder_keeps_few_vector_designs():
+    b = kr.DesignBuilder()
+    try:
+        for n in range(5):
+            b._store(("vec", "A", n, 0.5, 1.6, 64, 0.5), dict(cov=None))
+        b._store((1, 4, 4, 1, False, 1), np.zeros((1, 1, 4), np.uint8))
+        assert sum(1 for k in b._cache if k[0] == "vec") == b.KEEP_VEC
+        assert b.get((1, 4, 4, 1, False, 1)) is not None
+    finally:
+        b.close()
+
+
+# ------------------------------------------------------------------ motion (default on): seamless crawl, calm swim
+
+def test_crawl_wraps_seamlessly_at_any_time():
+    inner = (3.0, 3.0, 63.0, 43.0)
+    gx, gy = np.meshgrid(np.linspace(0, 66, 331), np.linspace(0, 46, 231))
+    for crot, zoom in ((0.0, 1.0), (0.4, 1.3)):
+        a = kr.content_map(gx, gy, inner, crot, zoom, (0.0, 0.0))
+        b = kr.content_map(gx, gy, inner, crot, zoom, (1.0 - 1e-9, 1.0 - 1e-9))
+        assert np.abs(a[0] - b[0]).max() < 1e-4 and np.abs(a[1] - b[1]).max() < 1e-4, "the accumulator wraps without a jump"
+        for c in ((0.13, 0.71), (0.5, 0.25), (0.999, 0.001)):
+            mx, my = kr.content_map(gx, gy, inner, crot, zoom, c)
+            ins = (gx > 3.3) & (gx < 62.7) & (gy > 3.3) & (gy < 42.7)
+            assert (mx[ins] >= 3.0 - 1e-6).all() and (mx[ins] <= 63.0 + 1e-6).all(), "always inside the design"
+            step = 0.2 / zoom * 1.5 + 1e-6                        # neighbour pixels map to neighbours: no tear (mirror)
+            assert np.abs(np.diff(mx, axis=1))[ins[:, 1:] & ins[:, :-1]].max() <= step
+            assert np.abs(np.diff(my, axis=0))[ins[1:] & ins[:-1]].max() <= step
+    out = kr.content_map(np.array([1.0]), np.array([1.0]), inner, 0.3, 1.2, (0.4, 0.4))
+    assert out[0][0] == 1.0 and out[1][0] == 1.0, "the border band never moves"
+
+
+def test_swim_is_gentle_and_periodic():
+    inner = (0.0, 0.0, 200.0, 140.0)
+    gx, gy = np.meshgrid(np.linspace(0, 200, 801), np.linspace(0, 140, 561))
+    amp = 0.55 * 0.4 + 0.35 * 0.3                         # the defaults (own swim + the global swim)
+    wx, wy = kr.swim_map(gx, gy, inner, amp, (1.0, 2.0))
+    assert 0.2 < np.abs(wx - gx).max() < 1.2, "visible but small (u)"
+    jac = np.abs(np.diff(wx, axis=1) / np.diff(gx, axis=1) - 1.0).max()
+    assert jac < 0.12, "the slope stays small: line widths change by < 12 %, no pinching"
+    w2 = kr.swim_map(gx, gy, inner, amp, (1.0 + kr.TAU, 2.0 - kr.TAU))
+    assert np.abs(w2[0] - wx).max() < 1e-9, "phases wrap at TAU: no jump after hours"
+
+
+def test_motion_accumulators_stay_bounded_over_hours():
+    kp = kr.KenePass.__new__(kr.KenePass)                 # CPU state only (no GL)
+    kp.pan, kp.band_scroll, kp.polar, kp.hk_scroll, kp.hk_polar, kp.rot = [0.0, 0.0], 0.0, 0.0, [0.0, 0.0], 0.0, 0.0
+    kp.crawl, kp.swim_ph, kp.sway_ph, kp._inner, kp._grid = [0.0, 0.0], [0.0, 0.0], 0.0, None, (180.0, 120.0, 1)
+    kp._hk_now = kp._hk_next = kp._hk_want = None
+    kp._hk_morph, kp.sync = 0.0, True
+    v = dict(params.defaults(), flow_dir=0.3)
+    clock = dict(bpm=128.0, beat=0.0)
+    prev = None
+    for i in range(20000):                                # ~11 hours in 2 s steps
+        kp._advance(2.0, 0.0, v, 0, clock)
+        assert 0.0 <= kp.crawl[0] < 1.0 and 0.0 <= kp.crawl[1] < 1.0
+        assert 0.0 <= kp.swim_ph[0] < kr.TAU and 0.0 <= kp.sway_ph < kr.TAU
+    moved = abs(kp.crawl[0]) + abs(kp.crawl[1])
+    assert moved > 0.0, "the default crawl moves"
+    still = dict(v, kene_motion=0.0, flow=0.0, travel=0.0)
+    c0 = list(kp.crawl)
+    kp._advance(1.0, 0.0, still, 0, clock)
+    assert kp.crawl == c0, "kene_motion 0 + no global flow = still (the earlier look)"
+
+
+def test_default_motion_is_visible_but_calm():
+    v = params.defaults()
+    bps = 124.0 / 60.0
+    own = 0.025 * v["kene_crawl"] * v["kene_motion"] * bps + 0.10 * v["flow"]
+    assert 0.01 < own < 0.08, f"the field crawls about 1 frame height per 12-100 s ({own:.3f} fh/s)"
+    assert v["kene_autopen"] >= 1 and v["hk_auto"] > 0 and v["kene_swim"] > 0
 
 
 # ------------------------------------------------------------------ GL (tiny renders)
@@ -786,3 +974,98 @@ def test_bead_studies_follow_the_spec_structures():
     # bead-by-bead lighting follows the fret: the 'along' channel changes steadily along the spiral
     al = kr.fret_along(*np.meshgrid(np.arange(12), np.arange(12)), 12, 2)
     assert 0.0 <= al.min() and al.max() < 1.0 and len(np.unique(np.round(al, 2))) > 20
+
+
+# ------------------------------------------------------------------ vector studies + semantic gate on the GPU
+
+def _chan(kp, size):
+    return np.frombuffer(kp.channels.read(), np.uint8).reshape(size[1], size[0], 4)[::-1].astype(float) / 255.0
+
+
+@pytest.mark.parametrize("style", [5, 6, 7])
+def test_gl_vector_study_renders_with_channels(gl, style):
+    size = (480, 300)
+    kp = kr.KenePass(gl, size)
+    try:
+        img = kr.render_once(kp, kr.default_values(l_kene_shipibo=1.0, kene_style=style, kene_flow=0.0))
+        assert kp._dkey[0] == "vec" and kp.design_channels() is not None, "drawn from the vector design"
+        ch = _chan(kp, size)
+        assert ch[..., 0].mean() > 0.02 and ch[..., 1].mean() > 0.01 and ch[..., 2].mean() > 0.2, "lines, fill, ground (the cloth is a portrait panel)"
+        assert img[..., :3].mean() > 25, "a lit cloth"
+        lines = kr.render_once(kp, kr.default_values(l_kene_shipibo=1.0, kene_style=style, kene_flow=0.0, kene_gate=1))
+        chl = _chan(kp, size)
+        assert chl[..., 2].max() < 0.02 and chl[..., 1].max() < 0.02, "linework only: no ground, no fill"
+        assert chl[..., 0].mean() > 0.02 and black_frac(lines) > 0.35, "lines on black"
+        if style in (5, 6):                              # dark ink turns to light once the ground is gated off
+            lit = lines[..., :3].max(axis=2)[chl[..., 0] > 0.8]
+            assert lit.mean() > 120, "ink becomes a light line on black"
+    finally:
+        kp.release()
+
+
+def test_gl_gate_presets_isolate_layers(gl):
+    size = (480, 300)
+    kp = kr.KenePass(gl, size)
+    try:
+        base = dict(l_kene_shipibo=1.0, kene_style=7, kene_flow=0.0)
+        kr.render_once(kp, kr.default_values(**base))
+        full = _chan(kp, size)
+        kr.render_once(kp, kr.default_values(**base, kene_gate=3))
+        patch = _chan(kp, size)
+        assert patch[..., 0].max() < 0.02 and 0.05 < patch[..., 2].mean() < 0.8 * full[..., 2].mean(), "ground in patches"
+        kr.render_once(kp, kr.default_values(**base, kene_gate=4))
+        cells = _chan(kp, size)
+        assert 0.0 < cells[..., 1].mean() < 0.8 * full[..., 1].mean(), "the fill lights some cells, not all"
+        kr.render_once(kp, kr.default_values(**base, kene_g_ground=0.0, kene_g_jewel=0.0))
+        g = _chan(kp, size)
+        assert g[..., 2].max() < 0.02 and g[..., 3].max() < 0.02 and g[..., 0].mean() > 0.5 * full[..., 0].mean()
+        # a tile style gates too (old renderer)
+        kr.render_once(kp, kr.default_values(l_kene_shipibo=1.0, kene_style=1, kene_gate=1))
+        t = _chan(kp, size)
+        assert t[..., 2].max() < 0.02 and t[..., 0].mean() > 0.01
+    finally:
+        kp.release()
+
+
+def test_gl_vector_design_is_staged_off_the_render_thread(gl):
+    kp = kr.KenePass(gl, (320, 200))
+    try:
+        v = kr.default_values(l_kene_shipibo=1.0, kene_style=5, kene_flow=0.0)
+        kp.wall_dt = 1 / 60
+        for i in range(400):                             # async: the builder thread builds, uploads come in slices
+            kp.render(v, kr.make_clock(1.0 + i / 60), 1.0 + i / 60, 1 / 60, (0, 0, 0), None)
+            if kp._dkey is not None and kp._mix >= 1.0:
+                break
+            import time as _t
+            _t.sleep(0.01)
+        assert kp._dkey is not None and kp._dkey[0] == "vec" and kp._mix >= 1.0
+        assert threading_ok(kp)
+    finally:
+        kp.release()
+
+
+def threading_ok(kp):
+    import threading
+    return threading.get_ident() not in kp.builder.build_threads
+
+
+@pytest.mark.parametrize("style,layout", [(5, 0), (7, 0), (0, 0), (5, 3), (5, 1)])
+def test_gl_default_motion_moves_within_a_second_and_does_not_shimmer(gl, style, layout):
+    size = (320, 200)
+    kp = kr.KenePass(gl, size)
+    kp.sync = True
+    try:
+        v = dict(params.defaults(), l_kene_shipibo=1.0, kene_style=style, kene_layout=layout, kene_autopen=0)
+        frames = []
+        for i in range(61):
+            t = 2.0 + i / 60.0
+            tex = kp.render(v, kr.make_clock(t), t, 1 / 60, (0.2, 0.2, 0.2), kr.GALLERY_PALETTE)
+            if i in (0, 1, 60):
+                frames.append(np.frombuffer(tex.read(), np.uint8).reshape(size[1], size[0], 4)[..., :3].astype(float))
+        d1, d60 = np.abs(frames[1] - frames[0]).mean(), np.abs(frames[2] - frames[0]).mean()
+        assert d60 > 2.0, f"visibly moving within one second ({d60:.2f})"
+        assert d1 < 0.35 * d60, f"calm and continuous: one frame changes far less than a second ({d1:.2f} vs {d60:.2f})"
+        flick = (np.abs(frames[1] - frames[0]).max(axis=2) > 160).mean()
+        assert flick < 0.01, "no shimmer: almost no pixel flips from dark to light between two frames"
+    finally:
+        kp.release()

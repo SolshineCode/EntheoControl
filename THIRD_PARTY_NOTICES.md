@@ -82,6 +82,14 @@ that allowed AGPL distribution, so they were rewritten (2026-11-26):
 - `fx_stack.py`: two inline `fract(sin(dot(p, vec2(12.9898, 78.233)))*43758.5453)` random calls now use Hoskins'
   `hash12` (1.2). The same share of cells is lit, but a different set of them.
 
+### 1.3b Scene transitions (`transitions.py`): original
+
+The transition shaders (doors, sliding doors, curtains, iris, portal, pattern reveal, shatter, peel, dissolve, wipe,
+zoom through) were written for this project from the geometry (hinged-panel perspective inverse, gauge functions for the
+iris shapes, a fold reflection for the peel). No code from gl-transitions (MIT) or Shadertoy was ported. The per-cell
+random value in SHATTER is the generic `fract(sin(x) * k)` construction with this project's own constants. If a
+gl-transitions effect is ported later, its MIT notice goes here and in the shader's header.
+
 ### 1.4 TouchVDMX Explorer prototype (not included)
 
 The four raymarched "3D decks" worlds, the blend modes and the particle swarm in `fx_stack.py` were reimplemented after

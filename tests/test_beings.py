@@ -67,7 +67,7 @@ def test_params_appended_not_reordered():
 def test_being_options_contract():
     lo, hi = params.PARAMS["being"][:2]
     opts = params.OPTIONS["being"]
-    assert lo == 0 and len(opts) == int(hi) + 1 == len(bg.FORMS) and 12 <= len(opts) <= 17
+    assert lo == 0 and len(opts) == int(hi) + 1 == len(bg.FORMS) and 12 <= len(opts) <= 24
     assert opts == bg.FORM_LABELS and len(set(opts)) == len(opts)
     assert len(set(bg.FORM_KEYS)) == len(bg.FORM_KEYS)
 
@@ -557,7 +557,7 @@ def test_kitten_is_form_16_and_colour_params_are_appended():
     assert bg.FORM_KEYS[16] == "kitten" and bg.FORM_KEYS[:16] == [
         "serpent", "dragon", "jaguar", "hummingbird", "butterflies", "jellyfish", "manta", "koi", "phoenix", "eyes",
         "angel", "jester", "octopus", "vine", "fireflies", "whale"], "forms are appended, never reordered"
-    assert params.OPTIONS["being"][16] == "Kittens" and params.PARAMS["being"][1] == 16.0
+    assert params.OPTIONS["being"][16] == "Kittens" and params.PARAMS["being"][1] >= 16.0
     i = names.index("being_color")
     assert names[i:i + 10] == COLOUR_NAMES and i > names.index("being_mix"), "one appended block, after everything older"
     for n in COLOUR_NAMES:
@@ -568,7 +568,7 @@ def test_kitten_is_form_16_and_colour_params_are_appended():
         assert params.OPTIONS[n] == bg.COLOR_MODES
     for n in ("being_sat", "being_bright", "serpent_sat", "serpent_bright"):
         assert params.PARAMS[n][2] == 1.0, "the defaults are the look as it was"
-    assert len(bg.FORM_EXT) == len(bg.FORMS) == 17
+    assert len(bg.FORM_EXT) == len(bg.FORMS) >= 17
 
 
 @pytest.mark.parametrize("key", ["serpent", "jaguar", "jellyfish", "phoenix", "vine", "whale"])
@@ -751,3 +751,319 @@ def test_serpent_colour_modes(tmp_path):
     lit = g.max(axis=2) > 60
     assert lit.mean() > 0.005 and np.percentile((g.max(axis=2) - g.min(axis=2))[lit], 90) <= 40, "depth 0: white serpents"
     assert pic["dim"].astype(int).sum() < 0.7 * pic["mode0"].astype(int).sum()
+
+
+# ================================================================ sprite creature (2026-11-26): the user's own image
+#
+# Only generic generated test images are used here (discs, the built-in stand-in figure); user images live in art/
+# (gitignored) and are never part of the repository.
+
+SPRITE_NAMES = ["being_dance", "being_bounce", "being_spin", "being_look", "being_tint", "being_frames", "being_xfade",
+                "being_faces", "being_sheet"]
+
+
+def _disc_png(path, size=(400, 300), r=0.42, rgb=(40, 200, 255), soft=False, mode="RGBA"):
+    """A generic test image: a coloured disc on transparent (PNG) or on white (JPG)."""
+    from PIL import Image
+    w, h = size
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    d = np.hypot(xx - w / 2 + 0.5, yy - h / 2 + 0.5) - r * min(w, h)
+    a = np.clip(0.5 - d, 0.0, 1.0) if soft else (d < 0).astype(np.float32)
+    if mode == "RGBA":
+        img = np.zeros((h, w, 4), np.uint8)
+        img[..., :3] = rgb
+        img[..., 3] = (a * 255).astype(np.uint8)
+        Image.fromarray(img, "RGBA").save(path)
+    else:
+        img = np.full((h, w, 3), 255, np.float32)
+        img = img * (1 - a[..., None]) + np.array(rgb, np.float32) * a[..., None]
+        Image.fromarray(img.astype(np.uint8), "RGB").save(path, quality=95)
+    return path
+
+
+def test_sprite_form_and_params_are_appended():
+    names = list(params.PARAMS)
+    assert bg.FORM_KEYS[17] == "sprite" and bg.FORM_KEYS[16] == "kitten"
+    assert params.OPTIONS["being"][17] == "Sprite (your image)" and params.PARAMS["being"][1] == 17.0
+    i = names.index("being_dance")
+    assert names[i:i + len(SPRITE_NAMES)] == SPRITE_NAMES and i > names.index("serpent_bright")
+    for n in SPRITE_NAMES:
+        lo, hi, d, group, label = params.PARAMS[n]
+        assert lo <= d <= hi and group == "beings" and label and n in params.BYPASS_KEEP
+    assert params.OPTIONS["being_dance"] == bg.DANCES and params.OPTIONS["being_look"] == bg.LOOKS
+    assert params.OPTIONS["being_frames"] == bg.POSE_STEPS and params.OPTIONS["being_faces"] == bg.FACES
+    for n in ("being_dance", "being_look", "being_frames", "being_faces"):
+        assert len(params.OPTIONS[n]) == int(params.PARAMS[n][1] - params.PARAMS[n][0]) + 1
+
+
+def test_no_third_party_names_anywhere_in_the_feature():
+    banned = ["".join(reversed(w)) for w in ("lufetarg", "samoht bob", "aicrag", "ecaf ruoy laets", "daehdaed")]
+    for f in ("beings.py", "params.py", "materials.py", "tests/test_beings.py", "panel.html"):
+        txt = (ROOT / f).read_text(encoding="utf-8").lower()
+        for w in banned:
+            assert w not in txt, f"{f} names a third-party mark"
+    gi = (ROOT / ".gitignore").read_text(encoding="utf-8").split()
+    assert "art/" in gi, "user images (art/) never go into the repository"
+
+
+def test_sequence_and_sheet_and_jpg_key(tmp_path):
+    for k in (3, 1, 2):
+        _disc_png(tmp_path / f"walk_{k}.png", r=0.2 + 0.05 * k)
+    _disc_png(tmp_path / "other.png")
+    assert [q.name for q in bg.sequence_for(tmp_path / "walk_2.png")] == ["walk_1.png", "walk_2.png", "walk_3.png"]
+    assert bg.sequence_for(tmp_path / "other.png") == [tmp_path / "other.png"]
+    poses, asp, _ = bg.decode_sprite(tmp_path / "walk_1.png", 1, 128)
+    pad = 2 * (bg.SPR_SPREAD + 2)                            # the texture carries a border for the field / glow
+    assert poses.shape[0] == 3 and poses.dtype == np.uint8 and asp == poses.shape[2] / poses.shape[1]
+    assert abs((poses.shape[2] - pad) / (poses.shape[1] - pad) - 400 / 300) < 0.05
+    inside = (poses[..., 3] > 127).mean(axis=(1, 2))
+    assert inside[0] < inside[1] < inside[2], "the poses keep their number order"
+    from PIL import Image                                    # a sheet: four poses side by side
+    Image.fromarray(np.concatenate([np.asarray(Image.open(tmp_path / "other.png"))] * 4, axis=1)).save(tmp_path / "sheet.png")
+    poses, asp, _ = bg.decode_sprite(tmp_path / "sheet.png", 4, 128)
+    assert poses.shape[0] == 4 and abs((poses.shape[2] - pad) / (poses.shape[1] - pad) - 400 / 300) < 0.05
+    jpg = _disc_png(tmp_path / "photo.jpg", mode="RGB")      # no alpha: keyed on the border colour
+    poses, _, _ = bg.decode_sprite(jpg, 1, 128)
+    a = poses[0, ..., 3] > 127
+    h, w = a.shape
+    assert a[h // 2, w // 2] and not a[2, 2] and 0.08 < a.mean() < 0.25, "the white background is keyed out"
+
+
+def test_distance_field_keeps_the_exact_outline(tmp_path):
+    """A disc of known radius: the field's 0.5 contour sits where the alpha edge was (sub-pixel), the colour is bled
+    past the edge (no fringe when filtered)."""
+    src = _disc_png(tmp_path / "disc.png", size=(300, 300), r=0.4, rgb=(250, 40, 90), soft=True)
+    poses, _, _ = bg.decode_sprite(src, 1, 256)
+    f = poses[0]
+    H, W = f.shape[:2]
+    pad = bg.SPR_SPREAD + 2
+    scale = (W - 2 * pad) / 300.0
+    row = f[H // 2, :, 3].astype(np.float32) / 255.0
+    sd = (0.5 - row) * 2.0 * bg.SPR_SPREAD                   # texels, > 0 outside
+    xs = np.arange(W) + 0.5
+    k = np.nonzero((sd[:-1] < 0) & (sd[1:] >= 0))[0][-1]     # right-hand edge crossing
+    edge = xs[k] + (0 - sd[k]) / (sd[k + 1] - sd[k])
+    want = W / 2 + 0.4 * 300 * scale
+    assert abs(edge - want) < 0.8, f"outline moved: {edge:.2f} vs {want:.2f}"
+    assert np.abs(f[H // 2, -3, :3].astype(int) - np.array([250, 40, 90])).max() < 12, "colour bled past the edge"
+    assert f[H // 2, -3, 3] < 40 and f[H // 2, W // 2, 3] > 220
+
+
+def test_huge_and_bad_images_never_hurt(tmp_path, monkeypatch, ctx):
+    from PIL import Image
+    big = tmp_path / "big.png"
+    Image.new("RGBA", (6000, 4000), (255, 0, 0, 255)).save(big)
+    poses, asp, _ = bg.decode_sprite(big, 1, 256)
+    pad = 2 * (bg.SPR_SPREAD + 2)
+    assert max(poses.shape[1:3]) <= 256 and abs((poses.shape[2] - pad) / (poses.shape[1] - pad) - 1.5) < 0.03, "decoded small"
+    monkeypatch.setattr(bg, "SPR_MAX_PIXELS", 1000)
+    lib = bg.SpriteLibrary(ctx, sync=True)
+    try:
+        lib.want(big)
+        lib.tick()
+        assert lib.tex is not None and "could not use" in lib.note, "too big: refused, the stand-in shows"
+        lib.want(tmp_path / "missing.png")
+        lib.tick()
+        assert "could not use" in lib.note
+    finally:
+        lib.release()
+
+
+def test_library_decodes_off_the_render_thread(tmp_path, ctx):
+    import threading
+    import time
+    src = _disc_png(tmp_path / "a.png")
+    lib = bg.SpriteLibrary(ctx)
+    try:
+        assert lib._thread is None and lib.tex is None, "nothing until asked"
+        lib.want(src)
+        assert lib._thread is not None and lib._thread is not threading.current_thread()
+        t0 = time.time()
+        while lib.key is None and time.time() - t0 < 10:
+            lib.tick()
+            time.sleep(0.02)
+        assert lib.key == (str(src), 1) and lib.frames == 1 and lib.uploads == 1
+    finally:
+        lib.release()
+
+
+def test_sprite_costs_nothing_until_shown(bp):
+    shot(bp, frames=2, being=3)
+    assert bp.sprites is None, "no sprite on show: no library, no thread, no texture"
+    src = bg.shader_source()
+    assert "fSprite" in src and "#define SKIN" not in src and "skTap" not in src, "the plain program carries no skin code"
+
+
+def _herd_run(vals, seconds=4.0, dt=1 / 60, bpm=120.0):
+    h = bg.Herd(1.6)
+    rows = []
+    for k in range(int(round(seconds / dt))):
+        ua, ub, uc, _ = h.step(dt, vals, (0, 0, 0), dict(beat=k * dt * bpm / 60.0))
+        rows.append((ua.copy(), h.ud.copy()))
+    return h, rows
+
+
+def test_march_line_hops_on_every_beat_and_faces_its_way():
+    vals = bg.default_values(being=bg.SPRITE, being_count=4, being_dance=1, being_speed=0.6, being_bounce=1.0, being_spin=0.0)
+    _, rows = _herd_run(vals)
+    _, base = _herd_run(dict(vals, being_bounce=0.0))
+    ys = np.array([r[0][:4, 1] for r in rows]) - np.array([r[0][:4, 1] for r in base])
+    per_beat = ys[:, 0].reshape(-1, 30).max(axis=1)
+    assert (per_beat > 0.02).all(), "one hop on every beat"
+    assert np.abs(np.diff(ys, axis=0)).max() < 0.03, "hops are smooth arcs"
+    sy = np.array([r[1][0, 1] for r in rows])
+    assert sy.min() < 0.95 and sy.max() > 1.04, "squash on landing, stretch in the air"
+    assert np.abs(np.diff(sy)).max() < 0.08, "squash / stretch is continuous"
+    xs = np.array([r[0][:4, 0] for r in base])
+    vx = np.diff(xs[:, 0])
+    w = np.array([r[1][0, 0] for r in base])[1:]
+    settled = np.abs(vx) > 1e-4
+    assert (np.sign(w[settled]) == np.sign(vx[settled])).mean() > 0.85, "the image faces the way it walks"
+    lane = np.array([r[0][:4, 1] for r in base])
+    assert np.ptp(lane[-1]) < 1e-6, "one line: everybody on the same lane"
+
+
+def test_conga_follows_the_leader_and_mirror_pairs_face_each_other():
+    vals = bg.default_values(being=bg.SPRITE, being_count=4, being_dance=2, being_speed=0.6, being_bounce=0.0, being_spin=0.0)
+    _, rows = _herd_run(vals, seconds=10.0)
+    lead = np.array([r[0][0, :2] for r in rows])
+    foll = np.array([r[0][1, :2] for r in rows])
+    best = min(np.abs(foll[lag:] - lead[:len(lead) - lag]).max() for lag in range(1, 400))
+    assert best < 0.01, "the second dancer walks the leader's track behind it"
+    vals = dict(vals, being_dance=3)
+    _, rows = _herd_run(vals, seconds=3.0)
+    ua, ud = rows[-1]
+    assert ua[0, 0] < ua[1, 0] and ud[0, 0] > 0.9 and ud[1, 0] < -0.9, "partners face each other"
+    _, rows = _herd_run(dict(vals, being_faces=2), seconds=3.0)
+    assert (rows[-1][1][:4, 0] > 0.9).all(), "never flip: always as drawn"
+    _, rows = _herd_run(dict(vals, being_faces=1), seconds=3.0)
+    assert rows[-1][1][0, 0] < -0.9, "an image that faces left is turned the other way"
+
+
+def test_bounce_in_place_spins_and_flock():
+    vals = bg.default_values(being=bg.SPRITE, being_count=4, being_dance=4, being_speed=0.6, being_spin=0.0)
+    _, rows = _herd_run(vals, seconds=4.0)
+    xs = np.array([r[0][:4, 0] for r in rows])
+    assert np.ptp(xs, axis=0).max() < 0.05, "bounce in place: they stay where they are"
+    still = np.array([r[1][:4, 0] for r in rows[60:]])          # (after the first turn to face the floor)
+    assert (np.abs(still) > 0.75).all() and (np.sign(still) == np.sign(still[-1])).all(), "no spins, no turning at 0"
+    spun = np.array([r[1][:4, 0] for r in _herd_run(dict(vals, being_spin=1.0), seconds=16.0)[1]])
+    assert (spun * np.sign(spun[0]) < -0.5).any() and np.abs(np.diff(spun, axis=0)).max() < 0.2, "spins, smoothly"
+    fl = dict(vals, being_dance=5, being_count=6, being_size=0.4)
+    _, rows = _herd_run(fl, seconds=12.0)
+    for ua, _ in rows[240:]:
+        p = ua[:6, :2]
+        assert (np.abs(p[:, 0]) <= 0.8).all() and (np.abs(p[:, 1]) <= 0.5).all()
+    p = rows[-1][0][:6, :2]
+    dmin = min(np.hypot(*(p[i] - p[j])) for i in range(6) for j in range(i + 1, 6))
+    assert dmin > 0.05, "the flock keeps apart"
+    assert np.abs(rows[-1][0][:6, :2] - rows[-200][0][:6, :2]).max() > 0.02, "and moves"
+
+
+def test_poses_step_on_the_beat_with_optional_crossfade():
+    h = bg.Herd(1.6)
+    h.frames = 4
+    vals = bg.default_values(being=bg.SPRITE, being_count=2, being_dance=1, being_frames=0, being_xfade=0.0)
+    seen = []
+    for k in range(240):
+        h.step(1 / 60, vals, (0, 0, 0), dict(beat=k / 30.0))
+        seen.append(h.ud[0, 2:].copy())
+    pa = [int(s[0]) for s in seen]
+    assert sorted(set(pa)) == [0, 1, 2, 3] and sum(a != b for a, b in zip(pa, pa[1:])) == 7, "one pose per beat"
+    assert all(abs(s[1] - round(s[1])) < 1e-6 for s in seen), "no crossfade asked: a cut"
+    h2 = bg.Herd(1.6)
+    h2.frames = 4
+    xs = []
+    for k in range(120):
+        h2.step(1 / 60, dict(vals, being_frames=2, being_xfade=0.5), (0, 0, 0), dict(beat=k / 30.0))
+        xs.append(h2.ud[0, 2:].copy())
+    assert len({int(s[0]) for s in xs}) == 1, "every bar: one pose over these 4 beats"
+    fr = [s[1] % 1.0 for s in xs]
+    assert max(fr) > 0.5 and min(fr) == 0.0, "the crossfade ramps over the last half of the step"
+
+
+def test_sprite_looks_and_image(tmp_path, ctx):
+    src = _disc_png(tmp_path / "disc.png", size=(300, 300), r=0.4, rgb=(250, 60, 40))
+    pics = []
+    for look in range(4):
+        p = bg.BeingsPass(ctx, OUT)
+        p.sprite_sync, p.sprite_path = True, str(src)
+        try:
+            pics.append(bg.render_frames(p, bg.default_values(being=bg.SPRITE, being_look=look, being_count=1, being_size=0.9,
+                                                              being_speed=0.0, being_color=1, being_hue=0.62), frames=2))
+            assert p.sprites.key[0] == str(src) and p.sprites.frames == 1
+        finally:
+            p.release()
+    img = pics[0][..., :3].astype(int)
+    lit = img.max(axis=2) > 80
+    assert ((img[..., 0] > img[..., 2] + 60) & lit).sum() > 0.6 * lit.sum(), "image look: the picture's own colour"
+    assert _near(_hues(pics[2]), 0.62, 0.10) > 0.6, "solid silhouette: the colour mode"
+    assert (lum(pics[1]) > 0.25).mean() < 0.5 * (lum(pics[2]) > 0.25).mean(), "glowing outline: light on the edge"
+    assert np.abs(pics[3].astype(int) - pics[2].astype(int)).mean() < 1.0, "skinned fill with no skin = solid"
+
+
+def test_sprite_edge_is_crisp_when_big(tmp_path, ctx):
+    src = _disc_png(tmp_path / "d.png", size=(200, 200), r=0.45, rgb=(255, 255, 255))
+    p = bg.BeingsPass(ctx, (1280, 800))
+    p.sprite_sync, p.sprite_path = True, str(src)
+    try:
+        img = bg.render_frames(p, bg.default_values(being=bg.SPRITE, being_count=1, being_size=1.0, being_speed=0.0,
+                                                    being_glow=0.0, being_bounce=0.0), frames=2)
+    finally:
+        p.release()
+    a = img[..., 3].astype(np.float32) / 255.0
+    row = a[np.argmax((a > 0.9).sum(axis=1))]
+    ramp = ((row > 0.1) & (row < 0.9)).sum()
+    assert (row > 0.9).sum() > 250 and ramp <= 8, f"silhouette edge stays sharp far above the decode size ({ramp} px ramp)"
+
+
+def test_sprite_skin_slot_is_picker_only_and_fill_skins():
+    mt = pytest.importorskip("materials")
+    env = mt.ENVS[bg.SKIN_ENV]
+    assert env["slots"] == ("fill", "sprite") and "sprite" in env["own"] and env["host"] == "beings"
+    assert 'if names[i] in ENVS[env].get("own", ()):' in Path(mt.__file__).read_text(encoding="utf-8")
+    skinned = bg.shader_source(mt.glsl(1, "pal"))
+    assert "texSkin" in skinned and "#define SKIN" in skinned
+
+
+def test_skinned_sprite_program_compiles(ctx):
+    pytest.importorskip("materials")
+    p = bg.BeingsPass(ctx, OUT)
+    try:
+        class Eng:
+            def active(self, env):
+                return False
+        p.skins = Eng()
+        assert p._skin_prog, "the skinned variant compiles"
+    finally:
+        p.release()
+
+
+def test_sprite_source_comes_from_the_skin_slot(ctx, tmp_path):
+    p = bg.BeingsPass(ctx, OUT)
+    try:
+        class Lib:
+            def path(self, key):
+                return tmp_path / key[1]
+
+        class Eng:
+            lib = Lib()
+
+            def active(self, env):
+                return False
+        p._skins = Eng()
+        p.skin_frame = {"beings": {"sprite": {"src": {"kind": "art", "name": "me.png"}}}}
+        assert p._sprite_source() == tmp_path / "me.png"
+        p.skin_frame = {"beings": {"sprite": {"src": {"kind": "layer", "name": "kene"}}}}
+        assert p._sprite_source() is None, "a live layer is not an image"
+        p.skin_frame = None
+        assert p._sprite_source() is None
+    finally:
+        p.release()
+
+
+def test_engine_and_panel_hooks():
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    assert '_bx["obj"].skins = skins' in src and 'ex["obj"].skin_frame' in src
+    html = (ROOT / "panel.html").read_text(encoding="utf-8")
+    assert "e.host==='beings'" in html and "mkCard('beings'" in html

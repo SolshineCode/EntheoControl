@@ -11,6 +11,10 @@ variable is added to the child.
                   --strict-mcp-config), no user / project / local settings (--setting-sources ""), no permission
                   escalation, its own short system prompt, no session saved. The flags are checked against
                   `claude --help` once (`verify`); if one is missing the backend refuses to start.
+                  Pictures (SEE THE OUTPUT): an image block in ONE stream-json message on stdin (`--input-format
+                  stream-json --output-format stream-json --verbose`), tools still off; the picture never touches its
+                  folder. Probed 2026-11-26 on this laptop: the init message lists tools: [] and the model describes the
+                  picture. A CLI whose init message lists any tool is refused. Without those flags: text only.
   AgyBackend      Antigravity CLI as a second chat backend, plus agy_pty for the agy image / vision providers.
                   Opt-in only ("Allow Google CLI tools"). agy is a coding agent with no tool-less mode, so it is
                   confined: see the block comment above AGY_MODE further down.
@@ -19,6 +23,8 @@ variable is added to the child.
 Children are put into one Windows Job Object with KILL_ON_JOB_CLOSE, so they die with the engine even if it
 crashes, and cancel / timeout kills the whole process tree (taskkill /T).
 """
+import base64
+import json
 import os
 import re
 import shutil
@@ -252,6 +258,7 @@ class ClaudeBackend:
         self.model = model if model and SAFE_NAME.match(str(model)) else None
         self.mode = None             # permission mode picked by verify()
         self.problem = None          # None = not checked yet, "" = verified, text = why it refuses to start
+        self.sees = False            # set by verify(): stream-json input (an image block on stdin) is available
 
     def exe(self):
         return real_exe(self._exe or shutil.which("claude"))
@@ -286,6 +293,9 @@ class ClaudeBackend:
         if self.mode is None:
             missing.append("--permission-mode default|manual|plan")
         self.problem = ("this `claude` version lacks " + ", ".join(missing) + ": refusing to start it") if missing else ""
+        blk = re.search(r"(?<![\w-])--input-format(?![\w-])(.*?)(?:\n\s*-|\Z)", help_text, re.S)   # up to the next flag
+        self.sees = bool(not missing and blk and re.search(r'choices:[^)]*"stream-json"', blk.group(1))
+                         and re.search(r"(?<![\w-])--verbose(?![\w-])", help_text))
         return self.problem
 
     def available(self):
@@ -293,8 +303,10 @@ class ClaudeBackend:
             self.verify()
         return self.problem == ""
 
-    def argv(self, cwd):
-        a = [self.exe(), "--print", "--output-format", "text",
+    def argv(self, cwd, stream=False):
+        io_fmt = (["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] if stream
+                  else ["--output-format", "text"])
+        a = [self.exe(), "--print"] + io_fmt + [
              "--tools", "",                                   # no built-in tools at all
              "--permission-mode", self.mode,                   # nothing is ever auto-approved
              "--strict-mcp-config", "--mcp-config", str(Path(cwd) / "no_mcp.json"),      # no MCP servers
@@ -305,14 +317,76 @@ class ClaudeBackend:
             a += ["--model", self.model]
         return a
 
-    def ask(self, prompt, cancel=None, progress=None):
+    def ask(self, prompt, cancel=None, progress=None, images=None):
         if not self.available():
             raise BackendError(self.problem or "claude is not available")
         cwd = self.cwd()
+        if images:
+            return self._ask_images(prompt, images, cwd, cancel, progress)
         rc, out, err = run_cli(self.argv(cwd), prompt, cwd=cwd, timeout=self.timeout, cancel=cancel, progress=progress)
         if rc != 0 or not out.strip():
             raise BackendError(f"claude exited {rc}: {(err or out).strip()[-300:] or 'no output'}")
         return out[:MAX_REPLY]
+
+    def _ask_images(self, prompt, images, cwd, cancel, progress):
+        """Pictures + text as ONE user message on stdin (stream-json). Tools stay off: the picture is part of the
+        message, so the model needs no file access to see it."""
+        if not self.sees:
+            raise BackendError("this `claude` version cannot take a picture without tools: text only")
+        pics = check_images(images)
+        blocks = []
+        for name, jpg in pics:
+            if len(pics) > 1:
+                blocks.append({"type": "text", "text": f"Picture {name}:"})
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                        "data": base64.b64encode(jpg).decode("ascii")}})
+        blocks.append({"type": "text", "text": str(prompt)})
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": blocks}}) + "\n"
+        rc, out, err = run_cli(self.argv(cwd, stream=True), msg, cwd=cwd, timeout=self.timeout, cancel=cancel,
+                               progress=progress)
+        result, tools = None, None
+        for line in out.splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            if o.get("type") == "system" and o.get("subtype") == "init":
+                tools = list(o.get("tools") or []) + list(o.get("mcp_servers") or [])
+            elif o.get("type") == "result" and isinstance(o.get("result"), str):
+                result = o["result"]
+        if tools:                                      # it came up with tools after all: never use that answer
+            raise BackendError("claude started with tools enabled: answer discarded")
+        if tools is None:
+            raise BackendError("claude did not confirm a tool-less session: answer discarded")
+        if rc != 0 or not (result or "").strip():
+            raise BackendError(f"claude exited {rc}: {(err or '').strip()[-300:] or 'no answer'}")
+        return result[:MAX_REPLY]
+
+
+IMAGE_NAMES = ("before.jpg", "output.jpg")      # the only picture names a backend accepts (SEE THE OUTPUT)
+MAX_IMAGE = 1 << 20
+
+
+def check_images(images):
+    """[(name, jpeg bytes)] -> the same, or BackendError: only our two names, only real JPEGs, at most two."""
+    out = []
+    items = list(images or ())
+    if len(items) > 2:
+        raise BackendError("at most two pictures")
+    for item in items:
+        try:
+            name, data = item
+        except (TypeError, ValueError):
+            raise BackendError("bad picture") from None
+        if name not in IMAGE_NAMES or name in [n for n, _ in out]:
+            raise BackendError("bad picture name")
+        if (not isinstance(data, (bytes, bytearray)) or not 100 < len(data) <= MAX_IMAGE
+                or bytes(data[:3]) != b"\xff\xd8\xff"):
+            raise BackendError("not a JPEG picture")
+        out.append((name, bytes(data)))
+    return out
 
 
 def fresh_dir(root, prefix):
@@ -490,6 +564,9 @@ def agy_pty(exe, instruction, cwd, timeout=600.0, done_file=None, settle=1.5, id
 
 AGY_CHAT_TASK = ("Read the file prompt.txt in the current folder and answer it. Follow the rules at the top of that file. "
                  "Reply with only the one JSON object it asks for and nothing else.")
+AGY_SEE_TASK = ("Read the file prompt.txt in the current folder and answer it. Follow the rules at the top of that file. "
+                "Look at the picture output.jpg in the same folder (and before.jpg if it is there) as the file asks. "
+                "Reply with only the one JSON object it asks for and nothing else.")
 
 
 class AgyBackend:
@@ -497,6 +574,7 @@ class AgyBackend:
     every command through the same allowlist and safety rules as a Claude reply; nothing in it is ever executed."""
     name = "agy"
     label = "agy (Gemini)"
+    sees = True                  # pictures are copied into the sandbox next to prompt.txt (AGY_SEE_TASK)
 
     def __init__(self, timeout=600.0, model=None, exe=None, runner=None, make_sandbox=None):
         self.timeout, self._exe = float(timeout), exe
@@ -515,14 +593,17 @@ class AgyBackend:
             self.problem = "agy resolves to a shell script: refusing to run it"
         return self.problem == ""
 
-    def ask(self, prompt, cancel=None, progress=None):
+    def ask(self, prompt, cancel=None, progress=None, images=None):
         if not self.available():
             raise BackendError(self.problem)
+        pics = check_images(images) if images else []      # before the sandbox exists: nothing to clean up on refusal
         d = self._sandbox()
         try:
             write_prompt(d, prompt)
-            text = self._run(self.exe(), AGY_CHAT_TASK, d, timeout=self.timeout, cancel=cancel, progress=progress,
-                             model=self.model, mode=AGY_MODE)
+            for name, jpg in pics:                         # only inside the throw-away folder, deleted below
+                (d / name).write_bytes(jpg)
+            text = self._run(self.exe(), AGY_SEE_TASK if pics else AGY_CHAT_TASK, d, timeout=self.timeout,
+                             cancel=cancel, progress=progress, model=self.model, mode=AGY_MODE)
             if not str(text).strip():
                 raise BackendError("agy produced no output (is it logged in? run `agy` once by hand)")
             return str(text)[:MAX_REPLY]

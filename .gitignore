@@ -38,3 +38,5 @@ research/kene_reference/user_refs/
 test_frames/kene_real/user_ref_pairs.png
 test_frames/kene_real/reference_pairs.png
 tools/agy_neon_runner.py
+# the user's own sprite images (beings.py sprite creature) and art uploads stay local, never in the repo
+art/

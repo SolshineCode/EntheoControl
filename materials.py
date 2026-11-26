@@ -43,6 +43,8 @@ except Exception:
 TAU = 2.0 * math.pi
 VERSION = 1
 UNIT = 22                        # private texture unit of the skin array (0-17, 20, 21 are taken: see HANDOFF)
+UNIT_L = 23                      # private texture unit of the live-layer array (LayerHub)
+UNIT_M, UNIT_LM = 24, 25         # the same two arrays again, read through a MIRRORED_REPEAT sampler object
 MAX_LAYERS = 8
 SIZES = (512, 1024)
 FADE_S = 0.4                     # source crossfade / fade in from procedural
@@ -65,6 +67,14 @@ ENVS = {
     "vortex": dict(label="Prismatic vortex", slots=("walls",), maps=DECK_MAPS, host="land", land=2),
     "hexdome": dict(label="Hex domes", slots=("domes",), maps=DECK_MAPS, host="land", land=3),
     "tunnel": dict(label="Travel tunnel", slots=("walls",), maps=TUNNEL_MAPS, host="scene"),
+    # [beings> the sprite creature (beings.py): "fill" = a skin inside the silhouette (look "Skinned fill"); "sprite" =
+    # the user's own image that IS the creature. `own` slots are only a picker: beings.SpriteLibrary loads them (alpha
+    # kept, distance field built), the skin array never holds them. <beings]
+    "beings": dict(label="Sprite creature", slots=("fill", "sprite"), maps=["Moves with the creature", "Mirrors with the creature", "Fixed to the screen"], host="beings",
+                   own=("sprite",)),
+    # [coilnest> the coil nest bodies (coilnest.py): the image becomes the cloth ground of every body; u along the
+    # body, v round the girth, kené lines / fill / jewels stay on top and keep their gating. <coilnest]
+    "coilnest": dict(label="Coil nest bodies", slots=("bodies",), maps=["Along the body"], host="coilnest"),
 }
 LAND_ENVS = ["corridor", "torus", "vortex", "hexdome"]
 MAX_SLOTS = 2
@@ -135,6 +145,7 @@ _GEO = {
     ("tunnel", "walls", EFF_TUBE): ("cyl", 4.0, 0.9, 2.0),
     ("tunnel", "walls", EFF_GROUND): ("plane", 0.9, 0.9, 1.25),
     ("tunnel", "walls", EFF_SCREEN): ("plane", 0.62, 0.62, 0.0),
+    ("coilnest", "bodies", 0): ("cyl", 2.0, 1.0, 0.0),           # (girth, 4 cells): 2 images round, one per 4 cells along
 }
 
 
@@ -475,6 +486,10 @@ def validate(c):
             raise ValueError("prompt must be 1..400 characters")
     elif op == "gen_cancel":
         pass
+    elif op == "example":                                # a ready-made skin preset (EXAMPLES): replaces every slot
+        if c.get("name") not in EXAMPLES:
+            raise ValueError("unknown example")
+        out["name"] = c["name"]
     elif op == "enable":
         if not isinstance(c.get("on"), bool):
             raise ValueError("'on' must be true or false")
@@ -601,6 +616,8 @@ class SkinState:
             self._rebuild()
         elif op == "replace":
             self.load(c["skins"])
+        elif op == "example":
+            self.load(EXAMPLES[c["name"]])
         elif op == "mod":
             key = f"{c['env']}:{c['slot']}:{c['f']}"
             pair = self.mods.get(key) or [None, None]
@@ -793,28 +810,53 @@ def glsl(nslots=MAX_SLOTS, pal="palC"):
 // ---- environment skins (materials.py). Per slot: skA = layer A, layer B, crossfade, amount;
 // skB = mapping, mix mode, tiling, palette-follow; skC = uv matrix (column major); skD = phase u, v, half texel,
 // brightness; skE = tint rgb, unused.
-uniform sampler2DArray texSkin;
+uniform sampler2DArray texSkin, texSkinL;            // images (unit 22) / live engine layers (unit 23, LayerHub)
+uniform sampler2DArray texSkinM, texSkinLM;          // the same arrays through a MIRRORED_REPEAT sampler (24 / 25)
+uniform float skMS;                                  // 1 = the mirrored samplers are bound (else: fold + clamp in maths)
 uniform vec4 skA[%(n)d], skB[%(n)d], skC[%(n)d], skD[%(n)d], skE[%(n)d];
+// skF = base present, overlays on, -, -. Overlay k = slot*%(o)d + j: skLA = source code, blend, opacity, remap + 2*mirror;
+// skLB = uv matrix; skLC = phase u, v, patch amount, patch size; skLD = channel gains rgba; skLE = patch drift xy,
+// threshold, lit; skLR[k*4 + c] = the colour of channel c (remap).
+uniform vec4 skF[%(n)d], skLA[%(m)d], skLB[%(m)d], skLC[%(m)d], skLD[%(m)d], skLE[%(m)d], skLR[%(m4)d];
 float skZ = 0.5;                                      // depth of this pixel, 0 near .. 1 far (set by the host)
 float skSp = 0.0;                                     // specular glint of the form light (set by skLight)
 float skDim = 1.0;                                    // the host multiplies its own haze / glow by this
+vec2 skU = vec2(0.0), skGx = vec2(0.0), skGy = vec2(0.0);   // the mapping of the last skTap / skTri (overlays reuse it)
+// source code < 100: a layer of the image array; >= 100: layer (code - 100) of the live-layer array
+vec4 skSample(float code, vec2 uv, vec2 gx, vec2 gy, bool mir){
+  if (mir) {                                         // hardware mirrored repeat: seamless for ANY image, at every mip
+    if (code > 99.5) return textureGrad(texSkinLM, vec3(uv, code - 100.0), gx, gy);
+    return textureGrad(texSkinM, vec3(uv, code), gx, gy);
+  }
+  if (code > 99.5) return textureGrad(texSkinL, vec3(uv, code - 100.0), gx, gy);
+  return textureGrad(texSkin, vec3(uv, code), gx, gy);
+}
+// "floating patches" field 0..1: two domain-warped sine waves (4 sin, no hash, no fetch); irregular blobs that drift
+float skNoise(vec2 p){
+  p *= 3.1;
+  float a = sin(p.x + 1.7*sin(p.y*0.71 + 0.3)), b = sin(p.y*1.13 + 1.5*sin(p.x*0.83 + 1.9));
+  return 0.5 + 0.25*(a + b);
+}
 vec3 skFetch(int s, vec2 uv, vec2 gx, vec2 gy){
-  if (skB[s].z > 0.5) {                               // mirrored repeat: continuous for ANY image; the fold is kept
+  bool mir = skB[s].z > 0.5 && skMS > 0.5;
+  if (skB[s].z > 0.5 && !mir) {                       // fallback mirrored repeat in maths; the fold is kept
     uv = 1.0 - abs(mod(uv, 2.0) - 1.0);               // half a (mip) texel away from the edge so the wrap never bleeds in
     float a = dot(gx, gx), b = dot(gy, gy);
     float e = clamp(max(skD[s].z, sqrt(max(min(a, b), max(a, b)*0.0625))), 0.0, 0.5);
     uv = clamp(uv, e, 1.0 - e);
   }
-  vec3 c = textureGrad(texSkin, vec3(uv, skA[s].x), gx, gy).rgb;
+  vec3 c = skSample(skA[s].x, uv, gx, gy, mir).rgb;
   if (skA[s].z > 0.002) {                             // only while a swap fades: the new image sweeps in from the
     float e = mix(-0.25, 1.25, skA[s].z);             // near end to the far end (a wipe along depth, no grey double exposure)
-    c = mix(c, textureGrad(texSkin, vec3(uv, skA[s].y), gx, gy).rgb, 1.0 - smoothstep(e - 0.18, e + 0.18, skZ));
+    c = mix(c, skSample(skA[s].y, uv, gx, gy, mir).rgb, 1.0 - smoothstep(e - 0.18, e + 0.18, skZ));
   }
   return c;
 }
 // ONE fetch. uv = the mapping's two coordinates, gx / gy = their change across one pixel (analytic: no derivative
 // seams at the atan cut or at silhouettes; the hardware does the anisotropic filtering).
 vec3 skTap(int s, vec2 uv, vec2 gx, vec2 gy){
+  skU = uv; skGx = gx; skGy = gy;
+  if (skF[s].x < 0.5) return vec3(0.0);               // no base image: overlays go onto the world's own look
   mat2 M = mat2(skC[s].xy, skC[s].zw);
   return skFetch(s, M*uv + skD[s].xy, M*gx, M*gy);
 }
@@ -822,6 +864,9 @@ vec3 skTap(int s, vec2 uv, vec2 gx, vec2 gy){
 vec3 skTri(int s, vec3 p, vec3 n, float f){
   mat2 M = mat2(skC[s].xy, skC[s].zw);
   vec3 w = abs(n); w *= w; w *= w; w *= w; w /= (w.x + w.y + w.z + 1e-5);       // ^8: crisp, no double exposure
+  skU = w.x > w.y ? (w.x > w.z ? p.yz : p.xy) : (w.y > w.z ? p.xz : p.xy);   // overlays: the dominant plane (1 fetch)
+  skGx = vec2(f*1.4, 0.0); skGy = vec2(0.0, f*1.4);
+  if (skF[s].x < 0.5) return vec3(0.0);
   vec2 gx = M*vec2(f*1.4, 0.0), gy = M*vec2(0.0, f*1.4), o = skD[s].xy;
   return skFetch(s, M*p.yz + o, gx, gy)*w.x + skFetch(s, M*p.xz + o, gx, gy)*w.y + skFetch(s, M*p.xy + vec2(o.x, 0.0), gx, gy)*w.z;
 }
@@ -830,11 +875,34 @@ vec3 skTri(int s, vec3 p, vec3 n, float f){
 // leaves a soft specular glint in skSp and the depth in skZ. Analytic: no extra march, no fetch.
 float skLight(vec3 N, vec3 rd, float t, float steps){
   const vec3 L = vec3(0.2120, 0.7420, -0.6360);
-  float ndl = clamp(dot(N, L)*0.40 + 0.68, 0.34, 1.0);
+  // key light (wrapped) x a headlamp falloff: walls facing the camera bright, grazing walls and creases fall off
+  float ndl = clamp(dot(N, L)*0.50 + 0.72, 0.36, 1.0)*(0.72 + 0.28*clamp(dot(N, -rd), 0.0, 1.0));
   float sp = max(dot(reflect(rd, N), L), 0.0); sp *= sp; sp *= sp; sp *= sp;       // ^16 by squaring (no pow)
   skSp = sp*sp*0.45;
   skZ = clamp(t*0.04, 0.0, 1.0);
   return ndl*exp(-(steps*0.006 + t*t*0.0017));
+}
+// One overlay layer of a skin stack on top of `o` (ONE fetch; patches = 4 hashes). Same mapping as the base.
+vec3 skLayer(int k, vec3 o, float shade){
+  vec4 A = skLA[k];
+  mat2 M = mat2(skLB[k].xy, skLB[k].zw);
+  vec2 uv = M*skU + skLC[k].xy, gx = M*skGx, gy = M*skGy, q = uv;
+  bool mir = A.w > 1.5 && skMS > 0.5;                // mirror (any layer is seamless) / plain repeat
+  if (A.w > 1.5 && !mir) uv = 1.0 - abs(mod(uv, 2.0) - 1.0);
+  vec4 c = skSample(A.x, uv, gx, gy, mir)*skLD[k];
+  vec3 col = mod(A.w, 2.0) > 0.5 ? skLR[k*4].rgb*c.r + skLR[k*4 + 1].rgb*c.g + skLR[k*4 + 2].rgb*c.b + skLR[k*4 + 3].rgb*c.a
+                                 : c.rgb;
+  if (skLC[k].z > 0.001) {                            // floating patches: a drifting noise window on the layer
+    float t = skLE[k].z, nz = skNoise(q*skLC[k].w + skLE[k].xy);
+    col *= mix(1.0, smoothstep(t - 0.12, t + 0.12, nz), skLC[k].z);
+  }
+  col *= mix(1.0, clamp(shade*1.6, 0.0, 1.3), skLE[k].w);       // the world's light: crevices stay dark
+  float op = A.z, b = A.y, l = dot(col, vec3(0.299, 0.587, 0.114));
+  if (b < 0.5) return o + col*op;
+  if (b < 1.5) return 1.0 - (1.0 - min(o, 1.0))*(1.0 - min(col*op, 1.0));
+  if (b < 2.5) return o*mix(vec3(1.0), 0.15 + 1.7*col, min(op, 1.0));
+  if (b < 3.5) return mix(o, col, clamp(l*2.5, 0.0, 1.0)*min(op, 1.0));
+  return o*mix(1.0, clamp(l*2.0, 0.0, 1.0), min(op, 1.0));
 }
 // proc = the world's own colour at this point, S = the skin, lines = the world's line mask (0..1), shade = the form
 // shading (light x the world's own relief) so the surface still reads as a lit surface, not a sticker.
@@ -847,17 +915,24 @@ vec3 skMix(int s, vec3 proc, vec3 S, float lines, float shade){
   l = dot(S, vec3(0.299, 0.587, 0.114));
   vec3 pc = min(proc, 1.0), o;
   float m = skB[s].y, pl = dot(pc, vec3(0.299, 0.587, 0.114));
-  if (m < 0.5) o = S*(shade*1.75) + vec3(1.0, 0.95, 0.88)*(skSp*l*shade) + proc*lines*0.16;
+  if (m < 0.5) o = S*(shade*3.0) + vec3(1.0, 0.95, 0.88)*(skSp*l*shade*1.6);   // Replace: the skin alone, lit
   else if (m < 1.5) o = proc*(0.22 + 2.1*S);          // the world's own light takes the skin's colour and grain
   else if (m < 2.5) { vec3 q = S*(shade*0.85); o = max(pc, q) + 0.25*min(pc, q); }     // lighter of the two: no milky haze
   else if (m < 3.5) o = proc*(0.50 + 1.5*S) + S*(pl*0.50 + 0.10*shade);
   else o = S*(lines*1.9*(0.55 + 0.45*shade)) + proc*(1.0 - lines)*0.10;
-  vec3 k = max(o - 0.8, 0.0);                          // soft knee: a bright skin rolls off, it never clips to white
-  o = min(o, 0.8) + k/(1.0 + 4.0*k);
-  skDim = min(skDim, 1.0 - 0.6*skA[s].w);
+  if (skF[s].x < 0.5) o = proc;                       // no base image: the world's own look carries the overlays
+  if (skF[s].y > 0.5) {
+    for (int j = 0; j < %(o)d; j++) {
+      int kk = s*%(o)d + j;
+      if (skLA[kk].z > 0.001) o = skLayer(kk, o, shade);
+    }
+  }
+  vec3 k = max(o - 1.15, 0.0);                         // soft knee: a bright skin rolls off, it never clips to white
+  o = min(o, 1.15) + k/(1.0 + 2.5*k);                  // (the worlds output up to 1.6 = full white)
+  skDim = min(skDim, 1.0 - 0.95*skA[s].w);             // under a skin the world's coloured haze goes (black = no light)
   return mix(proc, o, skA[s].w);
 }
-""" % dict(n=nslots, pal=pal)
+""" % dict(n=nslots, pal=pal, o=MAX_OVERLAYS, m=nslots * MAX_OVERLAYS, m4=nslots * MAX_OVERLAYS * 4)
 
 
 GLSL = glsl()
@@ -1246,6 +1321,8 @@ class SkinLibrary:
                 time.sleep(0.002)
 
     def use(self):
+        if self.tex is None:                             # only live layers on screen: no image array (none needed)
+            return
         self.tex.use(UNIT)
         self.binds += 1
 
@@ -1298,6 +1375,16 @@ class SkinEngine:
         self.enabled = True                         # the engine mirrors SkinState.on here (off = free the array)
         self.fade_s = FADE_S
         self.binds = 0
+        self.hub = None                             # LayerHub: live engine layers as sources (None = "layer" sources stay off)
+        no = MAX_SLOTS * MAX_OVERLAYS
+        self._uf = {env: np.zeros((MAX_SLOTS, 4), dtype="f4") for env in ENVS}         # base present, overlays on
+        self._ul = {env: np.zeros((5, no, 4), dtype="f4") for env in ENVS}             # skLA..skLE
+        self._ulr = {env: np.zeros((no * 4, 4), dtype="f4") for env in ENVS}           # skLR (channel colours)
+        self._lph = {env: [[0.0, 0.0, 0.0, 0.0] for _ in range(no)] for env in ENVS}  # overlay phase u, v, patch x, y
+        self._lm = {env: [(1.0, 0.0, 0.0, 1.0)] * no for env in ENVS}
+        self._lfollow = {env: [0.0] * no for env in ENVS}
+        self._ms = None                             # mirrored sampler objects: None = not tried yet, False = unavailable
+        self._hg = -1                               # the hub generation the live indices belong to
 
     def release(self):
         self.lib.release()
@@ -1336,6 +1423,8 @@ class SkinEngine:
     def status(self):
         s = self.lib.status()
         s.update(level=self.level, procedural=self.suppress, active=[e for e, on in self._on.items() if on])
+        if self.hub is not None:
+            s["layers"] = self.hub.status()
         return s
 
     def advance(self, env, dz):
@@ -1343,6 +1432,75 @@ class SkinEngine:
             if sl.amt > 0.0 and sl.follow != 0.0:
                 sl.pu = (sl.pu + sl.m[1] * dz * sl.follow) % PH_WRAP
                 sl.pv = (sl.pv + sl.m[3] * dz * sl.follow) % PH_WRAP
+        ul = self._ul[env]
+        for k, ph in enumerate(self._lph[env]):
+            f = self._lfollow[env][k]
+            if f != 0.0 and ul[0, k, 2] > 0.0:
+                m = self._lm[env][k]
+                ph[0] = (ph[0] + m[1] * dz * f) % PH_WRAP
+                ph[1] = (ph[1] + m[3] * dz * f) % PH_WRAP
+
+    def _req(self, key):
+        """-> source code for the shader: image array layer (0..7), 100 + live layer index, or -1 (not ready)."""
+        if key[0] == "layer":
+            h = self.hub
+            if h is None:
+                return -1
+            i = h.request(key[1])
+            return 100 + i if i >= 0 else -1
+        return self.lib.request(key)
+
+    def _hub_gen(self):
+        """The live-layer array was freed / reallocated: only slots SHOWING a live layer lose their index (image skins
+        are not touched, so they never re-fade)."""
+        hg = self.hub.gen if self.hub is not None else -1
+        if hg != self._hg:
+            self._hg = hg
+            for slots in self._slots.values():
+                for sl in slots:
+                    if sl.cur >= 100 or sl.nxt >= 100:
+                        sl.cur = sl.nxt = -1
+                        sl.cur_key = sl.nxt_key = None
+                        sl.xf = sl.amt = 0.0
+
+    def _overlays(self, env, i, v, kind, base, base_z, follow, tile_base, bpm, dt, pinned, wanted):
+        """Overlay uniforms of slot i. -> number of overlays with a ready source."""
+        ul, ulr, n = self._ul[env], self._ulr[env], 0
+        for j in range(MAX_OVERLAYS):
+            k = i * MAX_OVERLAYS + j
+            lay = v["layers"][j] if v is not None else None
+            code = -1
+            if lay is not None:
+                key = (lay["src"]["kind"], lay["src"]["name"])
+                code = self._req(key)
+                if key[0] != "layer":
+                    pinned.add(key)
+                    wanted.add(key)
+            if code < 0:
+                ul[0, k, 2] = 0.0
+                continue
+            n += 1
+            m = uv_matrix(kind, base, base_z, lay["scale"], lay["rot"], lay["tile"])
+            self._lm[env][k] = m
+            self._lfollow[env][k] = follow
+            ph = self._lph[env][k]
+            sp = lay["scroll"] * dt
+            if sp:
+                a = math.radians(lay["dir"])
+                ph[0] = (ph[0] + math.cos(a) * sp) % PH_WRAP
+                ph[1] = (ph[1] + math.sin(a) * sp) % PH_WRAP
+            ns = lay["nspeed"] * dt
+            if ns:
+                ph[2] = (ph[2] + 0.83 * ns) % 1024.0
+                ph[3] = (ph[3] + 0.56 * ns) % 1024.0
+            ul[0, k, 0], ul[0, k, 1], ul[0, k, 2], ul[0, k, 3] = code, lay["blend"], lay["opacity"], lay["remap"] + 2 * lay["tile"]
+            ul[1, k, 0], ul[1, k, 1], ul[1, k, 2], ul[1, k, 3] = m[0], m[2], m[1], m[3]
+            ul[2, k, 2], ul[2, k, 3] = lay["noise"], lay["nscale"]
+            ul[3, k, 0], ul[3, k, 1], ul[3, k, 2], ul[3, k, 3] = lay["gate"]
+            ul[4, k, 2], ul[4, k, 3] = lay["thr"], lay["lit"]
+            for c in range(4):
+                ulr[k * 4 + c, 0], ulr[k * 4 + c, 1], ulr[k * 4 + c, 2] = lay["cols"][c]
+        return n
 
     def idle(self):
         return not self._pinned and not self.lib.busy() and (self.enabled or self.lib.tex is None)
@@ -1363,31 +1521,50 @@ class SkinEngine:
         pinned, wanted = self._pinned, self._wanted
         pinned.clear()
         wanted.clear()
+        self._hub_gen()
         for env, slots in self._slots.items():
             fe = frame.get(env) if frame else None
             names = ENVS[env]["slots"]
             u = self._u[env]
             on = False
+            uf = self._uf[env]
+            gen = lib.gen
             for i, sl in enumerate(slots):
+                if names[i] in ENVS[env].get("own", ()):        # [beings] picker-only slot: its host loads it itself
+                    continue
                 v = fe.get(names[i]) if fe else None
-                if sl.gen != lib.gen:                         # the array was reallocated: indices are gone
+                if sl.gen != gen:                             # an array was reallocated: indices are gone
                     sl.cur = sl.nxt = -1
                     sl.cur_key = sl.nxt_key = None
                     sl.xf = sl.amt = 0.0
-                    sl.gen = lib.gen
+                    sl.gen = gen
                 want = None
-                if v is not None and not hold:
+                if v is not None and not hold and v["src"] is not None:
                     src = v["src"]
                     want = (src["kind"], src["name"])
                     wanted.add(want)
+                nov = 0
+                if v is not None and not hold:               # overlay layers (mapping set below, once the base is known)
+                    e0 = int(v["map"])
+                    if eff is not None and env in eff and e0 == 0:
+                        e0 = eff[env]
+                    elif ENVS[env]["host"] == "scene":
+                        e0 = (EFF_LOGPOLAR, EFF_LOGPOLAR, EFF_TUBE, EFF_SCREEN)[e0]
+                    g0 = geometry(env, names[i], e0)
+                    nov = self._overlays(env, i, v, g0[0], g0[1], g0[2], g0[3], int(v["tile"]), bpm, dt, pinned, wanted)
+                else:
+                    self._ul[env][0, i * MAX_OVERLAYS:(i + 1) * MAX_OVERLAYS, 2] = 0.0
+                uf[i, 1] = 1.0 if nov else 0.0
                 target = 0.0
+                if want is None and nov:
+                    target = 1.0                              # overlays alone: the world's own look is the base
                 if want is not None:
                     if sl.cur_key == want and sl.nxt_key is None:
                         target = 1.0
                     else:
                         if sl.nxt_key is not None and sl.nxt_key != want and sl.xf <= 0.0:
                             sl.nxt, sl.nxt_key = -1, None
-                        lay = lib.request(want)
+                        lay = self._req(want)
                         if sl.cur_key is None:
                             if lay >= 0:
                                 sl.cur, sl.cur_key = lay, want
@@ -1411,10 +1588,13 @@ class SkinEngine:
                         sl.cur, sl.cur_key, sl.nxt, sl.nxt_key, sl.xf = -1, None, -1, None, 0.0
                     u[0, i, 3] = 0.0
                     continue
+                if want is None and sl.cur_key is not None and v is not None and sl.amt >= 1.0:
+                    sl.cur, sl.cur_key, sl.nxt, sl.nxt_key, sl.xf = -1, None, -1, None, 0.0   # base cleared, overlays stay
+                uf[i, 0] = 1.0 if sl.cur_key is not None else 0.0
                 if sl.cur_key is not None:
                     pinned.add(sl.cur_key)
                     wanted.add(sl.cur_key)
-                    lib.request(sl.cur_key)
+                    self._req(sl.cur_key)
                 if sl.nxt_key is not None:
                     pinned.add(sl.nxt_key)
                     wanted.add(sl.nxt_key)
@@ -1475,10 +1655,510 @@ class SkinEngine:
         for j, name in enumerate(("skA", "skB", "skC", "skD", "skE")):
             if name in prog:
                 prog[name].write(u[j, :n])
-        if "texSkin" in prog:
-            prog["texSkin"].value = UNIT
+        if "skF" in prog:
+            prog["skF"].write(self._uf[env][:n])
+            uf = self._uf[env]
+            if uf[:n, 1].any():                               # overlays: their block (+ this frame's phases)
+                ul = self._ul[env]
+                no = n * MAX_OVERLAYS
+                for k, ph in enumerate(self._lph[env][:no]):
+                    ul[2, k, 0], ul[2, k, 1] = ph[0], ph[1]
+                    ul[4, k, 0], ul[4, k, 1] = ph[2], ph[3]
+                for j, name in enumerate(("skLA", "skLB", "skLC", "skLD", "skLE")):
+                    if name in prog:
+                        prog[name].write(ul[j, :no])
+                if "skLR" in prog:
+                    prog["skLR"].write(self._ulr[env][:no * 4])
+        if self._ms is None:                              # created on the render thread, once
+            try:
+                self._ms = (MirrorSampler(), MirrorSampler())
+            except Exception:
+                self._ms = False
+        for name, unit in (("texSkin", UNIT), ("texSkinL", UNIT_L), ("texSkinM", UNIT_M), ("texSkinLM", UNIT_LM)):
+            if name in prog:
+                prog[name].value = unit
+        if "skMS" in prog:
+            prog["skMS"].value = 1.0 if self._ms else 0.0
         self.lib.use()
+        if self.hub is not None:
+            self.hub.use()
+        if self._ms:
+            if self.lib.tex is not None:
+                self.lib.tex.use(UNIT_M)
+                self._ms[0].use(UNIT_M)
+            if self.hub is not None and self.hub.be is not None and getattr(self.hub.be, "arr", None) is not None:
+                self.hub.be.arr.use(UNIT_LM)
+                self._ms[1].use(UNIT_LM)
         self.binds += 1
+
+
+# ------------------------------------------------------------------ LAYERS AS SKINS (live engine layers -> textures)
+#
+# Any engine layer (kené / bead studies, Folding Blocks, beadwork, beings, math stack, fractals, text, camera, video,
+# the filtered output, the built-in 4-channel line layer) can be a skin source: {"kind": "layer", "name": <id>}.
+# The LayerHub turns a referenced layer into one layer of a small RGBA8 texture array (512 px, mipmapped, unit 23):
+#   * only while referenced: a source nobody requested for KEEP_S seconds gives its slot back (and its own pass, if
+#     one was made for it); with nothing referenced for FREE_S the array is freed. Nothing referenced = run() returns
+#     after one dict check: no GL call, no VRAM.
+#   * at most once per frame, whatever the number of consumers (deck slots, the tunnel, creature bodies).
+#   * reuse first: a layer the show already drew this frame is COPIED (one 512 px draw + mips), never drawn twice;
+#     only a layer that is off in the mix is drawn by its own small (512 px) instance.
+#   * static sources (the built-in line layer) are drawn once.
+#   * governor-aware: quality 1 (any reduction applied) -> every other frame; 2 (last resort) -> frozen.
+# One frame of latency: the hub runs after the layers have drawn; consumers sample last frame's copy.
+#
+# CONTRACT for other modules (beings / serpent bodies):
+#   hub = <the engine's LayerHub>              (live_visuals: `skins.hub`, also passed to consumers)
+#   i = hub.request("kene")                    every frame you need it; -> array layer index, or -1 (not ready yet)
+#   hub.use()                                  binds the array to UNIT_L (23) before your draw
+#   GLSL: uniform sampler2DArray texSkinL;  textureGrad(texSkinL, vec3(uv, i), dUVdx, dUVdy)  (RGBA8, mipmapped,
+#         clamp-to-edge: fold / fract the uv yourself; mirror fold = 1 - abs(mod(uv, 2) - 1) makes any layer seamless)
+#   For full stacks on a body, paste `materials.glsl()` and use skTap / skMix with a slot of your own, or copy skLayer.
+#   hub.status() -> dict for the governor / panel.
+LAYER_SOURCES = {                # id -> label (what the panel offers; the engine registers what it actually has)
+    "lines4": "Line layer, 4 channels (R lines, G fine fill, B ground, A jewels)",
+    "kene": "Kené study",
+    "kene4": "Kené study, 4 channels (R lines, G fill, B ground, A accents)",
+    "beadstudy": "Bead study",
+    "blocks": "Folding Blocks",
+    "beads": "Beadwork",
+    "lines": "Sacred lines",
+    "beings": "Beings",
+    "stack": "Math stack",
+    "fractal": "Math fractals",
+    "text": "Text",
+    "camera": "Crowd camera (silhouette mask)",
+    "video": "Video loops",
+    "output": "Filtered output (last frame)",
+}
+
+_COPY_FS = """
+#version 330
+uniform sampler2D src;
+uniform vec2 px;                                      // one destination texel in source uv
+uniform float mono;                                   // a one-channel source (camera mask): grey
+in vec2 v_uv;
+out vec4 f;
+void main(){                                          // 2x2 box of bilinear taps: a clean downscale to 512 px
+  vec2 o = px*0.25;
+  f = 0.25*(texture(src, v_uv + vec2(-o.x, -o.y)) + texture(src, v_uv + vec2(o.x, -o.y))
+          + texture(src, v_uv + vec2(-o.x, o.y)) + texture(src, v_uv + vec2(o.x, o.y)));
+  if (mono > 0.5) f = vec4(f.rrr, 1.0);
+}
+"""
+
+# The built-in kené-TYPE line layer (an original stepped-lozenge lattice, not a copy of any design), 4 semantic
+# channels: R primary outlines, G fine meander fill, B cloth ground, A jewel accents. Seamless (whole cells per tile).
+_LINES4_FS = """
+#version 330
+in vec2 v_uv;
+out vec4 f;
+uniform float N;
+float band(float d, float w, float aa){ return 1.0 - smoothstep(w - aa, w + aa, abs(d)); }
+void main(){
+  vec2 q = v_uv*N, c = floor(q), g = fract(q) - 0.5;
+  float aa = 1.5*N/512.0;
+  // stepped lozenge: diamond metric quantised into stairs (8 steps per half cell)
+  vec2 st = floor(abs(g)*16.0 + 0.5)/16.0;
+  float dia = st.x + st.y, smooth_d = abs(g.x) + abs(g.y);
+  float odd = mod(c.x + c.y, 2.0);
+  float prim = band(dia - 0.5, 0.045, aa);                           // the lattice outlines
+  prim = max(prim, band(dia - 0.25, 0.03, aa)*odd);                  // an inner lozenge on every other cell
+  prim = max(prim, band(g.x, 0.03, aa)*step(0.5, 1.0 - odd)*step(dia, 0.5)*step(0.25, abs(g.y)));   // spines
+  float inner = step(dia, 0.47);
+  float fine = band(fract(smooth_d*9.0 + 0.5*odd) - 0.5, 0.12, 9.0*aa)*inner*(1.0 - prim)*step(0.06, smooth_d);
+  float ground = inner*(1.0 - prim);
+  vec2 cj = abs(g) - 0.5;                                            // jewels at the lattice junctions + odd centres
+  float jew = 1.0 - smoothstep(0.055, 0.055 + aa, length(cj));
+  jew = max(jew, (1.0 - smoothstep(0.05, 0.05 + aa, length(g)))*odd);
+  f = vec4(prim, fine, ground, jew);
+}
+"""
+
+
+class MirrorSampler:
+    """A GL sampler object with MIRRORED_REPEAT wrap (moderngl 5.13 has no mirrored wrap), bound to one unit. With
+    it the shader reads mirrored tiling straight from the hardware: no fold maths, no edge clamp, no streak bands."""
+
+    def __init__(self, aniso=4.0):
+        import ctypes
+        import sys
+        if sys.platform != "win32":
+            raise OSError("raw GL samplers are only wired up for Windows")
+        C = ctypes
+        get = C.windll.opengl32.wglGetProcAddress
+        get.restype, get.argtypes = C.c_void_p, [C.c_char_p]
+
+        def proc(name, *args):
+            addr = get(name)
+            if not addr:
+                raise OSError(f"{name.decode()} is not available")
+            return C.WINFUNCTYPE(None, *args)(addr)
+        u, i, f = C.c_uint, C.c_int, C.c_float
+        gen = proc(b"glGenSamplers", i, C.POINTER(u))
+        pi = proc(b"glSamplerParameteri", u, u, i)
+        pf = proc(b"glSamplerParameterf", u, u, f)
+        self._bind = proc(b"glBindSampler", u, u)
+        sid = u(0)
+        gen(1, C.byref(sid))
+        if not sid.value:
+            raise OSError("glGenSamplers gave no sampler")
+        self.id = sid.value
+        for pname, val in ((0x2802, 0x8370), (0x2803, 0x8370), (0x2801, 0x2703), (0x2800, 0x2601)):
+            pi(self.id, pname, val)                      # WRAP_S/T = MIRRORED_REPEAT, trilinear
+        pf(self.id, 0x84FE, float(aniso))                # anisotropy
+
+    def use(self, unit):
+        self._bind(unit, self.id)
+
+
+class RawCopy:
+    """glCopyImageSubData through ctypes (GL 4.3): a 2D texture level -> one layer of a 2D array level, GPU only."""
+    T2D, T2A = 0x0DE1, 0x8C1A
+
+    def __init__(self):
+        import ctypes
+        import sys
+        if sys.platform != "win32":
+            raise OSError("raw GL copies are only wired up for Windows")
+        C = ctypes
+        get = C.windll.opengl32.wglGetProcAddress
+        get.restype, get.argtypes = C.c_void_p, [C.c_char_p]
+        addr = get(b"glCopyImageSubData")
+        if not addr:
+            raise OSError("glCopyImageSubData is not available")
+        i, u = C.c_int, C.c_uint
+        self._copy = C.WINFUNCTYPE(None, u, u, i, i, i, i, u, u, i, i, i, i, i, i, i)(addr)
+        self._err = C.windll.opengl32.glGetError
+        self._err.restype = u
+
+    def level(self, src, dst, layer, level, size):
+        self._copy(src, self.T2D, level, 0, 0, 0, dst, self.T2A, level, 0, 0, layer, size, size, 1)
+
+
+class _HubGL:
+    """The GL side of a LayerHub (tests swap in a fake)."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.arr = self.scratch = self.fbo = self.prog = self.vao = self.quad = None
+        self.raw = None
+        self.size = 0
+        self._l4 = None                  # (prog, vao, tex, fbo) of the built-in line layer
+        self.copy_fallbacks = 0
+
+    def _quad(self, fs):
+        if self.quad is None:
+            self.quad = self.ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
+        prog = self.ctx.program(vertex_shader=_HUB_VS, fragment_shader=fs)
+        return prog, self.ctx.vertex_array(prog, [(self.quad, "2f", "in_pos")])
+
+    def alloc(self, size, layers):
+        import moderngl
+        self.size = size
+        self.arr = self.ctx.texture_array((size, size, layers), 4, dtype="f1")
+        self.arr.build_mipmaps()                         # allocates the (empty) chain once
+        self.arr.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        self.arr.repeat_x = self.arr.repeat_y = True     # plain repeat here; mirrored tiling reads unit 25 (sampler)
+        try:
+            self.arr.anisotropy = 4.0
+        except Exception:
+            pass
+        self.scratch = self.ctx.texture((size, size), 4, dtype="f1")
+        self.scratch.build_mipmaps()
+        self.fbo = self.ctx.framebuffer([self.scratch])
+        if self.prog is None:
+            self.prog, self.vao = self._quad(_COPY_FS)
+        if self.raw is None:
+            try:
+                self.raw = RawCopy()
+            except Exception:
+                self.raw = False
+
+    def blit(self, tex, layer):
+        import moderngl
+        ctx, s = self.ctx, self.size
+        prev, vp = ctx.fbo, ctx.viewport
+        self.fbo.use()
+        ctx.viewport = (0, 0, s, s)
+        tex.use(UNIT_L)
+        self.prog["src"].value = UNIT_L
+        self.prog["px"].value = (1.0 / s, 1.0 / s)
+        self.prog["mono"].value = 1.0 if getattr(tex, "components", 4) == 1 else 0.0
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        self.scratch.build_mipmaps()
+        lv, n = 0, s
+        if self.raw:
+            while n >= 1:
+                self.raw.level(self.scratch.glo, self.arr.glo, layer, lv, n)
+                lv, n = lv + 1, n // 2
+        else:                                            # no raw GL: through the CPU (slow, correct)
+            self.arr.write(self.scratch.read(), viewport=(0, 0, layer, s, s, 1))
+            self.arr.build_mipmaps()
+            self.copy_fallbacks += 1
+        prev.use()
+        ctx.viewport = vp
+
+    def use(self, unit=UNIT_L):
+        if self.arr is not None:
+            self.arr.use(unit)
+
+    def release(self):
+        for o in (self.arr, self.scratch, self.fbo):
+            if o is not None:
+                o.release()
+        self.arr = self.scratch = self.fbo = None
+        if self._l4 is not None:
+            self._l4[2].release()
+            self._l4[3].release()
+            self._l4 = None
+
+    def vram_bytes(self, layers):
+        if self.arr is None:
+            return 0
+        return int((layers + 1) * self.size * self.size * 4 * 4 / 3)   # array + scratch, with mips
+
+    def lines4(self, size):
+        import moderngl
+        ctx = self.ctx
+        if self._l4 is None or self._l4[2].size != (size, size):
+            if self._l4 is not None:
+                self._l4[2].release()
+                self._l4[3].release()
+            prog, vao = self._l4[:2] if self._l4 is not None else self._quad(_LINES4_FS)
+            tex = ctx.texture((size, size), 4, dtype="f1")
+            self._l4 = (prog, vao, tex, ctx.framebuffer([tex]))
+        prog, vao, tex, fbo = self._l4
+        prev, vp = ctx.fbo, ctx.viewport
+        fbo.use()
+        ctx.viewport = (0, 0, size, size)
+        prog["N"].value = 6.0
+        vao.render(moderngl.TRIANGLE_STRIP)
+        prev.use()
+        ctx.viewport = vp
+        return tex
+
+    def probe(self, layer, level, n=8):
+        """Test helper: an n x n grid of texels of one layer / level (uint8 RGBA)."""
+        import moderngl
+        ctx = self.ctx
+        prog, vao = self._quad("""
+#version 330
+uniform sampler2DArray a; uniform float L, M; in vec2 v_uv; out vec4 f;
+void main(){ f = textureLod(a, vec3(v_uv, L), M); }""")
+        tex = ctx.texture((n, n), 4, dtype="f1")
+        fbo = ctx.framebuffer([tex])
+        prev, vp = ctx.fbo, ctx.viewport
+        fbo.use()
+        ctx.viewport = (0, 0, n, n)
+        self.arr.use(UNIT_L)
+        prog["a"].value, prog["L"].value, prog["M"].value = UNIT_L, float(layer), float(level)
+        vao.render(moderngl.TRIANGLE_STRIP)
+        out = np.frombuffer(fbo.read(components=4), dtype="u1").reshape(n, n, 4).copy()
+        prev.use()
+        ctx.viewport = vp
+        for o in (fbo, tex, vao, prog):
+            o.release()
+        return out
+
+
+_HUB_VS = """
+#version 330
+in vec2 in_pos;
+out vec2 v_uv;
+void main(){ v_uv = in_pos*0.5 + 0.5; gl_Position = vec4(in_pos, 0.0, 1.0); }
+"""
+
+
+class LayerHub:
+    """Live engine layers as skin sources (see the block comment above). One per GL context."""
+
+    KEEP_S = 2.0                     # a source not requested for this long gives its array layer back
+    FREE_S = 10.0                    # nothing requested for this long: the array is freed (0 MB)
+    MAX_FAILS = 5
+
+    def __init__(self, ctx, size=512, layers=4, backend=None, clock=time.monotonic):
+        self.size, self.layers = int(size), int(layers)
+        self.be = backend if backend is not None else _HubGL(ctx)
+        self.clock = clock
+        self._src = {}
+        self._want = {}                  # name -> last request time
+        self._slot = {}                  # name -> array layer
+        self._ready = set()
+        self._done = {}                  # name -> tick it was drawn / copied
+        self._fails = {}
+        self._tick = 0
+        self._alloc = False
+        self._last_use = None
+        self.gen = 0                     # bumps when the array is freed (consumers drop their indices)
+        self.copies = self.reused = self.own = self.skipped = 0
+        self.ms = 0.0                    # CPU time of the last frame's runs (GPU cost: see the tests' timer queries)
+        if hasattr(self.be, "lines4"):
+            self.register("lines4", draw=self.builtin_lines4, static=True)
+
+    # ---- registry (the engine registers what it has; consumers only use names)
+    def register(self, name, draw=None, visible=None, phase="scene", static=False, release=None, label=None, every=1):
+        """draw(size) -> a texture drawn by the source's OWN small instance (called only when the layer is not already
+        on screen); visible() -> this frame's on-screen texture or None; phase "scene" (after the layers drew) or
+        "post" (after the filters: the output); static: drawn once; release(): free the own instance;
+        every: refresh every N frames (expensive sources)."""
+        self._src[name] = dict(draw=draw, visible=visible, phase=phase, static=bool(static), release=release,
+                               every=max(1, int(every)),
+                               label=label or LAYER_SOURCES.get(name, name))
+        self._fails.pop(name, None)
+        self._ready.discard(name)
+
+    def unregister(self, name):
+        self._drop(name)
+        self._src.pop(name, None)
+
+    def sources(self):
+        return {k: v["label"] for k, v in self._src.items()}
+
+    def builtin_lines4(self, size):
+        return self.be.lines4(size)
+
+    # ---- consumers
+    def request(self, name):
+        """Every frame you need `name`. -> its array layer, or -1 while it holds nothing yet / unknown / no slot free."""
+        if name not in self._src or self._fails.get(name, 0) >= self.MAX_FAILS:
+            return -1
+        self._want[name] = self.clock()
+        i = self._slot.get(name)
+        if i is None:
+            used = set(self._slot.values())
+            for j in range(self.layers):
+                if j not in used:
+                    self._slot[name] = i = j
+                    break
+            else:
+                return -1
+        return i if name in self._ready else -1
+
+    def use(self):
+        self.be.use(UNIT_L)
+
+    # ---- per frame (GL)
+    def run(self, phase="scene", quality=0):
+        if not self._want:
+            return
+        t0 = time.perf_counter()
+        for name in self._want:
+            src = self._src.get(name)
+            if src is None or src["phase"] != phase or name not in self._slot or self._done.get(name) == self._tick:
+                continue
+            if self._fails.get(name, 0) >= self.MAX_FAILS:
+                continue
+            ready = name in self._ready
+            every = src["every"] * (2 if quality == 1 else 1)
+            if ready and (src["static"] or quality >= 2 or self._tick % every):
+                self.skipped += 1
+                continue
+            try:
+                tex = src["visible"]() if src["visible"] is not None else None
+                if tex is not None:
+                    self.reused += 1
+                elif src["draw"] is not None:
+                    tex = src["draw"](self.size)
+                    if tex is not None:
+                        self.own += 1
+                if tex is None:
+                    continue
+                if not self._alloc:
+                    self.be.alloc(self.size, self.layers)
+                    self._alloc = True
+                self.be.blit(tex, self._slot[name])
+                self._ready.add(name)
+                self._done[name] = self._tick
+                self._fails.pop(name, None)
+                self.copies += 1
+            except Exception as ex:
+                n = self._fails[name] = self._fails.get(name, 0) + 1
+                if n == 1 or n == self.MAX_FAILS:
+                    print(f"[skins] layer source '{name}' failed ({n}/{self.MAX_FAILS}): {str(ex)[:200]}")
+        self.ms = (time.perf_counter() - t0) * 1000.0
+
+    def end_frame(self):
+        self._tick += 1
+        if not self._want and not self._alloc:
+            return
+        now = self.clock()
+        for name in [n for n, t in self._want.items() if now - t > self.KEEP_S]:
+            self._drop(name)
+        if self._want:
+            self._last_use = max(self._want.values())
+        elif self._alloc and (self._last_use is None or now - self._last_use > self.FREE_S):
+            self.be.release()
+            self._alloc = False
+            self._ready.clear()
+            self.gen += 1
+
+    def _drop(self, name):
+        self._want.pop(name, None)
+        self._slot.pop(name, None)
+        self._ready.discard(name)
+        self._done.pop(name, None)
+        src = self._src.get(name)
+        if src is not None and src["release"] is not None:
+            try:
+                src["release"]()
+            except Exception:
+                pass
+
+    def release(self):
+        for name in list(self._want):
+            self._drop(name)
+        if self._alloc:
+            self.be.release()
+            self._alloc = False
+            self.gen += 1
+
+    def vram_bytes(self):
+        return self.be.vram_bytes(self.layers) if self._alloc else 0
+
+    def probe(self, layer, level=0, n=8):
+        return self.be.probe(layer, level, n)
+
+    def status(self):
+        return dict(size=self.size, layers=self.layers, live=sorted(self._slot), ready=sorted(self._ready),
+                    copies=self.copies, reused=self.reused, own=self.own, skipped=self.skipped,
+                    fails=dict(self._fails), vram_mb=round(self.vram_bytes() / 1048576.0, 1), ms=round(self.ms, 3),
+                    sources=sorted(self._src))
+
+
+# ------------------------------------------------------------------ example skin presets
+# "Kené cloth world": every part of the torus wormhole + corridor carries a kené-TYPE line layer (the built-in
+# 4-channel source, colour-remapped per channel) over an AI image skin; neighbouring parts scroll in opposite
+# directions, floating patches gate the fine fill, a gold glow layer rides on top. Load with
+# {"cmd": "skin", "op": "replace", "skins": materials.EXAMPLES["kene_cloth_world"]} (or `example` op).
+_L4 = dict(kind="layer", name="lines4")
+EXAMPLES = {
+    "kene_cloth_world": dict(v=VERSION, mods={}, slots={
+        "torus:tube": dict(src=dict(kind="ai", name="tex_0000001002.png"), scale=1.0, scroll=0.05, dir=0.0, layers=[
+            dict(src=_L4, blend=0, opacity=1.0, remap=1, gate=[1.2, 0.9, 0.0, 1.6], noise=0.55, nscale=1.2, nspeed=0.2,
+                 thr=0.45, scroll=0.12, dir=0.0, lit=0.7,
+                 cols=[[1.0, 0.95, 0.85], [0.95, 0.96, 1.0], [0.04, 0.14, 0.6], [0.95, 0.06, 0.1]]),
+            dict(src=_L4, blend=1, opacity=0.55, remap=1, gate=[1.0, 0.0, 0.0, 0.8], scale=2.0, scroll=0.12, dir=0.0,
+                 lit=0.25, cols=[[1.0, 0.62, 0.12], [0, 0, 0], [0, 0, 0], [1.0, 0.8, 0.3]])]),
+        "torus:chambers": dict(src=dict(kind="ai", name="tex_0000001005.png"), scroll=0.05, dir=180.0, layers=[
+            dict(src=_L4, blend=0, remap=1, gate=[1.1, 0.6, 0.0, 1.4], scroll=0.12, dir=180.0, scale=1.5, lit=0.7,
+                 cols=[[0.2, 1.0, 0.6], [0.8, 1.0, 0.9], [0, 0, 0], [0.13, 0.31, 1.0]]), None]),
+        "corridor:walls": dict(src=dict(kind="ai", name="tex_0000001002.png"), bright=1.3, layers=[
+            dict(src=_L4, blend=0, remap=1, gate=[1.3, 0.7, 0.0, 1.5], noise=0.5, nscale=1.0, nspeed=0.25, thr=0.5,
+                 scroll=0.08, dir=0.0, lit=0.6), None]),
+        "corridor:floor": dict(src=dict(kind="ai", name="tex_0000001005.png"), bright=1.3, layers=[
+            dict(src=_L4, blend=3, remap=1, gate=[1.0, 0.5, 0.6, 1.2], scale=1.5, lit=0.8,
+                 cols=[[1.0, 0.9, 0.7], [0.7, 0.8, 1.0], [0.25, 0.02, 0.18], [1.0, 0.1, 0.15]]), None]),
+        "vortex:walls": dict(layers=[
+            dict(src=_L4, blend=2, remap=1, gate=[1.4, 0.8, 0.5, 1.5], scale=1.0, scroll=0.1, dir=0.0, lit=0.5), None]),
+        "hexdome:domes": dict(src=dict(kind="ai", name="tex_0000001003.png"), bright=1.5, layers=[
+            dict(src=_L4, blend=0, remap=1, gate=[0.8, 0.0, 0.0, 2.0], scale=1.0, noise=0.4, nscale=2.0, lit=0.4,
+                 cols=[[1.0, 0.95, 0.85], [0, 0, 0], [0, 0, 0], [1.0, 0.75, 0.2]]), None]),
+        "tunnel:walls": dict(src=dict(kind="ai", name="tex_0000001007.png"), layers=[
+            dict(src=_L4, blend=0, remap=1, gate=[1.0, 0.6, 0.0, 1.5], noise=0.5, nscale=1.5, nspeed=0.3, lit=0.0), None]),
+    }),
+}
+EXAMPLES = {k: clean_skins(v) for k, v in EXAMPLES.items()}
 
 
 def roots_for(textures=None, art=None, here=None):

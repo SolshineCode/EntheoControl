@@ -193,7 +193,7 @@ def test_validate_online_commands():
     for bad in ({"op": "enable", "on": 1}, {"op": "mode", "mode": "god"}, {"op": "backend", "backend": "bash"},
                 {"op": "engine", "engine": "dalle"}, {"op": "ask", "text": ""}, {"op": "ask", "text": "x" * 1001},
                 {"op": "apply", "id": "1"}, {"op": "shell", "cmd2": "dir"}, {"op": "undo", "id": -1},
-                {"op": "backend", "backend": "gemini"}, {"op": "cli_google", "on": "yes"}):
+                {"op": "backend", "backend": "gemini-cli"}, {"op": "cli_google", "on": "yes"}):   # "gemini" = API (SEE)
         with pytest.raises(ValueError):
             validate(dict(bad, cmd="online"))
     assert validate({"cmd": "online", "op": "ask", "text": " hi\x00\x07 ", "junk": 1}) == {"cmd": "online", "op": "ask", "text": "hi"}
@@ -1733,6 +1733,614 @@ def test_panel_assistant_tab_switch_chat_apply_undo_and_engine_selector(tmp_path
             page.click("#onlsw")                                   # and off again from the top bar
             page.wait_for_function("window.__online.state().on === false", timeout=5000)
             assert ctl.online is None
+            br.close()
+    finally:
+        stop.set()
+        th.join(timeout=2)
+        ctl.close()
+        rc.stop()
+    assert errors == []
+
+
+# ------------------------------------------------------------------------------------------------ SEE THE OUTPUT
+# The assistant may look at ONE picture of the guarded program output with a message, and run an opt-in
+# look-and-adjust loop. Fake backends and a fake engine capture only (no GL, no CLI, no network).
+
+SEE_HELP = HELP + '''  --input-format <format>               Input format (only works with --print):
+                                        "text" (default), or "stream-json"
+                                        (choices: "text", "stream-json")
+  --verbose                             Override verbose mode setting from config
+'''
+
+
+def jpeg(color=(10, 200, 30), size=(640, 400)):
+    import io
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", size, color).save(b, "JPEG", quality=80)
+    return b.getvalue()
+
+
+class SeeBackend(FakeBackend):
+    sees = True
+
+    def __init__(self, replies=None, **kw):
+        super().__init__(replies, **kw)
+        self.images = []
+
+    def ask(self, prompt, cancel=None, progress=None, images=None):
+        self.images.append([(n, bytes(b)) for n, b in (images or [])])
+        return super().ask(prompt, cancel, progress)
+
+
+class FakeEngine:
+    """Answers the controller's capture requests the way live_visuals does: one picture per request, a frame later."""
+    def __init__(self, c, pics=None):
+        self.c, self.requests, self.sent = c, 0, []
+        self.pics = pics or (lambda k: jpeg((40 * k % 255, 120, 200)))
+
+    def handle(self, rest):
+        for x in rest or ():
+            if isinstance(x, dict) and x.get("cmd") == "assist_snap":
+                self.requests += 1
+                pic = self.pics(self.requests)
+                if pic is not None:
+                    self.sent.append(pic)
+                    protocol.snapshot_in(self.c, pic)
+        return rest
+
+    def frame(self, dt=1 / 30):
+        self.handle(self.c.apply([]))
+        self.c.ft.t += dt
+        self.c.update(dt, (0.5, 0.4, 0.2))
+
+    def run(self, seconds, dt=1 / 30):
+        for _ in range(int(seconds / dt)):
+            self.frame(dt)
+
+
+def see_make(tmp_path, replies=None, mode="suggest", **kw):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    c = make(tmp_path, backend=SeeBackend(replies), mode=mode, **kw)
+    return c, FakeEngine(c)
+
+
+def see_ask(c, eng, text="make it greener", frames=4, **kw):
+    eng.handle(do(c, op="ask", text=text, see=True, **kw))          # the engine sees the request in the same frame
+    for _ in range(frames):
+        eng.frame()
+    return c.state()["online"]
+
+
+def test_see_validation_defaults_off_and_loop_is_capped():
+    v = protocol.validate
+    assert "see" not in v({"op": "ask", "text": "x"}) and "loop" not in v({"op": "ask", "text": "x"})
+    assert v({"op": "ask", "text": "x", "see": True})["see"] is True
+    assert v({"op": "ask", "text": "x", "see": True, "loop": 99})["loop"] == 6        # cap 6
+    assert v({"op": "ask", "text": "x", "see": True, "loop": 0}).get("loop", 0) == 0
+    for bad in ({"see": "yes"}, {"see": True, "loop": "3"}, {"see": True, "loop": -1}, {"see": True, "loop": True}):
+        with pytest.raises(ValueError):
+            v(dict(bad, op="ask", text="x"))
+    assert v({"op": "ask", "text": "x", "loop": 3}).get("loop", 0) == 0                 # a loop needs the picture
+    for op in ("see_ok", "see_drop"):
+        assert v({"op": op, "id": 3}) == {"cmd": "online", "op": op, "id": 3}
+    assert v({"op": "loop_stop"})["op"] == "loop_stop"
+
+
+def test_see_is_off_by_default_and_a_plain_message_captures_nothing(tmp_path):
+    c, eng = see_make(tmp_path)
+    do(c, op="ask", text="calmer")
+    eng.run(0.3)
+    assert eng.requests == 0 and c.fake.images == [[]] and "output.jpg" not in c.fake.prompts[0]
+    assert len(c.online.snaps) == 0
+
+
+def test_see_sends_one_exact_picture_that_the_panel_shows(tmp_path):
+    from plugins.online import see
+    c, eng = see_make(tmp_path, [reply({"cmd": "set", "name": "zoom", "v": 0.3}, say="Mostly red: zooming in.")])
+    st = see_ask(c, eng)
+    assert eng.requests == 1                                           # ONE frame
+    assert len(c.fake.images) == 1 and [n for n, _ in c.fake.images[0]] == ["output.jpg"]
+    sent = c.fake.images[0][0][1]
+    assert sent == eng.sent[0]                                         # exactly the engine's bytes
+    assert "output.jpg" in c.fake.prompts[0] and "640x400" in c.fake.prompts[0]
+    user = [m for m in st["msgs"] if m["role"] == "user"][-1]
+    assert user["imgs"] and protocol.snap_jpeg(c, user["imgs"][0]["id"]) == sent    # the panel shows what was sent
+    assert last_prop(st)["status"] == "pending"                        # SUGGEST as usual
+    assert see.SNAP_SIZE == (640, 400)
+    # pictures live in memory only: nothing was written anywhere under the show folder
+    assert not [p for p in tmp_path.rglob("*") if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+    c.online.log.close()
+    for f in (tmp_path / "logs").glob("online_*.log"):
+        assert "/9j/" not in f.read_text(encoding="utf-8")            # never the picture in the log
+
+
+def test_see_needs_online_and_unrequested_frames_are_dropped(tmp_path):
+    c, eng = see_make(tmp_path)
+    protocol.snapshot_in(c, jpeg())                                    # nobody asked: dropped
+    eng.run(0.2)
+    assert len(c.online.snaps) == 0
+    do(c, op="enable", on=False)
+    protocol.snapshot_in(c, jpeg())                                    # ONLINE off: a no-op, never raises
+    do(c, op="ask", text="x", see=True)
+    eng.run(0.2)
+    assert eng.requests == 0 and c.online is None
+    assert protocol.snap_jpeg(c, 1) is None
+    c2, eng2 = see_make(tmp_path / "b")
+    do(c2, op="ask", text="x", see=True)
+    protocol.snapshot_in(c2, b"not a jpeg" * 50)                       # not a picture: refused
+    c2.ft.t += 0.02
+    c2.update(0.02, (0.5, 0.4, 0.2))
+    assert len(c2.online.snaps) == 0
+
+
+@pytest.mark.parametrize("layer", ["l_camera", "crowd_push", "l_video"])
+def test_see_with_people_possibly_in_frame_needs_a_confirm(tmp_path, layer):
+    c, eng = see_make(tmp_path, [reply({"cmd": "set", "name": "zoom", "v": 0.3})] * 2)
+    c.base[layer] = 0.8
+    eng.run(0.1)
+    st = see_ask(c, eng)
+    assert c.fake.prompts == []                                        # held back
+    user = [x for x in st["msgs"] if x["role"] == "user"][-1]
+    assert not user.get("imgs")                                        # not shown as "sent" before it is
+    m = [x for x in st["msgs"] if x.get("confirm")][-1]
+    assert m["imgs"] and m["people"] and protocol.snap_jpeg(c, m["imgs"][0]["id"]) == eng.sent[0]
+    do(c, op="see_ok", id=m["confirm"])
+    eng.run(0.2)
+    assert len(c.fake.prompts) == 1 and c.fake.images[0][0][1] == eng.sent[0]
+    user = [x for x in c.state()["online"]["msgs"] if x["role"] == "user"][-1]
+    assert [i["label"] for i in user["imgs"]] == ["sent"]
+    # DON'T SEND: nothing goes out and the picture is gone
+    c.ft.t += 2
+    st = see_ask(c, eng, frames=3)
+    m = [x for x in st["msgs"] if x.get("confirm")][-1]
+    do(c, op="see_drop", id=m["confirm"])
+    eng.run(0.2)
+    assert len(c.fake.prompts) == 1 and protocol.snap_jpeg(c, m["imgs"][0]["id"]) is None
+    assert not [x for x in c.state()["online"]["msgs"] if x.get("confirm")]     # nothing left to confirm
+
+
+def test_see_without_people_layers_needs_no_confirm_and_a_bypassed_camera_does_not_count(tmp_path):
+    c, eng = see_make(tmp_path, [reply()] * 2)
+    c.base["l_camera"] = 0.8
+    c.set_bypass("camera", True)
+    eng.run(1.5)                                                       # bypass fade: l_camera out of the output
+    see_ask(c, eng)
+    assert len(c.fake.prompts) == 1
+
+
+def test_see_no_frame_times_out_and_sends_nothing(tmp_path):
+    from plugins.online import see
+    c, eng = see_make(tmp_path)
+    eng.pics = lambda k: None                                          # engine never delivers (headless, no tap)
+    do(c, op="ask", text="x", see=True)
+    eng.run(see.SNAP_TIMEOUT_S + 0.5)
+    st = c.state()["online"]
+    assert c.fake.prompts == [] and any("No picture" in m["text"] for m in st["msgs"])
+    protocol.snapshot_in(c, jpeg())                                    # a late frame is dropped
+    eng.run(0.2)
+    assert c.fake.prompts == [] and len(c.online.snaps) == 0
+
+
+def test_a_text_only_backend_says_so_and_never_captures(tmp_path):
+    c, eng = see_make(tmp_path)
+    c.online.assistant.backends["claude"] = c.fake = FakeBackend()     # no `sees`
+    do(c, op="ask", text="x", see=True, loop=3)
+    eng.run(0.3)
+    st = c.state()["online"]
+    assert eng.requests == 0 and len(c.fake.prompts) == 1              # sent as text only
+    assert any("text only" in m["text"] for m in st["msgs"] if m["role"] == "system")
+    assert st["backends"]["claude"]["sees"] is False and st["loop"] is None
+
+
+def _loop_replies():
+    return [reply({"cmd": "set", "name": "zoom", "v": 0.3}, say="Dim and red: more zoom."),
+            reply({"cmd": "set", "name": "zoom", "v": 0.45}, say="Closer; a touch more."),
+            reply(say="That matches the wish.")]
+
+
+def test_loop_autopilot_refines_with_before_after_and_every_step_is_undoable(tmp_path):
+    c, eng = see_make(tmp_path, _loop_replies(), mode="autopilot")
+    see_ask(c, eng, loop=3)
+    eng.run(8.0)
+    f = c.fake
+    assert len(f.prompts) == 3 and eng.requests == 3
+    assert [n for n, _ in f.images[0]] == ["output.jpg"]
+    assert [n for n, _ in f.images[1]] == ["before.jpg", "output.jpg"]
+    assert f.images[1][0][1] == eng.sent[0] and f.images[1][1][1] == eng.sent[1]      # before = the step-1 picture
+    assert f.images[2][0][1] == eng.sent[1] and f.images[2][1][1] == eng.sent[2]
+    assert "step 1 of 3" in f.prompts[0] and "step 2 of 3" in f.prompts[1] and "step 3 of 3" in f.prompts[2]
+    assert "zoom" in f.prompts[1].split("step 2 of 3")[1].lower()                     # it is told what it changed
+    st = c.state()["online"]
+    assert st["loop"] is None and c.base["zoom"] == pytest.approx(0.45)
+    assert any("matches" in m["text"] for m in st["msgs"] if m["role"] == "assistant")
+    steps = [m for m in st["msgs"] if m.get("step")]
+    assert [m["step"] for m in steps] == [1, 2, 3]
+    assert [i["label"] for i in steps[1]["imgs"]] == ["before", "after"]               # thumbnails in the chat
+    assert len(st["history"]) == 2
+    for h in reversed(st["history"]):                                                 # every step undoable
+        do(c, op="undo", id=h["id"])
+        settle(c, 1.2)
+    assert c.base["zoom"] == pytest.approx(PARAMS["zoom"][2])
+
+
+def test_loop_waits_for_the_morph_to_settle_before_it_looks(tmp_path):
+    from plugins.online import see
+    c, eng = see_make(tmp_path, _loop_replies(), mode="autopilot")
+    see_ask(c, eng, loop=2)
+    assert eng.requests == 1
+    eng.run(see.SETTLE_S * 0.6)
+    assert eng.requests == 1 and c.state()["online"]["loop"]["phase"] == "settle"
+    eng.run(see.SETTLE_S)
+    assert eng.requests == 2
+
+
+def test_loop_suggest_waits_for_apply_and_dismiss_ends_it(tmp_path):
+    c, eng = see_make(tmp_path, _loop_replies())
+    see_ask(c, eng, loop=3)
+    eng.run(3.0)
+    st = c.state()["online"]
+    assert len(c.fake.prompts) == 1 and st["loop"]["phase"] == "apply"          # waits for the performer
+    do(c, op="apply", id=last_prop(st)["id"])
+    eng.run(3.0)
+    st = c.state()["online"]
+    assert len(c.fake.prompts) == 2 and last_prop(st)["status"] == "pending"
+    do(c, op="dismiss", id=last_prop(st)["id"])
+    eng.run(3.0)
+    assert len(c.fake.prompts) == 2 and c.state()["online"]["loop"] is None
+
+
+@pytest.mark.parametrize("how", ["touch", "bypass", "panic", "cancel", "stop", "off"])
+def test_loop_stops_on_performer_touch_panic_cancel_and_off(tmp_path, how):
+    c, eng = see_make(tmp_path, _loop_replies(), mode="autopilot")
+    see_ask(c, eng, loop=3)
+    eng.run(0.3)
+    assert len(c.fake.prompts) == 1 and c.state()["online"]["loop"]["phase"] == "settle"
+    if how == "touch":
+        c.apply([{"cmd": "set", "name": "hue", "v": 0.4}])
+    elif how == "bypass":
+        c.apply([{"cmd": "bypass", "key": "l_beads", "on": True}])
+    elif how == "panic":
+        c.apply([{"cmd": "panic"}])
+    elif how == "cancel":
+        do(c, op="cancel")
+    elif how == "stop":
+        do(c, op="loop_stop")
+    else:
+        do(c, op="enable", on=False)
+    eng.run(6.0)
+    assert len(c.fake.prompts) == 1 and eng.requests == 1
+    if c.online is not None:
+        st = c.state()["online"]
+        assert st["loop"] is None and any("loop" in m["text"].lower() for m in st["msgs"] if m["role"] == "system")
+
+
+def test_loop_respects_the_request_limit_and_the_allowlist(tmp_path):
+    from plugins.online import assistant, safety
+    bad = reply({"cmd": "trigger", "name": "strobe", "on": True}, {"cmd": "set", "name": "master", "v": 0.0},
+                {"cmd": "set", "name": "zoom", "v": 0.2})
+    c, eng = see_make(tmp_path, [bad] * 12, mode="autopilot")
+    for _ in range(assistant.ASK_LIMIT[0] - 2):                       # use up most of the minute's requests
+        do(c, op="ask", text="x")
+        eng.frame()
+        c.ft.t += 1.1
+    n0 = len(c.fake.prompts)
+    see_ask(c, eng, loop=6)
+    eng.run(20.0)
+    assert len(c.fake.prompts) == assistant.ASK_LIMIT[0]               # the loop got only what the limit allowed
+    lp = c.state()["online"]["loop"]
+    assert lp is not None and "limit" in lp["why"]
+    assert not c.held["strobe"] and c.base["master"] >= safety.MASTER_MIN   # loop replies: same rules
+    c.ft.t += 61
+    eng.run(30.0)
+    assert assistant.ASK_LIMIT[0] < len(c.fake.prompts) <= n0 + 6      # it goes on, never past the loop's N calls
+
+
+def test_agy_sees_the_pictures_only_inside_its_sandbox(tmp_path):
+    from plugins.online import backends
+    sb, seen = Sandboxes(), {}
+
+    def runner(exe, instruction, cwd, **kw):
+        cwd = Path(cwd)
+        files = sorted(f.name for f in cwd.iterdir())
+        seen.update(files=files, prompt=(cwd / "prompt.txt").read_text(encoding="utf-8"), instruction=instruction, cwd=cwd,
+                    out=(cwd / "output.jpg").read_bytes() if "output.jpg" in files else None,
+                    cmd=backends.agy_command(exe, instruction, kw["timeout"], kw.get("model"), kw.get("extra", ()), kw["mode"]))
+        return '{"say": "green", "commands": []}'
+
+    agy = backends.AgyBackend(exe=str(tmp_path / "agy.exe"), runner=runner, make_sandbox=lambda: sb("chat"))
+    assert agy.sees is True
+    pic, before = jpeg(), jpeg((200, 0, 0))
+    agy.ask("look at output.jpg", images=[("before.jpg", before), ("output.jpg", pic)])
+    assert seen["files"] == ["before.jpg", "output.jpg", "prompt.txt"] and seen["out"] == pic
+    assert _outside_project_and_home(seen["cwd"]) and not seen["cwd"].exists()        # deleted afterwards
+    assert seen["instruction"] == backends.AGY_SEE_TASK and "output.jpg" in seen["instruction"]
+    assert "--mode plan" in seen["cmd"] and seen["cmd"].count('"') == 2
+    with pytest.raises(backends.BackendError):                         # only our two names, only JPEGs
+        agy.ask("x", images=[("../evil.jpg", pic)])
+    with pytest.raises(backends.BackendError):
+        agy.ask("x", images=[("output.jpg", b"MZ" + b"\0" * 200)])
+    assert all(not d.exists() for d in sb.made)
+    agy.ask("plain text")                                              # no pictures: the plain task, as before
+    assert seen["instruction"] == backends.AGY_CHAT_TASK and seen["files"] == ["prompt.txt"]
+
+
+def test_claude_backend_sees_through_stdin_with_tools_still_off(tmp_path, monkeypatch):
+    """Probed 2026-11-26 on this laptop: `claude -p --input-format stream-json --output-format stream-json --verbose
+    --tools ""` reads an image block from stdin and answers about it, with tools: [] in its init message."""
+    import base64
+    from plugins.online import backends
+    seen = {}
+    exe = tmp_path / "claude.exe"
+    exe.write_bytes(b"")
+    init = {"type": "system", "subtype": "init", "tools": [], "mcp_servers": []}
+    out = [json.dumps(init), json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}),
+           json.dumps({"type": "result", "subtype": "success", "result": '{"say": "green", "commands": []}'})]
+
+    def fake_run(argv, stdin_text="", cwd=None, timeout=0, **kw):
+        if "--help" in argv:
+            return 0, SEE_HELP, ""
+        seen.update(argv=list(argv), stdin=stdin_text, files=sorted(f.name for f in Path(cwd).iterdir()))
+        return 0, "\n".join(out) + "\n", ""
+
+    monkeypatch.setattr(backends, "run_cli", fake_run)
+    b = backends.ClaudeBackend(tmp_path / "work", exe=str(exe))
+    assert b.available() and b.sees is True
+    pic = jpeg()
+    r = b.ask("SECRET PROMPT", images=[("output.jpg", pic)])
+    a = seen["argv"]
+    assert r == '{"say": "green", "commands": []}'
+    assert a[a.index("--tools") + 1] == "" and a[a.index("--input-format") + 1] == "stream-json"
+    assert a[a.index("--output-format") + 1] == "stream-json" and "--verbose" in a
+    for bad in ("--add-dir", "--file", "--dangerously-skip-permissions", "Read"):
+        assert bad not in a
+    msg = json.loads(seen["stdin"].strip())
+    blocks = msg["message"]["content"]
+    assert [x["type"] for x in blocks] == ["image", "text"] and base64.b64decode(blocks[0]["source"]["data"]) == pic
+    assert "SECRET PROMPT" in blocks[1]["text"] and "SECRET PROMPT" not in " ".join(a)
+    assert seen["files"] == ["no_mcp.json"]                            # the picture never lands in its folder
+    b.ask("text only")                                                 # no picture: the plain text call, as before
+    assert seen["argv"][seen["argv"].index("--output-format") + 1] == "text" and seen["stdin"] == "text only"
+    # a CLI that comes up WITH tools is refused, whatever it answered
+    out[0] = json.dumps(dict(init, tools=["Read", "Bash"]))
+    with pytest.raises(backends.BackendError):
+        b.ask("x", images=[("output.jpg", pic)])
+    # a CLI without stream-json input stays text-only (and still starts)
+    old = backends.ClaudeBackend(tmp_path / "work", exe=str(exe))
+    old.verify(SEE_HELP.replace("--input-format", "--inpt-frmt"))
+    assert old.problem == "" and old.sees is False
+    plain = backends.ClaudeBackend(tmp_path / "work", exe=str(exe))
+    plain.verify(HELP)
+    assert plain.problem == "" and plain.sees is False
+
+
+def test_gemini_api_chat_backend_sends_the_picture_inline(tmp_path):
+    import base64
+    from plugins.online import images, vision
+    keys = images.KeyStore(tmp_path / "k.json")
+    sent = {}
+
+    class Resp:
+        def __init__(self, body):
+            self.body = body
+
+        def read(self, n=-1):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(req, timeout=0):
+        sent.update(url=req.full_url, body=json.loads(req.data.decode()))
+        return Resp(json.dumps({"outputs": [{"type": "text", "text": '{"say": "ok", "commands": []}'}]}).encode())
+
+    g = vision.GeminiChatBackend(keys, opener=opener)
+    assert g.sees is True and not g.available() and "key" in g.problem
+    keys.set("AIzaTESTKEY_0123456789abcdefghij")
+    assert g.available()
+    pic = jpeg()
+    assert g.ask("PROMPT", images=[("output.jpg", pic)]) == '{"say": "ok", "commands": []}'
+    parts = sent["body"]["input"]
+    assert parts[0]["type"] == "text" and "PROMPT" in parts[0]["text"]
+    assert parts[1] == {"type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(pic).decode()}
+    assert sent["url"] == images.API_URL and "AIzaTESTKEY" not in json.dumps(sent["body"])
+    assert protocol.validate({"op": "backend", "backend": "gemini"})["backend"] == "gemini"
+    c, eng = see_make(tmp_path / "c")
+    assert "gemini" in protocol.BACKENDS
+
+
+def test_online_snap_route_needs_the_token_and_serves_memory_only(tmp_path):
+    import socket
+    import urllib.error
+    import urllib.request as ur
+    from remote_control import RemoteControl
+    sk = socket.socket()
+    sk.bind(("127.0.0.1", 0))
+    port = sk.getsockname()[1]
+    sk.close()
+    rc = RemoteControl(port=port, token="tok", quiet=True, host="127.0.0.1", art_dir=tmp_path / "art", tex_dir=tmp_path / "tex")
+    rc.start()
+    c, eng = see_make(tmp_path)
+    try:
+        st = see_ask(c, eng)
+        i = [m for m in st["msgs"] if m["role"] == "user"][-1]["imgs"][0]["id"]
+        with ur.urlopen(f"http://127.0.0.1:{port}/online-snap/{i}?k=tok", timeout=5) as r:
+            assert r.status == 200 and r.read() == eng.sent[0] and r.headers["Content-Type"] == "image/jpeg"
+        with pytest.raises(urllib.error.HTTPError):
+            ur.urlopen(f"http://127.0.0.1:{port}/online-snap/{i}?k=bad", timeout=5)
+        with ur.urlopen(f"http://127.0.0.1:{port}/online-snap/999?k=tok", timeout=5) as r:
+            assert r.status == 204
+        do(c, op="enable", on=False)                                   # OFF: every picture is gone
+        with ur.urlopen(f"http://127.0.0.1:{port}/online-snap/{i}?k=tok", timeout=5) as r:
+            assert r.status == 204
+    finally:
+        rc.stop()
+        c.close()
+
+
+def test_preview_tap_snap_is_asynchronous_and_never_reads_back_synchronously():
+    """The engine's capture for the assistant: blit + readback into a pixel buffer on one frame, the bytes collected
+    on a LATER frame and JPEG-encoded on a worker thread. No GL here: the GPU objects are stand-ins."""
+    import fx_stack
+    calls = []
+
+    class Buf:
+        def read(self):
+            calls.append("pbo.read")
+            return bytes(640 * 400 * 3)
+
+    class Fbo:
+        def read_into(self, pbo, components=3):
+            calls.append("read_into")
+
+        def read(self, **kw):
+            raise AssertionError("synchronous readback")
+
+    t = object.__new__(fx_stack.PreviewTap)
+    t.size, t.quality, t._busy, t._pending, t.captures = (640, 400), 80, threading.Lock(), None, 0
+    t._fbo, t._pbo = Fbo(), Buf()
+    t._blit = lambda tex: calls.append("blit")
+    got = []
+    assert t.snap("disp", got.append) is True
+    assert calls == ["blit", "read_into"] and got == []               # nothing waited for
+    t.collect = lambda wait=False: False                              # (its readback still in flight)
+    assert t.snap("disp", got.append) is False                        # one at a time
+    del t.collect
+    t.collect(wait=True)                                              # next frame: hand over to the encoder
+    assert calls[-1] == "pbo.read" and len(got) == 1 and got[0][:3] == b"\xff\xd8\xff"
+
+
+def test_engine_hook_captures_after_the_flash_guard_and_before_mapping():
+    """Source check of live_visuals' [online-see> block (the engine itself is not run here: GPU held)."""
+    src = (ROOT / "live_visuals.py").read_text(encoding="utf-8")
+    i_fg = src.index("fguard.process, disp")
+    i_see = src.index("[online-see>")
+    i_map = src.index("# ---- output pass.")
+    assert i_fg < i_see < i_map
+    block = src[i_see:src.index("<online-see]")]
+    assert "asnap.snap, disp" in block and "_see_in" in block and ".read(" not in block and "(640, 400)" in block
+    helper = src[src.index("def _see_in("):src.index("def save_snapshot(")]
+    assert "protocol.snapshot_in(ctl, jpg)" in helper.replace("_online_protocol", "protocol")
+    assert '"assist_snap"' in src
+
+
+def test_panel_see_the_output_toggle_picture_confirm_and_loop(tmp_path):
+    """The real panel in a headless browser: the per-message toggle (default off, reset after a send), the exact
+    picture shown in the chat, the people confirm, the loop status + before / after thumbnails, text-only backends."""
+    import socket
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from remote_control import RemoteControl
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    rc = RemoteControl(port=port, token="tok", quiet=True, host="127.0.0.1", art_dir=tmp_path / "art", tex_dir=tmp_path / "tex")
+    rc.start()
+    ctl = Controller(tmp_path, restore=False, autosave=False, midi=False, ai=False)
+    ctl.ai = FakeAI()
+    fake = SeeBackend([reply({"cmd": "set", "name": "zoom", "v": 0.3}, say="Red and dim: zoom in."),
+                       reply({"cmd": "set", "name": "zoom", "v": 0.35}, say="ok"),
+                       reply({"cmd": "set", "name": "zoom", "v": 0.4}, say="Step one."),
+                       reply({"cmd": "set", "name": "zoom", "v": 0.45}, say="Step two: closer.")])
+    ctl.online_opts = dict(root=tmp_path, backends={"claude": fake}, log_dir=None,
+                           keys_path=tmp_path / "appdata" / "online_keys.json")
+    stop, sent = threading.Event(), []
+
+    def loop():
+        while not stop.is_set():
+            for x in ctl.apply(rc.drain()) or ():
+                if isinstance(x, dict) and x.get("cmd") == "assist_snap":      # the engine's part, faked
+                    pic = jpeg((60 * (len(sent) + 1) % 255, 40, 160))
+                    sent.append(pic)
+                    protocol.snapshot_in(ctl, pic)
+            ctl.update(1 / 60, [0.5, 0.3, 0.1])
+            rc.publish_state(dict(ctl.state(), corners=[[0, 0], [1, 0], [1, 1], [0, 1]], res=[1280, 800], fps=60))
+            time.sleep(1 / 60)
+
+    th = threading.Thread(target=loop, daemon=True)
+    th.start()
+    errors = []
+    try:
+        with pw_api.sync_playwright() as pw:
+            br = None
+            for channel in ("msedge", "chrome", None):
+                try:
+                    br = pw.chromium.launch(channel=channel, headless=True) if channel else pw.chromium.launch(headless=True)
+                    break
+                except Exception:
+                    continue
+            if br is None:
+                pytest.skip("no Chromium-family browser available")
+            page = br.new_page(viewport=dict(width=1500, height=950))
+            page.on("pageerror", lambda e: errors.append(str(e)))
+            page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+            page.goto(f"http://127.0.0.1:{port}/?k=tok")
+            page.wait_for_function("window.__panel && window.__panel.state().online && window.__online", timeout=10000)
+            page.click('#tabs button[data-tab="assistant"]')
+            assert page.is_disabled("#onlsee")                      # ONLINE off: no picture can go anywhere
+            page.click("#onlbig")
+            page.wait_for_function("window.__online.state().on === true && !document.getElementById('onlsee').disabled",
+                                   timeout=8000)
+            assert not page.is_checked("#onlsee") and page.is_disabled("#onlloop")        # default off
+            assert "one more model call" in page.inner_text("#onlseebox")                 # cost note
+            # 1) one picture with one message: the chat shows the exact picture that was sent
+            page.check("#onlsee")
+            page.fill("#onlta", "make it greener")
+            page.press("#onlta", "Enter")
+            page.wait_for_selector("#onllog .onl-p.pending", timeout=8000)
+            page.wait_for_function("(function(){var i=document.querySelector('#onllog .onl-imgs img');"
+                                   "return i&&i.complete&&i.naturalWidth===640;})()", timeout=8000)
+            assert [n for n, _ in fake.images[0]] == ["output.jpg"] and fake.images[0][0][1] == sent[0]
+            assert not page.is_checked("#onlsee")                   # per message: off again
+            # 2) people could be in frame: held back until confirmed
+            ctl.base["l_camera"] = 0.8
+            page.wait_for_timeout(300)
+            page.check("#onlsee")
+            page.fill("#onlta", "brighter")
+            page.press("#onlta", "Enter")
+            page.wait_for_selector('#onllog button[data-act="see_ok"]', timeout=8000)
+            assert len(fake.prompts) == 1 and "People could be in this picture" in page.inner_text("#onllog")
+            page.screenshot(path=str(ROOT / "test_frames" / "online_see_confirm.png"))
+            page.click('#onllog button[data-act="see_ok"]')
+            page.wait_for_function("document.querySelectorAll('#onllog button[data-act=\"see_ok\"]').length === 0", timeout=8000)
+            end = time.monotonic() + 5
+            while len(fake.prompts) < 2 and time.monotonic() < end:
+                time.sleep(0.05)
+            assert len(fake.prompts) == 2
+            ctl.base["l_camera"] = 0.0
+            # 3) look-and-adjust loop, 2 steps, AUTOPILOT
+            page.click('#onlmode button[data-v="autopilot"]')
+            page.wait_for_function("window.__online.state().mode === 'autopilot'", timeout=5000)
+            page.wait_for_timeout(1200)                             # the camera layer fades out of the output
+            page.check("#onlsee")
+            page.check("#onlloop")
+            page.select_option("#onlloopn", "2")
+            page.fill("#onlta", "deeper, step by step")
+            page.press("#onlta", "Enter")
+            page.wait_for_selector("#onlloopst", state="visible", timeout=8000)
+            assert "step 1 of 2" in page.inner_text("#onlloopst")
+            page.wait_for_function("window.__online.state().msgs.some(function(m){return /loop finished/.test(m.text);})",
+                                   timeout=20000)
+            assert len(fake.prompts) == 4 and [n for n, _ in fake.images[3]] == ["before.jpg", "output.jpg"]
+            page.wait_for_selector("#onllog .onl-m.loop figcaption", timeout=5000)
+            caps = page.eval_on_selector_all("#onllog .onl-m.loop figcaption", "els => els.map(e => e.textContent)")
+            assert caps[-2:] == ["before", "after"]
+            assert not page.is_visible("#onlloopst") and ctl.base["zoom"] == pytest.approx(0.45)
+            page.screenshot(path=str(ROOT / "test_frames" / "online_see_loop.png"))
+            # 4) a text-only backend: the toggle is off and says why
+            ctl.online.assistant.backends["claude"] = FakeBackend()
+            page.wait_for_function("document.getElementById('onlsee').disabled", timeout=5000)
+            assert "text only" in page.inner_text("#onlseeT")
+            assert page.evaluate("document.documentElement.scrollWidth - window.innerWidth") <= 2
+            page.set_viewport_size(dict(width=390, height=844))     # phone: no sideways scroll
+            page.wait_for_timeout(300)
+            assert page.evaluate("document.documentElement.scrollWidth - window.innerWidth") <= 2
+            page.click("#onlsw")                                    # OFF: the pictures are gone from memory
+            page.wait_for_function("window.__online.state().on === false", timeout=5000)
+            assert protocol.served_snap("1") is None
             br.close()
     finally:
         stop.set()

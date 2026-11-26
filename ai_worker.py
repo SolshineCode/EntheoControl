@@ -83,8 +83,13 @@ def validate_job(body):
     if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**31):
         raise ValueError("seed must be an int")
     init = body.get("init")
-    if init not in (None, "snapshot"):
-        raise ValueError("init must be null or 'snapshot'")
+    if isinstance(init, dict):                       # dream from one library image (image_library ids)
+        nm = init.get("name")
+        if init.get("kind") not in ("art", "ai") or not isinstance(nm, str) or not ART_NAME.match(nm) or ".." in nm                 or nm.lower().endswith(".depth.png"):
+            raise ValueError("init image must be {kind: art | ai, name}")
+        init = {"kind": init["kind"], "name": nm}
+    elif init not in (None, "snapshot"):
+        raise ValueError("init must be null, 'snapshot' or {kind, name}")
     strength = body.get("strength", 0.45)
     if not isinstance(strength, (int, float)) or isinstance(strength, bool) or not 0.2 <= float(strength) <= 0.9:
         raise ValueError("strength must be 0.2..0.9")
@@ -175,6 +180,16 @@ def validate_art_name(body, art_dir):
     if Path(name).name != name or not path.is_file():
         raise ValueError("art file not found")
     return dict(kind="depth", name=name, prompt=f"depth: {name}", n=1)
+
+
+def init_path(init, tex_dir, art_dir):
+    """{kind: art | ai, name} -> the image file, which must lie directly in its folder (FileNotFoundError)."""
+    folder = Path(art_dir if init.get("kind") == "art" else tex_dir)
+    name = str(init.get("name") or "")
+    p = folder / name
+    if not ART_NAME.match(name) or Path(name).name != name or not p.is_file() or p.resolve().parent != folder.resolve():
+        raise FileNotFoundError(f"init image not found: {name}")
+    return p
 
 
 def save_depth(arr, path):
@@ -444,6 +459,9 @@ class Worker:
                         raise FileNotFoundError(f"snapshot not found: {self.snapshot}")
                     with Image.open(self.snapshot) as im:
                         init = fit_init(im)
+                elif isinstance(job["init"], dict):     # dream from a library image (art upload / AI / dreamed)
+                    with Image.open(init_path(job["init"], self.out_dir, self.art_dir)) as im:
+                        init = fit_init(im.convert("RGB"))
                 for i in range(job["n"]):
                     if gen != self.cancel_gen:
                         break

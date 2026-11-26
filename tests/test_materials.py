@@ -129,7 +129,8 @@ def test_default_is_all_procedural_and_empty():
     assert st.step(1 / 60) == {}
     assert len(json.dumps(st.state())) < 60, "no skins must cost next to nothing in the panel state"
     for env, e in mt.ENVS.items():
-        assert 1 <= len(e["slots"]) <= mt.MAX_SLOTS and len(e["maps"]) >= 3
+        # worlds and the tunnel offer >= 3 mappings; a creature / body host maps along its own body (1 is enough)
+        assert 1 <= len(e["slots"]) <= mt.MAX_SLOTS and len(e["maps"]) >= (3 if e["host"] in ("land", "scene") else 1)
         for s in e["slots"]:
             assert st.slots[env][s]["src"] is None
 
@@ -973,11 +974,16 @@ def test_procedural_sources_are_untouched_and_hooks_still_fit():
     for i, fs in enumerate(fx.LAND_FS):
         assert "texSkin" not in fs and "skA" not in fs, "the original programs carry no skin code at all"
         sk = fx.skinned_source(i)
-        assert sk.count("uniform sampler2DArray texSkin") == 1 and sk.count("skMix(") == 2
+        assert sk.count("uniform sampler2DArray texSkin,") == 1 and sk.count("skMix(") == 2
         anchor, add, _ = fx.SKIN_HOOKS[i]
-        back = sk.replace(mt.GLSL, "").replace(add, "").replace("col += skDim*palC(", "col += palC(")
-        assert back == fs, "skinned = original + one chunk + one block + the haze dimmer, nothing else"
-    assert mt.GLSL.count("textureGrad(") == 2, "one fetch per slot per pixel (+ one only while a swap fades)"
+        back = (sk.replace(mt.GLSL, "").replace(add, "").replace(fx.SKIN_DECL, "").replace(fx.SKIN_POST, "")
+                .replace("col += skDim*palC(", "col += palC("))
+        assert back == fs, "skinned = original + chunk + declarations + in-loop recorder + post-loop block + haze dimmer"
+        loop = fs[fs.index("for (int i"):fs.index(fx.GLOW_ANCHOR)]
+        assert "skMix(" not in add and "skTap(" not in add, "nothing heavy inside the march loop: it only records the hit"
+    # 4 = (image | live array) x (plain | mirrored sampler): ONE of them runs per fetch (uniform branch); a slot still
+    # costs one fetch per pixel (+ one only while a swap fades, + one per overlay layer)
+    assert mt.GLSL.count("textureGrad(") == 4
     assert "sampler2DArray" in mt.GLSL and mt.UNIT not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21)
 
 
@@ -1351,6 +1357,20 @@ def test_panel_skins_card_assigns_by_click_and_by_drag(tmp_path):
             page.click('#skins-land .skctl .skb button:has-text("Multiply")')
             page.wait_for_timeout(300)
             assert ctl.skins.slots["torus"]["chambers"]["mix"] == 1
+            # skin STACK: a live layer on top of the selected slot, its blend, colour by channel
+            sels = page.locator("#skins-land .skctl select")
+            sels.nth(0).select_option("layer:lines4")
+            page.wait_for_timeout(300)
+            lay = ctl.skins.slots["torus"]["chambers"]["layers"][0]
+            assert lay is not None and lay["src"] == dict(kind="layer", name="lines4")
+            sels.nth(1).select_option("1")
+            page.click('#skins-land .skctl button:has-text("COLOUR BY CHANNEL") >> nth=0')
+            page.wait_for_timeout(400)
+            lay = ctl.skins.slots["torus"]["chambers"]["layers"][0]
+            assert lay["blend"] == 1 and lay["remap"] == 1
+            page.click('#skins-land button:has-text("EXAMPLE WORLD")')
+            page.wait_for_timeout(400)
+            assert ctl.skins.slots["vortex"]["walls"]["layers"][0]["src"] == dict(kind="layer", name="lines4")
             # generate a skin: lands in the model as a pending job for the selected slot
             page.fill("#skgen-land", "glowing coral lattice")
             page.click('#skins-land .skgen button:has-text("GENERATE A SKIN")')

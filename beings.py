@@ -34,6 +34,7 @@ shader only receives wrapped phases, so nothing degrades over a long show.
 Standalone:  python beings.py --gallery   -> test_frames/beings/<form>.png + contact_sheet.png
              python beings.py --colours   -> colour_modes.png (beings) + colour_modes_serpents.png (engine serpents)
              python beings.py --bench     -> ms per frame for every form at 1280x800
+             python beings.py --sprite    -> test_frames/beings/sprite/ (sprite creature, generated test figure)
 """
 import math
 import sys
@@ -46,7 +47,7 @@ import numpy as np
 HERE = Path(__file__).parent
 TAU = 2.0 * math.pi
 N_MAX = 8
-HEAD, SIDE, FLOAT, TUMBLE, ANCHOR, CLUSTER = range(6)     # how a form moves (see Herd)
+HEAD, SIDE, FLOAT, TUMBLE, ANCHOR, CLUSTER, DANCE = range(7)     # how a form moves (see Herd)
 # key, panel label, motion, size multiplier, reach (local units from the centre that should stay on screen)
 FORMS = [
     ("serpent", "Anaconda spirit", HEAD, 1.00, 1.15),
@@ -66,6 +67,7 @@ FORMS = [
     ("fireflies", "Fireflies", CLUSTER, 1.15, 0.90),
     ("whale", "Whale", SIDE, 1.45, 0.85),
     ("kitten", "Kittens", SIDE, 0.72, 1.35),
+    ("sprite", "Sprite (your image)", DANCE, 0.95, 1.00),     # the user's own image (SpriteLibrary below)
 ]
 FORM_KEYS = [f[0] for f in FORMS]
 FORM_LABELS = [f[1] for f in FORMS]
@@ -77,11 +79,25 @@ LOW_RES, LOW_RES_ON, LOW_RES_OFF = 0.75, 0.80, 0.62    # draw at 0.75x while the
 MIN_RES, MIN_RES_ON, MIN_RES_OFF = 0.60, 1.45, 1.25    # and at 0.6x far over it (only a wall of vines gets there)
 # cull box per form: local half-extents, measure_extents() + margin (tests check they still cover the picture)
 COLOR_MODES = ["Show palette", "Single hue", "Two-tone", "Rainbow", "Each its own hue", "Light chase"]
+SPRITE = FORM_KEYS.index("sprite")
+DANCES = ["Free dance", "March in a line", "Conga line", "Mirror pairs", "Bounce in place", "Flock"]
+LOOKS = ["Image", "Glowing outline", "Solid silhouette", "Skinned fill"]
+POSE_STEPS = ["Every beat", "Every half-beat", "Every bar", "Every two beats"]
+POSE_RATE = (1.0, 2.0, 0.25, 0.5)            # pose steps per beat
+FACES = ["Faces right", "Faces left", "Never flip"]
+SPR_UNIT = 24                                # sprite frames (sampler2DArray); 0-17, 20-23 are taken (see HANDOFF)
+SPR_RES = 512                                # longest side of a decoded pose, texels
+SPR_SPREAD = 24                              # distance field reach, texels (alpha 0..1 = -spread..+spread)
+SPR_MAX_PIXELS = 60_000_000                  # bigger source images are refused (decode RAM)
+SPR_MAX_FRAMES = 8
+SPR_HALF = 0.85                              # half the longest side of a sprite, local units
+SKIN_ENV = "beings"                          # materials.ENVS entry: slot "fill" = skinned fill, slot "sprite" = the image
 FORM_EXT = [
     (1.66, 1.09), (1.70, 1.47), (1.59, 1.36), (1.31, 1.42), (1.53, 1.59), (1.02, 1.39),
     (1.67, 1.52), (1.48, 1.08), (1.44, 1.70), (1.55, 1.21), (1.36, 1.65), (1.63, 1.62),
     (1.56, 1.54), (1.13, 1.70), (1.68, 1.64), (1.70, 1.14),
     (1.68, 1.46),
+    (1.25, 1.30),
 ]
 GALLERY_PALETTE = [(0.00, 0.85, 0.80), (1.00, 0.05, 0.55), (1.00, 0.70, 0.05), (0.28, 0.10, 1.00), (0.10, 0.90, 0.30)]
 
@@ -104,10 +120,15 @@ uniform float uCMode, uHue, uHue2, uSat, uBright, uChasePh, uChaseW;   // colour
 uniform float uT, uBass, uMid, uHigh, uAmt, uWig, uGlow, uDetail, uZoom;
 uniform float uCull;       // 1 = cull to the per-form box, large = off (measuring)
 uniform vec2 uScroll;      // ember / breath drift, wrapped on the CPU where the sparkle lattice repeats
+uniform vec4 uD[8];        // sprites: width scale (facing / turn / spin, signed), height scale, pose A, pose B + crossfade
+uniform sampler2DArray texSpr;   // sprite poses: rgb = colour (bled out past the outline), a = signed distance (0.5 = edge)
+uniform vec4 uSpr;         // sprite aspect (w / h), poses, look, tint
+uniform float uSprK;       // distance-field scale: 2 * spread / longest side (texels)
 const float PI = 3.14159265, TAU = 6.2831853, TURN = 0.15915494;
 const vec3 W = vec3(1.0, 0.97, 0.90);
 
 vec3 gC; float gA, gD, gPx, gLW;       // accumulated light, silhouette, nearest outline, pixel size, line half-width
+vec2 gP;                               // this pixel in content units (screen-fixed skin mapping)
 vec3 cL, cP, cQ;                       // line / pattern / accent colour of this being
 float gG, gHueSeed;                    // 0 head / top .. 1 tail / bottom of this being; its own hue offset
 
@@ -133,6 +154,7 @@ vec3 pal(float h){
   if (uCMode < 3.5) return hsv(uHue+gG+v, 1.0);
   return hsv(uHue+gHueSeed+v, st);
 }
+//@SKIN_GLSL
 float smin(float a, float b, float k){ float h = max(k-abs(a-b), 0.0)/k; return min(a, b)-h*h*k*0.25; }
 float sdSeg(vec2 p, vec2 a, vec2 b){
   vec2 pa = p-a, ba = b-a; float h = clamp(dot(pa, ba)/max(dot(ba, ba), 1e-9), 0.0, 1.0); return length(pa-ba*h);
@@ -884,11 +906,51 @@ void fKitten(vec2 p, float ph, float sd, float g){
   bead(p-hc-vec2(-0.10, -0.345), 0.042, cQ); bead(p-hc-vec2(-0.10, -0.355), 0.013, vec3(0.0));
 }
 
+// sprite: the user's own image. Poses carry a signed distance field built from the image's alpha on the decode
+// thread, so the outline is the image's own outline and stays crisp at any size; it squashes / stretches about its feet.
+void fSprite(vec2 p, float sd, vec4 D){
+  float sx = D.x < 0.0 ? min(D.x, -0.06) : max(D.x, 0.06), sy = max(D.y, 0.3);
+  vec2 hb = uSpr.x >= 1.0 ? vec2(SPRH, SPRH/uSpr.x) : vec2(SPRH*uSpr.x, SPRH);
+  p.x /= sx; p.y = (p.y+hb.y)/sy-hb.y;
+  vec2 bq = abs(p)-hb;
+  float dbox = length(max(bq, 0.0))+min(max(bq.x, bq.y), 0.0);
+  if (dbox > 0.25) return;
+  float px0 = gPx, lw0 = gLW;
+  gPx = gPx/min(abs(sx), sy); gLW = max(gLW, 0.85*gPx);
+  vec2 uv = clamp(p/(2.0*hb)+0.5, 0.0, 1.0);
+  vec4 A = texture(texSpr, vec3(uv, D.z));
+  float xf = fract(D.w);
+  if (xf > 0.002) A = mix(A, texture(texSpr, vec3(uv, floor(D.w))), xf);    // pose crossfade: the outlines morph
+  float d = (0.5-A.a)*uSprK*2.0*max(hb.x, hb.y);
+  d = max(d, dbox)+(1.0-smoothstep(0.0, 0.08, A.a))*0.4;                    // beyond the field's reach: far away
+  float look = uSpr.z, L = dot(A.rgb, vec3(0.299, 0.587, 0.114));
+  vec3 col = pal(sd+0.15+uv.y*0.35);
+  float contour = pline(d+0.045, gLW*0.45, gPx);
+  if (look < 0.5) {                                                         // the image, optionally tinted
+    part(d, cL, mix(A.rgb, col*(0.30+1.25*L), uSpr.w)*0.88);
+  } else if (look < 1.5) {                                                  // glowing outline
+    part(d, cL, cP*0.04);
+    stroke(abs(d+0.040), gLW*0.6, cQ*0.85);
+  } else {                                                                  // solid silhouette / skinned fill
+    vec3 f = col*0.72+cQ*contour*0.55;
+#ifdef SKIN
+    if (look > 2.5) {                       // mapping: 0 moves with it (reads the right way round), 1 mirrors, 2 screen
+      vec2 su = skB[0].x > 1.5 ? gP*0.5+0.5 : vec2(skB[0].x < 0.5 && sx < 0.0 ? 1.0-uv.x : uv.x, uv.y);
+      float gs = skB[0].x > 1.5 ? 0.5*uZoom/uRes.y : 0.0;
+      vec2 gx = skB[0].x > 1.5 ? vec2(gs, 0.0) : vec2(gPx/(2.0*hb.x), 0.0), gy = skB[0].x > 1.5 ? vec2(0.0, gs) : vec2(0.0, gPx/(2.0*hb.y));
+      f = skMix(0, f, skTap(0, su, gx, gy), contour, 1.0);
+    }
+#endif
+    part(d, cL, f);
+  }
+  gPx = px0; gLW = lw0;
+}
+
 const vec2 EXT[NFORMS] = vec2[NFORMS](/*EXT*/vec2(1.7)/*EXT*/);
 
-vec4 being(int form, vec2 p, float ph, float sd, float gait, float grow){
+vec4 being(int form, vec2 p, float ph, float sd, float gait, float grow, vec4 D){
   gC = vec3(0.0); gA = 0.0; gD = 1e3;
-  bool alongX = form < 5 || form == 6 || form == 7 || form >= 15;      // long bodies: head .. tail, the rest: top .. bottom
+  bool alongX = form < 5 || form == 6 || form == 7 || (form >= 15 && form != 17);     // long bodies: head .. tail, the rest: top .. bottom
   gG = clamp(0.5-(alongX ? p.x : p.y)/2.6, 0.0, 1.0);
   gHueSeed = fract(sd*0.754877);
   cL = mix(pal(sd), W, 0.30); cP = pal(sd+0.22); cQ = pal(sd+0.48);
@@ -908,7 +970,8 @@ vec4 being(int form, vec2 p, float ph, float sd, float gait, float grow){
   else if (form == 13) fVine(p, ph, sd, grow);
   else if (form == 14) fFireflies(p, ph, sd);
   else if (form == 15) fWhale(p, ph, sd);
-  else                 fKitten(p, ph, sd, gait);
+  else if (form == 16) fKitten(p, ph, sd, gait);
+  else                 fSprite(p, sd, D);
   float edge = smoothstep(1.70, 1.45, length(p));                    // nothing may be cut by the bounding circle
   float halo = exp(-max(gD, 0.0)*(26.0-14.0*uGlow))*(0.10+0.55*uGlow)*(1.0-gA);
   vec3 c = gC*(0.70+0.45*uGlow)*(1.0+0.40*uBass)+cL*halo*(0.8+0.6*uBass);
@@ -924,6 +987,7 @@ vec4 being(int form, vec2 p, float ph, float sd, float gait, float grow){
 
 void main(){
   vec2 P = (v_uv-0.5)*vec2(uRes.x/uRes.y, 1.0)*uZoom;
+  gP = P;
   vec3 col = vec3(0.0); float al = 0.0;
   for (int i = 0; i < uN; i++) {
     vec2 q = P-uA[i].xy; float sc = uA[i].w, fade = uC[i].w;
@@ -936,7 +1000,7 @@ void main(){
     if (any(greaterThan(abs(q), EXT[form]*uCull))) continue;         // outside this form's box: nothing to draw
     gPx = uZoom/(uRes.y*sc);
     gLW = max(0.0105, 0.85*gPx);
-    vec4 r = being(form, q, uB[i].x, uB[i].z, uC[i].y, uC[i].z);
+    vec4 r = being(form, q, uB[i].x, uB[i].z, uC[i].y, uC[i].z, uD[i]);
     if (any(isnan(r)) || any(isinf(r))) r = vec4(0.0);
     r = clamp(r, 0.0, 4.0)*fade;
     col = col*(1.0-min(r.a, 1.0))+r.rgb;
@@ -994,6 +1058,12 @@ class Herd:
         self.snap = True                           # next step: no fades, show the wanted herd at once (start / layer was off)
         self.load = 0.0                            # summed box area on show, content units (the frame is aspect x 1)
         self.cap = 1.0                             # scale factor the area budget applied this step
+        self.frames = 1                            # sprite poses available (set by the pass from its SpriteLibrary)
+        self.ud = np.zeros((N_MAX, 4), dtype="f4")  # sprite block (uD): width, height, pose A, pose B + crossfade
+        self.ud[:, :2] = 1.0
+        self.turn = np.ones(N_MAX)                 # sprite facing, -1..1, eases through 0 when it turns round
+        self.fp = None                             # flock: positions / velocities (content units)
+        self.fv = np.zeros((N_MAX, 2))
 
     def _path(self, s, i, form, scale):
         """Centre of being i at path phase s -> (x, y) in content units. Stays inside the frame by construction."""
@@ -1019,6 +1089,143 @@ class Herd:
         elif motion == CLUSTER:
             x, y = x * 0.5, y * 0.5
         return x, y
+
+    def _box(self, form, scale):
+        reach = FORMS[form][4]
+        mx = min(reach * scale * 0.85, self.aspect * 0.5 - 0.06)
+        my = min(reach * scale * 0.85, 0.5 - 0.05)
+        return self.aspect * 0.5 - mx, 0.5 - my
+
+    def _dance(self, s, i, form, sc, mode, track=None):
+        """Centre of dancer i at path phase s for the deterministic dance modes -> (x, y, facing or None).
+        track = the scale the shared line (march / conga) is laid out for, so every dancer walks the same track."""
+        X, Y = self._box(form, track if (track and mode in (1, 2)) else sc)
+        h = HERD_H[i]
+        gap = 2.15 * sc                                    # body lengths between dancers in a line
+        face = None
+        if mode == 1:                                      # march: one line, back and forth along a lane (countermarch)
+            L = 2.0 * X
+            if L < 1e-6:
+                x = 0.0
+            else:
+                m = (s * 0.30 - i * gap) % (2.0 * L)
+                x = -X + (m if m < L else 2.0 * L - m)
+            y = -0.35 * Y + 0.05 * Y * math.sin(0.5 * s)
+        elif mode == 2:                                    # conga: round the dance floor, each behind the next
+            R = max(0.5 * (X + 0.7 * Y), 0.05)
+            th = (s * 0.30 - i * gap) / R
+            x, y = X * math.cos(th), 0.7 * Y * math.sin(th)
+        elif mode == 3:                                    # mirror pairs: partners face each other, moves mirrored
+            p, side = i // 2, (-1.0 if i % 2 == 0 else 1.0)
+            cx, cy = ((0.0, -0.30), (-0.60, 0.40), (0.60, 0.40), (0.0, 0.85))[p]
+            cx = cx * X + 0.12 * X * math.sin(0.35 * s + 1.7 * p)
+            x = cx + side * (1.05 + 0.15 * math.sin(0.5 * s + p)) * sc
+            y = cy * Y + 0.04 * Y * math.sin(0.4 * s + p)
+            face = -side
+        elif mode == 4:                                    # bounce in place
+            lane = ((i * 0.618 + 0.1) % 1.0) * 2.0 - 1.0
+            x = lane * X * 0.9 + 0.02 * math.sin(0.3 * s + i)
+            y = -0.30 * Y + 0.06 * Y * math.sin(0.4 * s + 2.0 * i)
+            face = 1.0 if lane < 0.0 else -1.0                # facing the middle of the floor
+        else:                                              # free dance: a slow wander, mostly sideways
+            s = s * 0.55
+            x = X * (0.66 * math.sin((0.23 + 0.19 * h[0]) * s + TAU * h[4]) + 0.34 * math.sin((0.61 + 0.30 * h[1]) * s + TAU * h[5]))
+            y = 0.7 * Y * (0.66 * math.sin((0.29 + 0.17 * h[2]) * s + TAU * h[5]) + 0.34 * math.sin((0.53 + 0.30 * h[3]) * s + TAU * h[4]))
+        return min(max(x, -X), X), min(max(y, -Y), Y), face
+
+    def _flock(self, ds, forms, scales, vis):
+        """Flock (mode 5): steer to a wandering leader point, keep apart, match the neighbours. Integrated in path
+        time (ds), so speed 0 / freeze hold it still. Positions stay inside the frame box."""
+        idx = [i for i in range(N_MAX) if FORMS[forms[i]][2] == DANCE]
+        if not idx:
+            return
+        if self.fp is None:
+            self.fp = np.array([self._dance(self.s, i, forms[i], scales[i], 0)[:2] for i in range(N_MAX)], dtype=float)
+            self.fv[:] = 0.0
+        if ds <= 0.0:
+            return
+        tx, ty, _ = self._dance(self.s, 0, forms[idx[0]], scales[idx[0]], 0)
+        tgt = np.array((tx, ty))
+        act = [i for i in idx if vis[i] > 0.0]
+        n_sub = max(1, int(math.ceil(ds / 0.05)))
+        h = ds / n_sub
+        for _ in range(n_sub):
+            vmean = self.fv[act].mean(axis=0) if act else np.zeros(2)
+            for i in idx:
+                p, v = self.fp[i], self.fv[i]
+                acc = 1.4 * (tgt - p) + 0.9 * (vmean - v) - 0.8 * v
+                for j in act:
+                    if j == i:
+                        continue
+                    d = p - self.fp[j]
+                    r = math.hypot(d[0], d[1]) + 1e-6
+                    lim = 2.0 * max(scales[i], scales[j])
+                    if r < lim:
+                        acc += d / r * (lim - r) / lim * 6.0
+                v += acc * h
+                spd = math.hypot(v[0], v[1])
+                if spd > 0.9:
+                    v *= 0.9 / spd
+                p += v * h
+                X, Y = self._box(forms[i], scales[i])
+                for k, lim in ((0, X), (1, Y)):
+                    if abs(p[k]) > lim:
+                        p[k] = math.copysign(lim, p[k])
+                        v[k] *= -0.3
+
+    def _dance_block(self, i, sc, beat, values, vx, forced, dt):
+        """-> (hop height, uD row) for dancer i: hop + squash / stretch on the beat, facing, spins, pose step."""
+        mode = int(round(_val(values, "being_dance", 0.0, 0.0, len(DANCES) - 1)))
+        bounce = _val(values, "being_bounce", 0.5, 0.0, 1.0)
+        spin = _val(values, "being_spin", 0.2, 0.0, 1.0)
+        faces = int(round(_val(values, "being_faces", 0.0, 0.0, len(FACES) - 1)))
+        k = math.floor(beat)
+        bp_ = beat - k
+        if mode == 0:
+            hop_on = (int(k) + i) % 2 == 0                  # free dance: hop on every other beat, taking turns
+        elif mode == 2:
+            hop_on = int(k) % 4 == 3                        # conga: everybody kicks on the fourth beat
+        else:
+            hop_on = True
+        hh = 4.0 * bp_ * (1.0 - bp_) if hop_on else 0.0
+        land = math.exp(-(bp_ / 0.10) ** 2) + math.exp(-((1.0 - bp_) / 0.10) ** 2)
+        sy = 1.0 + bounce * (0.16 * hh - 0.20 * land)
+        sxs = 1.0 + bounce * (0.20 * land - 0.08 * hh)
+        if forced is not None:
+            want = forced
+        elif vx > 0.004:
+            want = 1.0
+        elif vx < -0.004:
+            want = -1.0
+        else:
+            want = 1.0 if self.turn[i] >= 0 else -1.0
+        if faces == 1:
+            want = -want
+        elif faces == 2:
+            want = 1.0
+        step = dt / 0.22
+        self.turn[i] = min(want, self.turn[i] + step) if want > self.turn[i] else max(want, self.turn[i] - step)
+        w = self.turn[i]
+        bar = math.floor(beat / 4.0)
+        if spin > 0.0 and (bar * 0.6180339887 + HERD_H[i, 3]) % 1.0 < spin * 0.35:
+            r = min(max((beat - 4.0 * bar) / 2.0, 0.0), 1.0)
+            r = r * r * (3.0 - 2.0 * r)
+            w *= math.cos(TAU * r)                          # a spin: the image turns round once, like a flipped card
+        nf = max(1, int(self.frames))
+        if nf > 1:
+            rate = POSE_RATE[int(round(_val(values, "being_frames", 0.0, 0.0, len(POSE_STEPS) - 1)))]
+            fk = beat * rate + (i if mode == 0 else 0)
+            fa = int(math.floor(fk)) % nf
+            f = fk - math.floor(fk)
+            xfade = _val(values, "being_xfade", 0.0, 0.0, 1.0)
+            xf = 0.0
+            if xfade > 0.001:
+                xf = min(max((f - (1.0 - xfade)) / xfade, 0.0), 1.0)
+                xf = min(xf * xf * (3.0 - 2.0 * xf), 0.999)
+            pa, pb = float(fa), float((fa + 1) % nf) + xf
+        else:
+            pa, pb = 0.0, 0.0
+        return bounce * 0.30 * sc * hh, (w * sxs, sy, pa, pb)
 
     @staticmethod
     def raw_scale(i, form, size):
@@ -1073,16 +1280,35 @@ class Herd:
         scales = [sc if FORMS[f][2] == ANCHOR else sc * self.cap for f, sc in zip(forms, scales)]
         self.load = fixed + free * self.cap * self.cap
         ua, ub, uc = (np.zeros((N_MAX, 4), dtype="f4") for _ in range(3))
+        dbeat = beat if clock and "beat" in clock else self.a * 0.9    # dancers without a clock keep their own time
+        ud = self.ud
+        ud[:] = (1.0, 1.0, 0.0, 0.0)
+        mode = int(round(_val(values, "being_dance", 0.0, 0.0, len(DANCES) - 1)))
+        if mode == 5:
+            self._flock(ds, forms, scales, vis)
+        else:
+            self.fp = None
         eps = 0.02
         new_pos = np.zeros((N_MAX, 2))
         for i in range(N_MAX):
             f, sc = forms[i], scales[i]
             motion = FORMS[f][2]
-            x, y = self._path(self.s, i, f, sc)
-            x1, y1 = self._path(self.s + eps, i, f, sc)
-            x0, y0 = self._path(self.s - eps, i, f, sc)
-            vx, vy = (x1 - x0) / (2 * eps), (y1 - y0) / (2 * eps)
             ang, face, bend, grow, fade = 0.0, 1.0, 0.0, 1.0, 1.0
+            if motion == DANCE:
+                if mode == 5 and self.fp is not None:
+                    x, y = float(self.fp[i, 0]), float(self.fp[i, 1])
+                    vx, forced = float(self.fv[i, 0]), None
+                else:
+                    trk = max(scales)
+                    x, y, forced = self._dance(self.s, i, f, sc, mode, trk)
+                    vx = (self._dance(self.s + eps, i, f, sc, mode, trk)[0] - self._dance(self.s - eps, i, f, sc, mode, trk)[0]) / (2 * eps)
+                hop, ud[i] = self._dance_block(i, sc, dbeat, values, vx, forced, dt)
+                y += hop
+            else:
+                x, y = self._path(self.s, i, f, sc)
+                x1, y1 = self._path(self.s + eps, i, f, sc)
+                x0, y0 = self._path(self.s - eps, i, f, sc)
+                vx, vy = (x1 - x0) / (2 * eps), (y1 - y0) / (2 * eps)
             if motion == HEAD:
                 ang = math.atan2(vy, vx) if abs(vx) + abs(vy) > 1e-9 else 0.0
                 h0, h1 = math.atan2(y - y0, x - x0), math.atan2(y1 - y, x1 - x)
@@ -1126,6 +1352,289 @@ class Herd:
         return ua, ub, uc, n
 
 
+# ---------------------------------------------------------------- sprite creature: the user's own image(s)
+#
+# Decode thread (never the render thread): open (PNG / JPG / WEBP / BMP; SVG only if cairosvg is installed), refuse
+# more than SPR_MAX_PIXELS, shrink early (draft / reduce), work out the alpha (the image's own alpha, else a key on the
+# border colour for photos / JPGs), resize in PREMULTIPLIED space (no dark or light fringes), then build a signed
+# distance field from the alpha (OpenCV distance transform; exact sub-pixel edge from the alpha ramp) and bleed the
+# colour outwards past the outline (nearest inside pixel), so filtering at the edge never pulls in background.
+# Texture layout per pose: rgb = straight colour, a = 0.5 - distance / (2 * SPR_SPREAD) (inside > 0.5), y up.
+
+SEQ_RE = __import__("re").compile(r"^(.*?)[ _\-.]?(\d{1,3})$")
+SPR_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".svg")
+
+
+def sequence_for(path):
+    """A numbered image (walk_1.png, walk_02.png, ...) brings its numbered siblings: the poses of a cycle (<= 8,
+    in number order, same folder). Anything else is a single pose. -> [Path]."""
+    path = Path(path)
+    m = SEQ_RE.match(path.stem)
+    if not m:
+        return [path]
+    pre = m.group(1)
+    found = []
+    try:
+        for q in path.parent.iterdir():
+            if q.suffix.lower() not in SPR_EXT or not q.is_file():
+                continue
+            mq = SEQ_RE.match(q.stem)
+            if mq and mq.group(1) == pre:
+                found.append((int(mq.group(2)), q.name, q))
+    except OSError:
+        return [path]
+    found.sort()
+    out = [q for _, _, q in found][:SPR_MAX_FRAMES]
+    return out if len(out) >= 2 and path in out else [path]
+
+
+def _open_rgba(path, want):
+    """-> float32 (h, w, 4) straight RGBA 0..1, shrunk so the longest side is about 2 x want at most."""
+    from PIL import Image
+    path = Path(path)
+    if path.suffix.lower() == ".svg":
+        try:
+            import cairosvg                                   # optional: not in requirements.txt
+        except ImportError:
+            raise ValueError("SVG needs the optional cairosvg package; export the drawing as a PNG instead")
+        import io
+        im = Image.open(io.BytesIO(cairosvg.svg2png(url=str(path), output_width=int(want * 2))))
+    else:
+        im = Image.open(path)
+    with im:
+        w, h = im.size
+        if w * h > SPR_MAX_PIXELS:
+            raise ValueError(f"image too large ({w}x{h})")
+        im.draft("RGB", (want * 2, want * 2))
+        f = max(im.size) // (want * 2)
+        if f >= 2:
+            im = im.reduce(f)
+        has_alpha = im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info)
+        a = np.asarray(im.convert("RGBA"), dtype=np.float32) / 255.0
+    if not has_alpha or a[..., 3].min() > 0.995:
+        a[..., 3] = border_key(a[..., :3])
+    return a
+
+
+def border_key(rgb):
+    """Alpha for an image without one (a JPG): how far each pixel is from the border colour (median of the edge)."""
+    edge = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]])
+    bg = np.median(edge, axis=0)
+    d = np.abs(rgb - bg).max(axis=2)
+    return np.clip((d - 0.10) / 0.14, 0.0, 1.0)
+
+
+def _resize_premul(a, size):
+    from PIL import Image
+    pm = a.copy()
+    pm[..., :3] *= pm[..., 3:4]
+    chans = [np.asarray(Image.fromarray(pm[..., c]).resize(size, Image.LANCZOS)) for c in range(4)]
+    out = np.clip(np.stack(chans, axis=2), 0.0, 1.0)
+    al = out[..., 3:4]
+    out[..., :3] = np.where(al > 1e-4, out[..., :3] / np.maximum(al, 1e-4), 0.0)
+    return np.clip(out, 0.0, 1.0)
+
+
+def _edt(mask):
+    """Distance (texels) from every pixel to the nearest pixel where mask is False, + the index of that pixel."""
+    try:
+        import cv2
+        src = mask.astype(np.uint8)
+        dist, lab = cv2.distanceTransformWithLabels(src, cv2.DIST_L2, cv2.DIST_MASK_PRECISE, labelType=cv2.DIST_LABEL_PIXEL)
+        zy, zx = np.nonzero(src == 0)
+        if len(zy) == 0:
+            return dist, None
+        lut = np.zeros(int(lab.max()) + 1, dtype=np.int64)
+        lut[lab[zy, zx]] = zy * mask.shape[1] + zx
+        return dist, lut[lab]
+    except ImportError:                                       # fallback: chamfer by repeated 3x3 erosion (no colour bleed)
+        dist = np.zeros(mask.shape, np.float32)
+        cur = mask.copy()
+        for k in range(1, SPR_SPREAD + 2):
+            if not cur.any():
+                break
+            dist[cur] = k
+            c = cur.copy()
+            c[1:] &= cur[:-1]; c[:-1] &= cur[1:]; c[:, 1:] &= cur[:, :-1]; c[:, :-1] &= cur[:, 1:]
+            cur = c
+        dist[cur] = SPR_SPREAD + 2
+        return dist, None
+
+
+def sdf_pose(rgba, spread=SPR_SPREAD):
+    """(h, w, 4) straight RGBA float -> (h, w, 4) uint8: rgb = colour bled past the outline, a = signed distance."""
+    al = rgba[..., 3]
+    inside = al >= 0.5
+    d_out, near_in = _edt(~inside)                          # outside pixels: distance to the nearest inside pixel
+    d_in, _ = _edt(inside)                                  # inside pixels: distance to the nearest outside pixel
+    sd = np.where(inside, -(d_in - 0.5), d_out - 0.5)       # > 0 outside, the edge half way between the pixels
+    ramp = (al > 0.0) & (al < 1.0) & (np.abs(sd) <= 1.0)    # antialiased edge pixels: their alpha IS the sub-pixel edge
+    sd = np.where(ramp, 0.5 - al, sd)
+    rgb = rgba[..., :3]
+    if near_in is not None:
+        flat = rgb.reshape(-1, 3)
+        rgb = np.where(inside[..., None], rgb, flat[near_in.reshape(-1)].reshape(rgb.shape))
+    out = np.empty(rgba.shape, np.uint8)
+    out[..., :3] = np.clip(rgb * 255.0 + 0.5, 0, 255)
+    out[..., 3] = np.clip((0.5 - sd / (2.0 * spread)) * 255.0 + 0.5, 0, 255)
+    return out
+
+
+def decode_sprite(path, sheet=1, res=SPR_RES):
+    """-> (poses uint8 (n, H, W, 4) bottom row first, aspect w / h, note). Runs on the decode thread."""
+    paths = sequence_for(path)
+    sheet = max(1, min(int(sheet), SPR_MAX_FRAMES))
+    cells = []
+    if sheet > 1:
+        img = _open_rgba(paths[0], res * sheet)
+        w = img.shape[1] // sheet
+        cells = [img[:, k * w:(k + 1) * w] for k in range(sheet)]
+    else:
+        cells = [_open_rgba(q, res) for q in paths]
+    h0, w0 = cells[0].shape[:2]
+    aspect = w0 / max(h0, 1)
+    pad = SPR_SPREAD + 2                                     # room for the field (and the glow) round the picture
+    inner = res - 2 * pad
+    W = max(8, int(round(inner * min(aspect, 1.0)))) + 2 * pad
+    H = max(8, int(round(inner / max(aspect, 1.0)))) + 2 * pad
+    poses = []
+    for c in cells:
+        r = _resize_premul(c, (W - 2 * pad, H - 2 * pad))
+        full = np.zeros((H, W, 4), np.float32)
+        full[pad:H - pad, pad:W - pad] = r
+        poses.append(sdf_pose(full)[::-1])
+    names = ", ".join(q.name for q in paths[:3]) + (" ..." if len(paths) > 3 else "")
+    return np.ascontiguousarray(np.stack(poses)), W / H, f"{len(poses)} pose(s) from {names}"
+
+
+def placeholder_poses(res=256):
+    """A generic stand-in creature (two poses: arms down / up) until the user picks an image; also the test image."""
+    yy, xx = np.mgrid[0:res, 0:res].astype(np.float32) / res * 2.0 - 1.0
+    yy = -yy
+    out = []
+    for up in (0.0, 1.0):
+        body = (xx / 0.46) ** 2 + ((yy + 0.18) / 0.52) ** 2 < 1.0
+        head = xx ** 2 + (yy - 0.48) ** 2 < 0.30 ** 2
+        ang = 0.5 + 0.9 * up
+        arms = np.zeros_like(body)
+        for sgn in (-1.0, 1.0):
+            ax, ay = sgn * 0.40, 0.02
+            dx, dy = sgn * math.cos(ang), math.sin(ang)
+            t = np.clip((xx - ax) * dx + (yy - ay) * dy, 0.0, 0.42)
+            arms |= (xx - ax - dx * t) ** 2 + (yy - ay - dy * t) ** 2 < 0.085 ** 2
+        legs = ((np.abs(np.abs(xx) - 0.20) < 0.10) & (yy < -0.55) & (yy > -0.90))
+        a = (body | head | arms | legs).astype(np.float32)
+        hue = (xx * 0.3 + yy * 0.25 + 0.55) % 1.0
+        rgb = np.stack([np.clip(np.abs(((hue + o) % 1.0) * 6.0 - 3.0) - 1.0, 0, 1) for o in (0.0, 2 / 3, 1 / 3)], axis=2)
+        rgb = 0.25 + 0.65 * rgb
+        for sgn in (-1.0, 1.0):                                  # eyes
+            eye = (xx - sgn * 0.11) ** 2 + (yy - 0.52) ** 2 < 0.06 ** 2
+            rgb[eye] = 0.95
+            rgb[(xx - sgn * 0.11) ** 2 + (yy - 0.51) ** 2 < 0.028 ** 2] = 0.05
+        out.append(np.concatenate([rgb, a[..., None]], axis=2))
+    return out
+
+
+class SpriteLibrary:
+    """The pose texture of the sprite creature: ONE RGBA8 sampler2DArray on unit SPR_UNIT, created on first use.
+
+    want(path, sheet) asks for an image (None = the stand-in); decoding happens on a worker thread started on the
+    first request (sync=True decodes inline: tests, stills); tick() uploads a finished decode (at most once per frame).
+    Nothing exists (no thread, no texture) until a sprite is actually on show."""
+
+    def __init__(self, ctx, res=SPR_RES, sync=False):
+        self.ctx, self.res, self.sync = ctx, int(res), bool(sync)
+        self.tex = None
+        self.frames, self.aspect = 1, 1.0
+        self.key = None                     # what is uploaded
+        self.wanted = None                  # what was asked for last
+        self.note = ""
+        self.loads = self.uploads = 0
+        self._thread = None
+        self._job = None
+        self._done = None
+        self._lock = __import__("threading").Lock()
+        self._wake = __import__("threading").Event()
+
+    def want(self, path, sheet=1):
+        key = (str(path) if path else None, max(1, min(int(sheet), SPR_MAX_FRAMES)))
+        if key == self.wanted:
+            return
+        self.wanted = key
+        if key[0] is None:
+            self._done = (key, *self._placeholder())
+            return
+        if self.sync:
+            self._done = self._decode(key)
+            return
+        with self._lock:
+            self._job = key
+        if self._thread is None:
+            import threading
+            self._thread = threading.Thread(target=self._work, name="sprite-decode", daemon=True)
+            self._thread.start()
+        self._wake.set()
+
+    def _placeholder(self):
+        cells = placeholder_poses()
+        poses = [sdf_pose(np.pad(c, ((28, 28), (28, 28), (0, 0))))[::-1] for c in cells]
+        return np.ascontiguousarray(np.stack(poses)), 1.0, "stand-in (pick your own image: SKINS card, slot SPRITE)"
+
+    def _decode(self, key):
+        try:
+            poses, asp, note = decode_sprite(key[0], key[1], self.res)
+            self.loads += 1
+            return key, poses, asp, note
+        except Exception as ex:                                  # unreadable / too big / missing: the stand-in
+            poses, asp, _ = self._placeholder()
+            return key, poses, asp, f"could not use {Path(key[0]).name}: {str(ex)[:120]}"
+
+    def _work(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                key, self._job = self._job, None
+            if key is None:
+                continue
+            res = self._decode(key)
+            with self._lock:
+                if key == self.wanted:
+                    self._done = res
+
+    def busy(self):
+        return self._job is not None or (self.wanted is not None and self.wanted != self.key and self._done is None)
+
+    def tick(self):
+        """Render thread: upload a finished decode (one texture create + one write + mip build, once per load)."""
+        with self._lock:
+            done, self._done = self._done, None
+        if done is None:
+            if self.tex is None and self.wanted is None:
+                self.want(None)
+                return self.tick()
+            return
+        key, poses, asp, note = done
+        if key != self.wanted:
+            return
+        n, H, W = poses.shape[:3]
+        if self.tex is None or self.tex.size != (W, H, n):
+            if self.tex is not None:
+                self.tex.release()
+            self.tex = self.ctx.texture_array((W, H, n), 4, dtype="f1")
+            self.tex.repeat_x = self.tex.repeat_y = False
+        self.tex.write(poses.tobytes())
+        self.tex.build_mipmaps()
+        self.tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        self.frames, self.aspect, self.key, self.note = n, float(asp), key, note
+        self.uploads += 1
+
+    def release(self):
+        if self.tex is not None:
+            self.tex.release()
+            self.tex = None
+
+
 def pick_res(res, load):
     """Resolution tier for a load (in budgets), with hysteresis so the pass never flaps between targets."""
     if load > MIN_RES_ON or (res == MIN_RES and load > MIN_RES_OFF):
@@ -1159,6 +1668,14 @@ class BeingsPass:
         self._quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
         self._prog = ctx.program(vertex_shader=VS, fragment_shader=shader_source())
         self._vao = ctx.vertex_array(self._prog, [(self._quad, "2f", "in_pos")])
+        self._prog["texSpr"].value = SPR_UNIT
+        self._cur = self._prog
+        self._skins = None                               # materials.SkinEngine (skinned sprite fill), set by the engine
+        self._skin_prog = None                           # (program, vao) with the materials chunk; False = failed once
+        self.skin_frame = None                           # the controller's SkinState.frame (beings:sprite = the image)
+        self.sprite_path = None                          # explicit image path (stills / tests); beats skin_frame
+        self.sprites = None                              # SpriteLibrary, created when a sprite first comes on show
+        self.sprite_sync = False                         # decode inline (tests / stills)
         self._targets = {}
         self._target(1.0)
         self.herd = Herd(self.out_size[0] / self.out_size[1])
@@ -1185,8 +1702,44 @@ class BeingsPass:
             self._targets[res] = (tex, fbo)
         return self._targets[res]
 
+    @property
+    def skins(self):
+        return self._skins
+
+    @skins.setter
+    def skins(self, eng):
+        """The engine's SkinEngine. Setting it compiles the skinned program once (a deliberate moment: skins ON)."""
+        self._skins = eng
+        if eng is not None and self._skin_prog is None:
+            try:
+                import materials
+                prog = self.ctx.program(vertex_shader=VS, fragment_shader=shader_source(materials.glsl(1, "pal")))
+                prog["texSpr"].value = SPR_UNIT
+                self._skin_prog = (prog, self.ctx.vertex_array(prog, [(self._quad, "2f", "in_pos")]))
+            except Exception as ex:
+                self._skin_prog = False
+                print(f"[l_beings] skinned sprite fill disabled (shader did not compile): {str(ex)[:300]}")
+
+    def _sprite_source(self):
+        """-> the image path the sprite should show, or None (the stand-in)."""
+        if self.sprite_path:
+            return self.sprite_path
+        try:
+            src = ((self.skin_frame or {}).get(SKIN_ENV) or {}).get("sprite") or {}
+            src = src.get("src")
+            if src and src.get("kind") in ("art", "ai") and self._skins is not None:
+                return self._skins.lib.path((src["kind"], src["name"]))
+        except Exception:
+            pass
+        return None
+
     def release(self):
         objs = [o for pair in self._targets.values() for o in pair[::-1]] + [self._vao, self._prog, self._quad]
+        if self._skin_prog:
+            objs += [self._skin_prog[1], self._skin_prog[0]]
+            self._skin_prog = None
+        if self.sprites is not None:
+            self.sprites.release()
         self._targets = {}
         for o in objs:
             try:
@@ -1197,8 +1750,8 @@ class BeingsPass:
     close = release
 
     def _set(self, name, value):
-        if name in self._prog:
-            self._prog[name].value = value
+        if name in self._cur:
+            self._cur[name].value = value
 
     def render(self, values, clock=None, t=0.0, dt=None, bands=(0.0, 0.0, 0.0), palette_rgb=None) -> moderngl.Texture:
         ctx = self.ctx
@@ -1225,19 +1778,42 @@ class BeingsPass:
                     self._blank = True
                 self.herd.snap = True                    # back on later: the herd of that moment, no stale fades
                 return self._targets[1.0][0]
+            if self.sprites is not None:
+                self.herd.frames = self.sprites.frames
             ua, ub, uc, _n = self.herd.step(dt, values, bands, clock)
             self.res = pick_res(self.res, self.herd.load / AREA_BUDGET)
+            herd_forms = self.herd.form or ()
+            spr = any(f == SPRITE and self.herd.env[i] > 0.0 for i, f in enumerate(herd_forms))
+            look = int(round(_val(values, "being_look", 0.0, 0.0, len(LOOKS) - 1)))
+            self._cur, vao = self._prog, self._vao
+            if spr:                                      # only while a sprite is on show: library, unit, uniforms
+                if self.sprites is None:
+                    self.sprites = SpriteLibrary(ctx, sync=self.sprite_sync)
+                self.sprites.want(self._sprite_source(), int(round(_val(values, "being_sheet", 1.0, 1.0, SPR_MAX_FRAMES))))
+                self.sprites.tick()
+                if (look == 3 and self._skin_prog and self._skins is not None and self._skins.active(SKIN_ENV)):
+                    self._cur, vao = self._skin_prog
             tex, fbo = self._target(self.res)
             fbo.use()
             ctx.viewport = (0, 0, *tex.size)
             ctx.disable(moderngl.BLEND)
+            if spr and self.sprites.tex is not None:
+                st = self.sprites.tex
+                st.use(SPR_UNIT)
+                self._set("uSpr", (self.sprites.aspect, float(self.sprites.frames), float(look),
+                                   _val(values, "being_tint", 0.0, 0.0, 1.0)))
+                self._set("uSprK", 2.0 * SPR_SPREAD / max(st.width, st.height))
+                if self._cur is not self._prog:
+                    self._skins.bind(self._cur, SKIN_ENV)
+            if "uD" in self._cur:
+                self._cur["uD"].write(self.herd.ud.astype("f4").tobytes())
             self._set("uRes", tuple(float(x) for x in tex.size))
             self._set("uN", N_MAX)
             for name, arr in (("uA", ua), ("uB", ub), ("uC", uc)):
-                if name in self._prog:
-                    self._prog[name].write(arr.tobytes())
-            if "uPal" in self._prog:
-                self._prog["uPal"].write(self._pal.astype("f4").tobytes())
+                if name in self._cur:
+                    self._cur[name].write(arr.tobytes())
+            if "uPal" in self._cur:
+                self._cur["uPal"].write(self._pal.astype("f4").tobytes())
             self._set("uT", t % PHASE_WRAP)              # wrapped in double precision, twinkle rates are k/8
             self._set("uScroll", ((t * 0.12) % (64.0 / 5.0), (t * 0.30) % (64.0 / 9.0)))
             self._set("uBass", bands[0]); self._set("uMid", bands[1]); self._set("uHigh", bands[2])
@@ -1257,7 +1833,7 @@ class BeingsPass:
                 chase = _num((clock or {}).get("bar_phase", 0.0)) * _val(values, "chase_rate", 1.0, -4.0, 4.0)
             self._set("uChasePh", _num(chase) % 1.0)
             self._set("uChaseW", _val(values, "chase_width", 0.25, 0.05, 0.95))
-            self._vao.render(moderngl.TRIANGLE_STRIP)
+            vao.render(moderngl.TRIANGLE_STRIP)
             self.draws += 1
             self._blank = False
             return tex
@@ -1271,10 +1847,14 @@ class BeingsPass:
                 ctx.screen.use()
 
 
-def shader_source():
+def shader_source(skin_glsl=None):
     ext = ", ".join(f"vec2({x:.2f}, {y:.2f})" for x, y in FORM_EXT)
     a, b = FS.index("/*EXT*/"), FS.rindex("/*EXT*/") + len("/*EXT*/")
-    return (FS[:a] + ext + FS[b:]).replace("NFORMS", str(len(FORMS)))
+    src = (FS[:a] + ext + FS[b:]).replace("NFORMS", str(len(FORMS))).replace("SPRH", f"{SPR_HALF:.3f}")
+    if skin_glsl:                                # the skinned variant: materials chunk (one slot: beings:fill) + SKIN
+        nl = chr(10)
+        src = src.replace("#version 330" + nl, "#version 330" + nl + "#define SKIN" + nl, 1).replace("//@SKIN_GLSL", skin_glsl)
+    return src
 
 
 def measure_extents(ctx=None, size=(640, 640), steps=40):
@@ -1435,6 +2015,80 @@ def colour_sheets(out_dir=None, cell=(480, 300)):
     return out_dir
 
 
+def write_test_poses(folder):
+    """The generic stand-in figure as a numbered two-pose PNG sequence (pose_1.png, pose_2.png) -> path of pose 1."""
+    from PIL import Image
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for k, c in enumerate(placeholder_poses(400), 1):
+        Image.fromarray((np.clip(c, 0, 1) * 255).astype(np.uint8), "RGBA").save(folder / f"pose_{k}.png")
+    return folder / "pose_1.png"
+
+
+def sprite_gallery(out_dir=None, cell=(640, 400)):
+    """test_frames/beings/sprite/: the sprite creature with a GENERATED generic test figure (never user art):
+    looks x colour modes, the dance modes, a big close-up (edge crispness) and a skinned fill; + sprite_sheet.png."""
+    import tempfile
+    from PIL import Image, ImageDraw
+    out_dir = Path(out_dir or HERE / "test_frames" / "beings" / "sprite")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ctx, _win = hidden_context()
+    tmp = tempfile.mkdtemp()
+    pose = write_test_poses(tmp)
+    S = SPRITE
+    shots = [
+        ("look_image", dict(being_look=0), 0),
+        ("look_image_tint_rainbow", dict(being_look=0, being_tint=0.8, being_color=3), 0),
+        ("look_outline", dict(being_look=1), 0),
+        ("look_solid_rainbow", dict(being_look=2, being_color=3), 0),
+        ("look_solid_each", dict(being_look=2, being_color=4, being_count=5), 0),
+        ("look_solid_chase", dict(being_look=2, being_color=5, chase_phase=0.3), 0),
+        ("dance_march", dict(being_dance=1, being_count=5, being_size=0.35), 0),
+        ("dance_conga", dict(being_dance=2, being_count=6, being_size=0.35), 0),
+        ("dance_mirror", dict(being_dance=3, being_count=4, being_size=0.45), 0),
+        ("dance_bounce", dict(being_dance=4, being_count=4, being_size=0.45), 0),
+        ("dance_flock", dict(being_dance=5, being_count=7, being_size=0.3), 0),
+        ("closeup_crisp", dict(being_count=1, being_size=1.0, being_speed=0.0, being_look=2, being_glow=0.3), 0),
+        ("skinned_fill", dict(being_look=3, being_count=3, being_size=0.6), 1),
+    ]
+    tw, th, cols = 320, 200, 5
+    sheet = Image.new("RGB", (tw * cols, (th + 16) * math.ceil(len(shots) / cols)), (0, 0, 0))
+    dr = ImageDraw.Draw(sheet)
+    eng = None
+    for i, (tag, over, skinned) in enumerate(shots):
+        bp = BeingsPass(ctx, cell)
+        bp.sprite_sync, bp.sprite_path = True, str(pose)
+        try:
+            vals = default_values(being=S, being_count=3, being_size=0.6, being_frames=1, **over)
+            if skinned:
+                try:
+                    import materials as mt
+                    tex = sorted((HERE / "textures").glob("*.png"))
+                    if tex:
+                        st = mt.SkinState(on=True)
+                        st.do(mt.validate({"cmd": "skin", "op": "assign", "env": SKIN_ENV, "slot": "fill", "kind": "ai",
+                                           "name": tex[len(tex) // 2].name}))
+                        eng = mt.SkinEngine(ctx, mt.roots_for(), size=512, sync=True)
+                        for _ in range(30):
+                            eng.update(st.frame, 1 / 60, None, gl=True)
+                        bp.skins = eng
+                except Exception as ex:
+                    print("[beings] skinned cell skipped:", ex)
+            img = render_frames(bp, vals, frames=2, warm=6.0 + i)
+        finally:
+            bp.release()
+        im = Image.fromarray(img[..., :3])
+        im.save(out_dir / f"{tag}.png")
+        x, y = (i % cols) * tw, (i // cols) * (th + 16)
+        sheet.paste(im.resize((tw, th), Image.LANCZOS), (x, y))
+        dr.text((x + 4, y + th + 2), tag, fill=(200, 200, 200))
+    if eng is not None:
+        eng.release()
+    sheet.save(out_dir / "sprite_sheet.png")
+    print(f"[beings] sprite gallery -> {out_dir}")
+    return out_dir
+
+
 def bench(out_size=(1280, 800), frames=120):
     ctx, _win = hidden_context()
     bp = BeingsPass(ctx, out_size)
@@ -1461,6 +2115,8 @@ def bench(out_size=(1280, 800), frames=120):
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         bench()
+    elif "--sprite" in sys.argv:
+        sprite_gallery()
     elif "--colours" in sys.argv:
         colour_sheets()
     else:

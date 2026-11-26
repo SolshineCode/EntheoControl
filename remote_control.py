@@ -22,6 +22,8 @@ HTTP API (every request needs the token: `?k=<token>` or header `X-Token`):
   GET  /art-thumb/<name>   small cached JPEG of one art piece
   POST /upload             raw image body (png / jpeg / webp, <= 25 MB), header X-Filename -> art/<name>.png
   POST /art-delete         {"name": ...}
+  POST /library            {op: fav|unfav|pick|unpick|title|import|delete, kind: art|ai, name, title?} (image_library.py)
+                           import = AI image -> new art piece (prompt as title, deduped, quota) + a depth map job
   POST /dreamify           {name, source, preset, strength, octaves} -> proxied to ai_worker /dreamify (DREAMIFY)
   POST /dream-cancel       -> ai_worker /dream-cancel
   GET  /dream-status       -> {available, dream (progress or null), queue (dream jobs), done (dream results), error}
@@ -52,6 +54,7 @@ import flashguard
 import recorder
 import surfaces
 import shows                                         # show / preset files (export, import, thumbnails)
+import image_library                                 # one library: art uploads + AI / dreamed images (flags, import)
 try:                                                 # crowd camera (pure python at import; the webcam is in camera_worker.py)
     import camera_layer
 except Exception:
@@ -141,8 +144,8 @@ def validate_command(c):
         return surfaces.validate_cmd(c)
     if cmd == "art_pick":                            # source picker -> engine (live_visuals.art_pick): choose by name
         out = {"source": c.get("source", "art")}
-        if out["source"] not in ("art", "ai"):
-            raise ValueError("'source' must be \"art\" or \"ai\"")
+        if out["source"] not in ("art", "ai", "any"):    # any: the art piece of that name, else the AI texture
+            raise ValueError("'source' must be \"art\", \"ai\" or \"any\"")
         if c.get("name") not in (None, ""):
             name = c["name"]
             # art files are hand-dropped too (spaces, unicode): the engine only ever matches the name against its own
@@ -156,9 +159,10 @@ def validate_command(c):
         if "use" in c and c["use"] is not None:
             out["use"] = _int(c, "use", 0, 15)
         return control.passthrough(cmd, **out)
-    if cmd == "show_texture":                        # source picker: cross-fade to this file in textures/
+    if cmd == "show_texture":                        # source picker: cross-fade to this file in textures/ (or art/<name>)
         name = c.get("name")
-        if not isinstance(name, str) or not TEX_NAME.match(name) or ".." in name:
+        bare = name[4:] if isinstance(name, str) and name.startswith("art/") else name
+        if not isinstance(name, str) or not isinstance(bare, str) or not TEX_NAME.match(bare) or ".." in name:
             raise ValueError("'name' must be a texture file name")
         return control.passthrough(cmd, name=name)
     if cmd == "fold":
@@ -643,7 +647,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "art": art_listing(self.server.rc.art_dir)})
         elif path == "/sources":                     # source picker: uploaded art + AI / seed textures
             rc = self.server.rc
-            self._send(200, {"ok": True, "art": art_listing(rc.art_dir), "tex": tex_listing(rc.tex_dir)})
+            self._send(200, {"ok": True, "art": art_listing(rc.art_dir), "tex": tex_listing(rc.tex_dir),
+                             "items": image_library.listing(rc.art_dir, rc.tex_dir)})
         elif path == "/fonts":                       # text layer: installed fonts + the project's fonts/ folder
             try:
                 import text_layer
@@ -676,6 +681,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(204, b"", "image/jpeg")
         elif path == "/automap-image":               # AUTO MAP wizard picture (camera still + found faces), memory only
             data = automap.image_jpeg() if automap is not None else None
+            if data:
+                self._send(200, data, "image/jpeg")
+            else:
+                self._send(204, b"", "image/jpeg")
+        elif path.startswith("/online-snap/"):       # ASSISTANT: the exact picture of the output it sends (memory only;
+            on = getattr(control, "_online", None)   # 204 while ONLINE is off or the picture is gone)
+            data = on.served_snap(path[13:]) if on is not None else None
             if data:
                 self._send(200, data, "image/jpeg")
             else:
@@ -908,6 +920,7 @@ class _Handler(BaseHTTPRequestHandler):
             if body is None:
                 return
             try:
+                image_library.check_quota(rc.art_dir, len(body))
                 name = save_art(body, unquote(self.headers.get("X-Filename", ""))[:200], rc.art_dir)
             except ValueError as ex:
                 return self._send(400, {"ok": False, "error": str(ex)[:200]})
@@ -930,11 +943,53 @@ class _Handler(BaseHTTPRequestHandler):
         index = delete_art(self.server.rc.art_dir, name)
         if index < 0:
             return self._send(404, {"ok": False, "error": "no such art piece, or it could not be deleted"})
+        image_library.forget(self.server.rc.art_dir, "art", name)
         try:                                         # the controller keeps the same piece on screen
             self.server.rc._q.put_nowait({"cmd": "art_deleted", "i": index})
         except queue.Full:
             pass
         self._send(200, {"ok": True, "index": index})
+
+    def _library(self):
+        """POST /library: favourites / picked set / titles, AI image -> art piece, delete either kind."""
+        body = self._body(MAX_BODY)
+        if body is None:
+            return
+        rc = self.server.rc
+        try:
+            c = json.loads(body.decode("utf-8"))
+            if not isinstance(c, dict):
+                raise ValueError("body must be an object")
+            op, kind, name = c.get("op"), c.get("kind"), c.get("name")
+            title = c.get("title") if isinstance(c.get("title"), str) else None
+            if op == "import":
+                if kind != "ai":
+                    raise ValueError("only AI images are imported (art is already in the art library)")
+                art = image_library.import_ai(rc.tex_dir, rc.art_dir, name, title)
+                if not _depth_path(rc.art_dir, art).exists():
+                    request_depth(art, rc.ai_url, rc.token_paths)      # the relief fly-through wants one
+                names = [a["name"] for a in art_listing(rc.art_dir)]
+                return self._send(200, {"ok": True, "name": art, "index": names.index(art) if art in names else -1})
+            if op == "delete":
+                if kind == "art":
+                    index = delete_art(rc.art_dir, name)
+                    if index < 0:
+                        raise ValueError("no such art piece, or it could not be deleted")
+                    image_library.forget(rc.art_dir, "art", name)
+                    try:
+                        rc._q.put_nowait({"cmd": "art_deleted", "i": index})
+                    except queue.Full:
+                        pass
+                    return self._send(200, {"ok": True, "index": index})
+                if not image_library.delete(rc.art_dir, rc.tex_dir, kind, name):
+                    raise ValueError("the image could not be deleted")
+                return self._send(200, {"ok": True})
+            image_library.edit(rc.art_dir, rc.tex_dir, op, kind, name, title)
+            return self._send(200, {"ok": True})
+        except (ValueError, RecursionError, UnicodeDecodeError) as ex:
+            return self._send(400, {"ok": False, "error": str(ex)[:200]})
+        except OSError as ex:
+            return self._send(500, {"ok": False, "error": f"could not write ({type(ex).__name__})"})
 
     def _dream(self, path):
         body = self._body(4096)
@@ -979,6 +1034,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._upload()
         if path == "/art-delete":
             return self._art_delete()
+        if path == "/library":
+            return self._library()
         if path in ("/dreamify", "/dream-cancel"):
             return self._dream(path)
         if path in ("/preset-import", "/show-import", "/media-upload"):

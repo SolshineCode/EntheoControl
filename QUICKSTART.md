@@ -235,6 +235,7 @@ Fractal mode (KIFS, Mandelbox, hyperbolic, Apollonian, Julia, 4D polytope), morp
 - **Transition**: morph length and quantize.
 - **Autopilot**: Scene change ON / OFF, every 4-128 bars, order, hold palette family (0-16 phrases), drift (a slow random walk) with amount and a chip list of drifting params.
 - **Scene crossfader**: pick DECK A and DECK B, then drag to blend two scenes by hand (continuous faders blend, stepped ones flip at the middle).
+- **Transition** (same card as Morph and Quantize): the visual transition recalls use, with its beats, style, origin pad, END NOW / CANCEL, and SET FOR A SCENE… / the TRANSITION… scene mode. See [6.3b](#63b-transitions-doors-iris-portal-).
 
 ### 3.11 AI DREAM
 Prompt (Enter = generate, Shift+Enter = new line), negative prompt, count (1, 2, 4, 8), seed, SHOW WHEN READY, **GENERATE**, CANCEL QUEUE, **DREAM FROM CURRENT FRAME** with a strength fader (low = stay close to the frame), prompt presets, Results, Prompt history. With ONLINE on, an **Image engine** selector and the Gemini key row appear above the prompt. See [12](#12-ai-local-and-online).
@@ -357,7 +358,16 @@ Every layer has an opacity fader on LAYERS (and in PERFORM's live layers when it
 **Travel modes** (Travel mode, then push Travel into): 0 Zoom tunnel, 1 Tube (mandala) or ground and sky planes (flat), 2 Depth layers, 3 Droste spiral. Tunnel bend and Depth fade shape it; **Spin** barrel-rolls and **Spin twist** makes the far end lead.
 
 ### 5.2 Beings
-17 forms (`being`): Anaconda spirit, Feathered dragon, Jaguar spirit, Hummingbird, Butterflies & moths, Jellyfish, Manta rays, Koi, Firebird, All-seeing eyes, Light beings, Jester sprites, Octopus, Spirit vine, Fireflies, Whale, Kittens. **Variety** 0 = all the chosen form, 1 = every being a different form. **Colour mode** (beings and serpents separately): Show palette, Single hue, Two-tone, Rainbow, Each its own hue, Light chase. Bass pulses them, highs sparkle. All are generated archetypes, not copies of any artwork.
+18 forms (`being`): Anaconda spirit, Feathered dragon, Jaguar spirit, Hummingbird, Butterflies & moths, Jellyfish, Manta rays, Koi, Firebird, All-seeing eyes, Light beings, Jester sprites, Octopus, Spirit vine, Fireflies, Whale, Kittens, Sprite (your image). **Variety** 0 = all the chosen form, 1 = every being a different form. **Colour mode** (beings and serpents separately): Show palette, Single hue, Two-tone, Rainbow, Each its own hue, Light chase. Bass pulses them, highs sparkle. All are generated archetypes, not copies of any artwork.
+
+**Sprite (your image)** (being 17) animates a picture YOU supply. Your images stay on this laptop in `art/` and are never part of the repository; use only artwork you have the rights to.
+1. Put the image in `art/` (ART tab upload). A PNG with transparency works best: its outline becomes the creature's outline exactly. A JPG or a picture without transparency is keyed on its border colour (a plain background works).
+2. Several poses: name them `walk_1.png`, `walk_2.png`, ... (up to 8, numbered) and pick any one of them, or put up to 8 poses side by side in one image and set **Poses in a sheet** to the number of poses.
+3. BEINGS tab: switch **SKINS ON** on the "SPRITE CREATURE" card and drop your image (from any Sources picker) on the **SPRITE** tile. Set **Being** to "Sprite (your image)" and raise the Beings layer. Until you pick an image a generic stand-in figure dances.
+- **Dance**: Free dance, March in a line (one hop per beat), Conga line (a kick on beat 4), Mirror pairs (partners face each other), Bounce in place, Flock. **Bounce** = hop height + squash / stretch. **Spins** = how often one spins round. They face the way they walk; **Image faces** tells it which way your picture looks (or Never flip).
+- **Pose step**: every beat / half-beat / bar / two beats; **Pose crossfade** morphs one outline into the next.
+- **Sprite look**: Image (its own colours; **Sprite tint** blends in the colour mode), Glowing outline, Solid silhouette (colour modes: rainbow, each its own hue, light chase...), Skinned fill (drop any image or live layer, e.g. the kené study, on the **FILL** tile).
+- SVG drawings need the optional `cairosvg` package (not installed); export a PNG instead.
 
 ### 5.3 3D decks
 Four raymarched worlds (Sacred corridor, Torus wormhole, Prismatic vortex, Hex domes) on an A / B deck. Blend modes and "A warps B" combine them. Their colours come from the show palette, and folds, hue, travel, punch and the fly camera act on them.
@@ -382,6 +392,14 @@ Two generative study layers of the visual grammar documented in [research/kene_r
 - For a box face or a strip, use Field = Single panel or Band: they stay still and fill the surface cleanly.
 - Credit for public shows: "Generative study inspired by Shipibo-Konibo kené / Huni Kuin kenê kuin. For public shows, credit and collaborate with the originating communities. See research/kene_reference."
 
+### 5.6 Coil nest (serpent bodies)
+A frame-filling nest of 6 to 14 thick serpent bodies: no room and no sky. The bodies are the architecture, with pitch-black crevices between them. Textile-like kené-type skins slide along each body, neighbours in opposite directions, while the bodies slowly writhe and the camera breathes in and out. Inspired by the grammar of TAS Visuals' "Serpents" (2016); nothing of that piece is copied. Raise **Coil nest (serpent bodies)** on LAYERS; the **COILNEST** tab holds the rest. Off by default, and off costs nothing.
+- **Bodies** 6-14, **Thickness**, **Writhe / breathe**, **Skin slither**, **Camera breathing**, **Heads** (none = endless coils), **End caps** (medallion caps on the bodies that rise toward you).
+- **Gating**: every skin has four channels: primary lines, fine fill, cloth ground and jewel accents. With **Gating programme on the bar**, it walks Linework only, White engraving, Floating ground patches, Full embroidered cloth, Rim sweep, changing every 2 / 4 / 8 / 16 bars (**Bars per stage**). Changes are always slow fades (at least half a second), so no flicker. **Manual stage** lets the timeline, clips or a MIDI pad choose the **Stage**. **Gating depth** 0 = always the full cloth. **Primary lines / Fine fill / Cloth ground / Jewel accents / Rim sweep** scale each channel on top.
+- **Skin source**: Procedural kené (default); **SKINS slot** (switch SKINS on and drop an image or an AI texture on "Coil nest bodies": it becomes the cloth, and the lines stay on top); **Kené study channels** (the 4-channel line layer); **Engine layer** (pick one under **Layer as skin**: kené study, beads, Folding Blocks, beings, math stack, fractals, text, camera, video, filtered output).
+- **Follow show palette**, **Line glow**, **Black crevices** (1 = the nest hides everything under it, 0 = other layers show through the gaps), **Render scale** (the governor lowers it, and halves the body count, under load).
+- **Serpent skin (coil nest)** on MOTION dresses the classic serpents in the same skin and gating, even with the coil nest layer off.
+
 ---
 
 ## 6. Modulation, clock, scenes, autopilot
@@ -400,6 +418,17 @@ Every fader has two modulation slots. Final value = fader + amount × range × s
 
 ### 6.3 Scenes
 A scene stores every fader and its mods, the BUILD stack, skins, and a thumbnail. It does not store bypass switches. Recall waits for the quantize boundary and morphs over the chosen bars. Saved in `scenes.json`.
+
+### 6.3b Transitions (doors, iris, portal ...)
+MORPH (the faders glide) is what a recall does unless you pick a visual transition. A visual transition draws the new look a second time and opens it through the old one, like a door swinging open in the wall.
+- **Pick one**: SCENES tab, Transition card. MORPH, DOORS, SLIDING DOORS, CURTAINS, IRIS, PORTAL, PATTERN REVEAL, SHATTER / TILES, PEEL, DISSOLVE, WIPE, ZOOM THROUGH. Then **Beats** (1, 2, 4, 8, 16), **Style** (doors swing away or toward you; iris circle, polygon, star or kaleido; portal ring or white; reveal through the lines, the dark cells or the edges; shatter flip or fall; slide horizontal or vertical) and **Panels / sides / cells**. On PERFORM the same choice is one line (Transition + beats) next to Quantize.
+- **Origin**: drag the dot on the small Origin pad. Portal, iris, zoom and shatter start there.
+- **What uses it**: every scene pad recall (also MIDI pads and autopilot), theme restores you tap, and preset recalls. Timeline cues use only the transition stored in the cue, so old shows play exactly as before. **SET FOR A SCENE…** (or the TRANSITION… scene mode) gives one scene its own transition: pick a transition, press it, tap the pad. Pick MORPH first to clear a scene's own one.
+- **While it runs** the status line shows its progress. **END NOW** jumps to the new look, **CANCEL** stays on the old one. A second recall during a transition waits for it (the newest one wins). A MORPH recall makes the running transition finish within about a third of a second.
+- **Pattern reveal** uses the picture on the wall as the mask: the new scene shows first through the bright lines (kené lines, bead outlines, Folding Blocks cells), then the openings widen until it fills the frame.
+- **MIDI**: MIDI LEARN, then tap a transition button: a pad picks it (`transition:<kind>`). Learn the Beats row to a knob (`transition:len`). CANCEL is learnable too.
+- **Safety**: every visual transition lasts at least 0.5 s, the portal at least 1 s and the white portal at least 1.5 s (it never goes to pure white). The glow is an edge or a ring, never the whole frame. The flash guard still guards the result. PANIC ends a transition at once and goes to the safe look. If the governor reports strain the recall falls back to MORPH with one short dip through dark (never more than one dip a second).
+- **Cost**: nothing while no transition runs. During one, the new look is drawn at half size (a third of the size when the laptop is strained), so it looks slightly softer until it lands.
 
 ### 6.4 Autopilot
 Steps through saved scenes every 4-128 bars, in random or next order, can hold a palette family, and can drift chosen params slowly. It runs locally and calls no AI.

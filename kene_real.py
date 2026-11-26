@@ -43,6 +43,10 @@ try:
     import moderngl
 except ImportError:                                     # the CPU half (designs, colours, tests) works without GL
     moderngl = None
+try:
+    import kene_vector                                  # vector generators of the painted / embroidered studies
+except ImportError:                                     # (PIL missing): those two styles fall back to the tile renderer
+    kene_vector = None
 
 HERE = Path(__file__).resolve().parent
 TAU = 2.0 * math.pi
@@ -84,7 +88,16 @@ HK_COLOR_NAMES = ["Black & white", "Red / yellow / white", "Blue / turquoise / o
 HK_CYCLE = ["Hold", "Morph every 8 bars", "Morph every 16 bars", "Morph every 32 bars"]
 HK_CYCLE_BARS = [0, 8, 16, 32]
 HK_T = 48                                               # bead tile period
-OPTIONS = {"kene_style": STYLES, "kene_colors": COLOR_SETS, "kene_layout": LAYOUTS, "kene_pen": PEN,
+# semantic gating of the four channels (primary lines, fine fill, ground, accents), appended 2026-11-26: presets after
+# the layer isolations of a reference video analysed in research/critique/video_7pGV8fTCOGQ.md (sections 2, 4.2)
+GATES = ["Gains as set", "Linework only", "White engraving", "Floating ground patches", "Cell by cell fill",
+         "Full cloth, stitched"]
+GATE_GAINS = [(1, 1, 1, 1), (1, 0, 0, 1), (1, 1, 0, 0), (0, 1, 1, 0), (0, 1, 0, 0), (1, 1, 1, 1)]
+VEC_STYLES = {5: "A", 6: "B", 7: "C"}                         # styles drawn from kene_vector (continuous geometry)
+VEC_UNITS = (26, 30, 31)                                # private texture units of the vector design textures (bound per draw)
+AUTOPEN = ["Off (Drawn fader)", "Draw in: 16 bars", "Draw in: 32 bars", "Draw in: 64 bars"]
+AUTOPEN_BARS = [0, 16, 32, 64]
+OPTIONS = {"kene_autopen": AUTOPEN, "kene_gate": GATES, "kene_style": STYLES, "kene_colors": COLOR_SETS, "kene_layout": LAYOUTS, "kene_pen": PEN,
            "kene_pen_new": PEN_NEW, "kene_seed": [str(i + 1) for i in range(N_SEEDS)],
            "kene_form": FORMS, "hk_motif": HK_MOTIF_LABELS, "hk_medium": HK_MEDIA, "hk_colors": HK_COLOR_NAMES, "hk_cycle": HK_CYCLE}
 
@@ -694,6 +707,26 @@ def meander_fill(mask, rng, lo=3, hi=7, lab=None, order=None, wrap_x=False):
     return bits
 
 
+def s_fret(stroke=2, gap=1, hand=1):
+    """S-FRET (GRAMMAR_SPEC E): two square spirals of about one turn each, the second the first turned 180 degrees,
+    joined by one straight run, drawn with a `stroke`-bead line and `gap`-bead spaces. -> square bool mask."""
+    S = [(0, 0), (1, 0), (1, 1), (-1, 1), (-1, -1), (1, -1)]
+    B = [(-x + 2, -y - 2) for x, y in S]
+    path = S + B[::-1][1:]
+    if hand < 0:
+        path = [(-x, y) for x, y in path]
+    p = stroke + gap
+    xs, ys = [x for x, _ in path], [y for _, y in path]
+    x0, y0 = min(xs), min(ys)
+    n = (max(max(xs) - x0, max(ys) - y0)) * p + stroke
+    m = np.zeros((n, n), bool)
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        i0, i1 = sorted(((ax - x0) * p, (bx - x0) * p))
+        j0, j1 = sorted(((ay - y0) * p, (by - y0) * p))
+        m[j0:j1 + stroke, i0:i1 + stroke] = True
+    return m
+
+
 def fret_along(i, j, period=12, width=2, diagonal=False, hand=1):
     """0..1 position along the fret's spiral (ring + angle), for lighting beads one after another along it."""
     i, j = np.asarray(i, int), np.asarray(j, int)
@@ -759,7 +792,7 @@ def hk_tile(family, seed=0, size=HK_T):
         band = ((j + 8) // 16 + seed) % 3               # (14 pattern rows + a black row + a dotted orange selvedge)
         y = (j + 8) % 16 - 7.5
         ay = np.abs(y)
-        key = fret(i, j, 8, 1, diagonal=True)                               # 45 degree staircase key hooks, 2 turns
+        key = fret(i + 3, j + 3, 6, 1, diagonal=True)                             # 45 degree staircase key hooks, 2 turns
         r0 = np.where(key == 1, np.where(ay <= 1.5, 2, 1), 0)               # white on black, orange along the mid-line
         dd = (cen(i, 16) + np.floor(ay)).astype(int)                        # concentric diamonds, tips touching: three
         r1 = np.where((dd % 2 == 1) & (dd <= 6), 2, 0)                       # nested outlines one float wide, orange / black,
@@ -769,7 +802,7 @@ def hk_tile(family, seed=0, size=HK_T):
         r2 = np.where(e <= 2, np.where(e == 0, 0, 2), np.where((e == 4) | (e == 5) | (e == 8), 1, 0))   # white zigzag echoes
         role = np.where(band == 0, r0, np.where(band == 1, r1, r2))
         role = np.where(ay > 7.0, np.where(i % 2 == 0, 2, 0), np.where(ay > 6.0, 0, role))
-        along = np.where(band == 0, fret_along(i, j, 8, 1, True), (i / 24.0) % 1.0)
+        along = np.where(band == 0, fret_along(i + 3, j + 3, 6, 1, True), (i / 24.0) % 1.0)
     elif family == 6:                                   # E bead tiles: a grid of four different 22 x 22 tiles, gaps between
         ti, tj = (i // 24) % 2, (j // 24) % 2
         x, y = (i % 24) - 11.5, (j % 24) - 11.5
@@ -777,7 +810,11 @@ def hk_tile(family, seed=0, size=HK_T):
         d = (ax + ay).astype(int)                                           # 1, 2, ... from the tile centre outward
         frame = ombre(20 - d, 6)                                            # six ombré rings, one bead each, corners in
         xi, yi = np.floor(x).astype(int), np.floor(y).astype(int)
-        key = (fret(xi + 6, yi + 6, 12, 2, hand=1 if seed % 2 == 0 else -1) == 1) & (np.maximum(ax, ay) < 6)   # big S-fret,
+        sf = s_fret(2, 1, 1 if seed % 2 == 0 else -1)                       # big S-fret (two spirals),
+        n_ = sf.shape[0]
+        ki, kj = xi + n_ // 2, yi + n_ // 2
+        inn = (ki >= 0) & (ki < n_) & (kj >= 0) & (kj < n_)
+        key = inn & sf[np.clip(kj, 0, n_ - 1), np.clip(ki, 0, n_ - 1)]
         t0 = np.where(d <= 13, np.where(key, WHITE_ROLE, 0), np.where(d == 14, 7, frame))                    # 2 beads wide
         eyes = (np.abs(ax - 3.0) <= 1.0) & (np.abs(ay - 3.0) <= 1.0)        # four eyes: 2 x 2 squares, outlined
         ring = (np.abs(ax - 3.0) <= 2.0) & (np.abs(ay - 3.0) <= 2.0) & ~eyes
@@ -785,7 +822,8 @@ def hk_tile(family, seed=0, size=HK_T):
         ov = np.sqrt(((ax - 4.5) / 3.0) ** 2 + (ay / 6.5) ** 2)             # eye pair: two upright ovals on an ombré ground
         t2 = np.where(ov <= 1.0, np.where((np.abs(ax - 4.5) < 1.0) & (ay < 3.0), 0, WHITE_ROLE),
                       np.where(ov <= 1.25, 0, ombre(np.floor((ov - 1.25) * 5.0).astype(int), 6)))
-        key2 = (fret(xi + 6, yi + 6, 12, 2, hand=-1 if seed % 2 == 0 else 1) == 1) & (np.maximum(ax, ay) < 6)
+        sf2 = s_fret(2, 1, -1 if seed % 2 == 0 else 1).T                    # the same key turned a quarter
+        key2 = inn & sf2[np.clip(kj, 0, n_ - 1), np.clip(ki, 0, n_ - 1)]
         t3 = np.where(d <= 13, np.where(key2, WHITE_ROLE, 8), np.where(d == 14, 0, ombre(d - 15, 6)))   # mirrored key on a
         role = np.where(ti == 0, np.where(tj == 0, t0, t2), np.where(tj == 0, t1, t3))
         role = np.where((ax > 11.0) | (ay > 11.0), 0, role)                 # the gap between tiles
@@ -876,7 +914,8 @@ def style_uniforms(values, palette):
         cols = list(THREADS[cset])
     out = dict(ground=(0.0, 0.0, 0.0), ground_on=0.0, stitch=0.0, bead=0.0, tier=(1.0, 0.9, 0.72), border=0.0,
                acc=ACCENTS, arm=None, echo2=None, dense=False, arm_w=None, acc_on=1.0, twig=0.0, frame=None, wob=0.0,
-               form=None, hair=0.0, knob=1.0, cborder=0.0)
+               form=None, hair=0.0, knob=1.0, cborder=0.0, vec=None, ink=0.0, emit=(1.0, 0.95, 0.86),
+               fillc=(1.0, 1.0, 1.0))
     if cset == 0:
         out["acc"] = tuple(tuple(_bright(pal[n])) for n in (3, 1, 2))
     if style == 1:                                      # mud-dyed cotton: chocolate / black on cream, one ink
@@ -909,10 +948,53 @@ def style_uniforms(values, palette):
         w = [0.24, 0.20, 0.20]                           # orange outer + yellow inner outline; fill line = half its spacing
     if style == 2:
         out["border"] = 1.0
+    if style in (1, 3, 5, 6):                           # dark ink on a lit ground: with the ground gated off the ink
+        out["ink"] = 1.0                                # turns to light (white engraving on black)
+    if style in VEC_STYLES and kene_vector is not None:
+        out["vec"] = VEC_STYLES[style]
+        g, fc = {5: (kene_vector.A_GROUND, kene_vector.A_INK), 6: (kene_vector.B_FIELD, kene_vector.B_INK),
+                 7: (kene_vector.C_GROUND, kene_vector.C_FILL)}[style]
+        out["ground"], out["fillc"] = tuple(c / 255.0 for c in g), tuple(c / 255.0 for c in fc)
     out.update(cols=[tuple(float(x) for x in c) for c in cols], w=tuple(w))
     out["arm"] = tuple(out["arm"] or out["cols"][0])
     out["echo2"] = tuple(out["echo2"] or out["cols"][1])
     return out
+
+
+def gate_state(values):
+    """{gains (primary, fill, ground, accents), mode, mono}: the gate preset times the four gain faders. mode 3 = ground
+    only through a travelling noise mask, 4 = the fill lights cell by cell; mono = white engraving."""
+    g = _idx(values, "kene_gate", len(GATES))
+    fad = [_val(values, n, 1.0, 0.0, 1.0) for n in ("kene_g_line", "kene_g_fill", "kene_g_ground", "kene_g_jewel")]
+    gains = tuple(float(a * b) for a, b in zip(GATE_GAINS[g], fad))
+    return dict(gate=g, gains=gains, mode=float(g if g in (3, 4) else 0), mono=1.0 if g == 2 else 0.0,
+                stitch=1.0 if g == 5 else 0.0)
+
+
+def content_map(gx, gy, inner, crot=0.0, zoom=1.0, crawl=(0.0, 0.0)):
+    """numpy twin of the shader's contentMap (tests): rotate / zoom / crawl inside the scrolling rect, mirror wrap."""
+    gx, gy = np.asarray(gx, float), np.asarray(gy, float)
+    lo, hi = np.array(inner[:2], float), np.array(inner[2:], float)
+    sz = np.maximum(hi - lo, 1e-3)
+    c = 0.5 * (lo + hi)
+    dx, dy = gx - c[0], gy - c[1]
+    co, si = math.cos(crot), math.sin(crot)
+    qx = (co * dx + si * dy) / zoom + c[0] + crawl[0] * 2 * sz[0]      # GLSL mat2(c,-s,s,c) * v = (c x + s y, -s x + c y)
+    qy = (-si * dx + co * dy) / zoom + c[1] + crawl[1] * 2 * sz[1]
+    mx = lo[0] + sz[0] - np.abs(np.mod(qx - lo[0], 2 * sz[0]) - sz[0])
+    my = lo[1] + sz[1] - np.abs(np.mod(qy - lo[1], 2 * sz[1]) - sz[1])
+    inside = (gx >= lo[0]) & (gy >= lo[1]) & (gx <= hi[0]) & (gy <= hi[1])
+    return np.where(inside, mx, gx), np.where(inside, my, gy)
+
+
+def swim_map(gx, gy, inner, amp, ph):
+    """numpy twin of the shader's swim warp."""
+    gx, gy = np.asarray(gx, float), np.asarray(gy, float)
+    e = np.minimum(np.minimum(gx - inner[0], inner[2] - gx), np.minimum(gy - inner[1], inner[3] - gy))
+    t = np.clip(e / 8.0, 0.0, 1.0)
+    m = t * t * (3 - 2 * t)
+    return (gx + amp * m * (np.sin(gy * 0.17 + ph[0]) + 0.5 * np.sin(gx * 0.09 - ph[1])),
+            gy + amp * m * (np.sin(gx * 0.15 + ph[1]) + 0.5 * np.sin(gy * 0.11 + ph[0] + 1.7)))
 
 
 def pen_state(values, beat):
@@ -921,6 +1003,8 @@ def pen_state(values, beat):
     seed = _idx(values, "kene_seed", N_SEEDS)
     draw = _val(values, "kene_draw", 1.0, 0.0, 1.0)
     bars = PEN_BARS[_idx(values, "kene_pen", len(PEN))]
+    if not bars and _val(values, "kene_motion", 0.0, 0.0, 1.0) > 0.0:     # the automatic pen (default on)
+        bars = AUTOPEN_BARS[_idx(values, "kene_autopen", len(AUTOPEN))]
     if not bars:
         return dict(progress=draw, seed=seed, next_seed=seed, fade=1.0)
     cyc = max(_num(beat), 0.0) / (4.0 * bars)
@@ -961,12 +1045,22 @@ uniform float uArmW, uAccOn, uTwig, uWob, uFrameOn, uHOmb, uHair, uKnob, uCBorde
 uniform vec3 uFrame;
 uniform float uGroundOn, uStitch, uBead, uRound, uCurve, uFill, uDraw, uFlow, uFlowPh, uBreath, uGlow;
 uniform float uChase, uChasePh, uChaseW, uBass, uHigh;
-uniform float uHB, uHNB, uHMed, uHSeq, uHSeqPh, uHGlow, uHMorph, uHT;
+uniform float uHB, uHNB, uHMed, uHSeq, uHSeqPh, uHGlow, uHMorph, uHT, uHStudy;
 uniform vec2 uHFam, uHScroll;  // family now / next; bead scroll (wrapped at the tile period)
 uniform float uHPolar;
 uniform vec3 uHC[8];
-in vec2 v_uv; out vec4 f;
+uniform sampler2D uV0, uV1, uV2;      // vector design (kene_vector): coverage RGBA, primary colour + cell id, accent colour
+uniform float uVec, uInk, uMono, uGateMode, uGateT;
+uniform vec4 uGate;                   // gains: primary lines, fine fill, ground, accents (gate preset x faders)
+uniform vec3 uEmit, uFillC;           // light colour of dark ink once the ground is gated off; vector fill colour
+uniform float uCRot, uCZoom, uFRot, uSwimA;   // content rotation / zoom (panel, medallion), field sway, swim amount (u)
+uniform vec2 uCrawl, uSwimPh;         // content scroll (fraction of the mirror period), swim phases
+uniform vec4 uInner;                  // the scrolling rect of the design (tile / u units); outside it = a fixed border
+in vec2 v_uv;
+layout(location = 0) out vec4 f;
+layout(location = 1) out vec4 fch;    // semantic channels: R primary, G fine fill, B ground, A accents
 const float TAU = 6.28318530718, PI = 3.14159265359;
+vec4 gCh = vec4(0.0);
 float max3(vec3 c){ return max(c.r, max(c.g, c.b)); }
 mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
 float tri(float x){ return abs(fract(x)-0.5)*2.0; }
@@ -979,6 +1073,95 @@ float stroke(float d, float w, float fw){
 }
 float seg(vec2 p, vec2 e){ return length(p - e*clamp(dot(p,e)/dot(e,e), 0.0, 1.0)); }
 
+// sine hash in the form used in Inigo Quilez's MIT-licensed shaders, Copyright (c) 2013 Inigo Quilez, MIT License (THIRD_PARTY_NOTICES.md)
+float hash1(float x){ return fract(sin(x*127.1 + 3.7)*43758.5453); }
+float vnoise(vec2 p){                                  // value noise from hash1 (smooth, 0..1)
+  vec2 i = floor(p), u = fract(p); u = u*u*(3.0-2.0*u);
+  float a = hash1(i.x + 57.0*i.y), b = hash1(i.x + 1.0 + 57.0*i.y), c = hash1(i.x + 57.0*(i.y+1.0)), d = hash1(i.x + 1.0 + 57.0*(i.y+1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// gate masks of one cell: ground patches drifting through the field (mode 3), fill lighting cell by cell (mode 4)
+void gateMasks(float id, vec2 g, out float mG, out float mF){
+  mG = 1.0; mF = 1.0;
+  if (uGateMode > 2.5 && uGateMode < 3.5) {          // whole cells of cloth float up and sink, each in its own time
+    float x = fract(hash1(id*1.37)*7.0 + uGateT*0.15);
+    mG = smoothstep(0.0, 0.08, x)*(1.0 - smoothstep(0.30, 0.38, x));
+    mF = mG;
+  } else if (uGateMode > 3.5) {
+    float x = fract(hash1(id*2.11)*5.0 + uGateT*0.5);
+    mF = smoothstep(0.0, 0.05, x)*(1.0 - smoothstep(0.22, 0.32, x));
+  }
+}
+
+// the vector studies (painted A, embroidered C): g in u (0..uGrid.xy = the panel), fw = one pixel in u
+vec4 vecShade(vec2 g, float fw, float prog, float cloth){
+  vec2 uv = g/uGrid.xy;
+  vec2 e2 = min(uv, 1.0-uv)*uGrid.xy;                  // u inside the panel edge
+  float inside = smoothstep(-0.5*fw, 0.5*fw, min(e2.x, e2.y));
+  vec2 dx = vec2(fw/uGrid.x, 0.0), dy = vec2(0.0, fw/uGrid.y);
+  vec4 cv = textureGrad(uV0, uv, dx, dy), pc = textureGrad(uV1, uv, dx, dy), ac = textureGrad(uV2, uv, dx, dy);
+  float id = floor(textureLod(uV1, uv, 0.0).a*255.0 + 0.5);
+  float lod0 = log2(max(fw*float(textureSize(uV0, 0).y)/uGrid.y, 1e-3));
+  // the pen: outward from the centre; primary first, the fill after
+  float ord = clamp(length(g - 0.5*uGrid.xy)/(0.5*length(uGrid.xy)), 0.0, 1.0);
+  float e = 0.035, o = ord*0.55;
+  float rP = smoothstep(o, o+e, prog), rT = smoothstep(o+0.30, o+0.30+e, prog), rA = smoothstep(o+0.12, o+0.12+e, prog);
+  float head = cv.r*rP*(1.0-smoothstep(o+e, o+4.0*e, prog))*step(prog, 0.999);
+  float x = fract(ord*3.0 - uFlowPh), pulse = x*x*x*x*(1.0-smoothstep(0.94, 1.0, x));
+  float cw = abs(fract(ord - uChasePh + 0.5) - 0.5)*2.0;
+  float lit = mix(1.0, 0.10 + 0.90*(1.0 - smoothstep(0.5*uChaseW, uChaseW, cw)), uChase);
+  float mG, mF; gateMasks(id, g, mG, mF);
+  float gG = uGate.z*mG*cloth*inside;
+  float kG = cv.b*gG, kF = cv.g*uGate.y*mF*rT*uFill*inside, kP = cv.r*uGate.x*rP*inside, kA = cv.a*uGate.w*rA*uAccOn*inside;
+  if (uGateMode > 2.5 && uGateMode < 3.5) {          // patches keep the cell shapes: off the lines and their gaps
+    float near = 1.0 - smoothstep(0.12, 0.45, textureLod(uV0, uv, max(lod0, 0.0) + 2.3).r);
+    kG *= (1.0 - cv.r)*near; kF *= (1.0 - cv.r)*near;
+  }
+  if (uStitch > 0.5) {                                 // embroidery: slanted stitch dashes along every line, cross-stitch grain
+    float sf = 1.0 - smoothstep(0.10, 0.22, fw);
+    float d1 = abs(fract((g.x + g.y)*2.2) - 0.5), d2 = abs(fract((g.x - g.y)*2.2) - 0.5);
+    float dash = mix(1.0, 0.62 + 0.38*smoothstep(0.08, 0.22, d1), sf);
+    kP *= dash; kF *= dash; kA *= mix(1.0, 0.80 + 0.20*smoothstep(0.08, 0.22, d1), sf);
+    kG *= mix(1.0, 0.86 + 0.14*smoothstep(0.05, 0.25, min(d1, d2)), sf);
+  }
+  float em = uInk*(1.0 - uGate.z*mG);                 // dark ink becomes light when the ground is gated off
+  vec3 P = pc.rgb, A = ac.rgb, Fc = mix(uFillC, uEmit*0.80, em);
+  if (em > 0.0) {
+    P = mix(P, cv.r*uEmit, em);
+    A = mix(A, cv.a*uEmit, em*(1.0 - smoothstep(0.10, 0.30, max3(A)/max(cv.a, 1e-3))));
+  }
+  if (uMono > 0.5) { P = mix(P, cv.r*vec3(1.0), 0.85); Fc = mix(Fc, vec3(0.92), 0.85); A = mix(A, cv.a*vec3(1.0), 0.6); }
+  float br = 1.0 + 0.04*uBreath + 0.06*uFlow*pulse*lit;
+  vec3 col = uGround*kG*br;
+  col = mix(col, Fc, kF);
+  col = col*(1.0 - kP) + P*(kP/max(cv.r, 1e-3))*mix(1.0, lit, 0.5);
+  col = col*(1.0 - kA) + A*(kA/max(cv.a, 1e-3));
+  float glow = textureLod(uV0, uv, max(lod0, 0.0) + 3.6).r;   // a soft halo: a coarse mip of the primary coverage
+  vec3 gc = mix(uEmit, pc.rgb/max(cv.r, 1e-3), 1.0 - uInk);
+  col += gc*uGlow*0.35*glow*rP*uGate.x*(1.0 - kP)*(1.0 - uGate.z*mG*0.85)*inside;
+  col = mix(col, max(col, uEmit), 0.5*head*uGate.x);
+  gCh = vec4(kP, kF, kG, kA);
+  return vec4(col, max(max(kG, kF), max(kP, kA)));
+}
+
+// single panel / medallion motion: the content inside the scrolling rect turns, zooms and crawls; it is wrapped by
+// MIRRORING (seamless for any design, every frame, at any crawl); the border band outside the rect stays put
+vec2 contentMap(vec2 g, bool keepBorder){
+  vec2 lo = uInner.xy, hi = uInner.zw, sz = max(hi - lo, vec2(1e-3));
+  if (keepBorder && (g.x < lo.x || g.y < lo.y || g.x > hi.x || g.y > hi.y)) return g;
+  vec2 c = 0.5*(lo + hi);
+  vec2 q = rot(uCRot)*(g - c)/uCZoom + c + uCrawl*2.0*sz;
+  return lo + sz - abs(mod(q - lo, 2.0*sz) - sz);
+}
+vec2 swim(vec2 g){                                    // gentle flowing warp (amplitude uSwimA u, slope < 0.1: widths stay)
+  if (uSwimA <= 0.0) return g;
+  vec2 lo = uInner.xy, hi = uInner.zw;
+  vec2 e = min(g - lo, hi - g);
+  float m = smoothstep(0.0, 8.0, min(e.x, e.y));       // the fixed border does not swim (eased over 8 u)
+  return g + uSwimA*m*vec2(sin(g.y*0.17 + uSwimPh.x) + 0.5*sin(g.x*0.09 - uSwimPh.y),
+                           sin(g.x*0.15 + uSwimPh.y) + 0.5*sin(g.y*0.11 + uSwimPh.x + 1.7));
+}
+
 vec4 tileAt(ivec2 ij, float v){
   int nx = int(uGrid.x), ny = int(uGrid.y);
   if (uWrap > 0.5) ij.x = int(mod(float(ij.x), uGrid.x));
@@ -989,7 +1172,9 @@ vec4 tileAt(ivec2 ij, float v){
 // g: position in fine tiles; fw: one pixel in tiles; v: design variant; prog: pen progress; cloth: lit ground mask
 vec4 shipibo(vec2 g, float fw, float v, float prog, float cloth){
   float disc = 1.0, sfw = fw;
+  g = swim(g);
   if (uWob > 0.0) g += uWob*0.07*vec2(sin(g.y*1.05 + 0.6*sin(g.x*0.37)), sin(g.x*0.95 + 1.7 + 0.6*sin(g.y*0.31)));   // hand-drawn
+  if (uVec > 0.5) return vecShade(g, fw, prog, cloth);
   if (uBead > 0.0) {                                   // beadwork: one decision per bead, drawn as a round bead
     vec2 gb = g*uBead, bc = fract(gb)-0.5; float bfw = fw*uBead;
     disc = (1.0 - smoothstep(0.40-bfw, 0.40+bfw, length(bc))) * (0.72 + 0.5*(1.0-smoothstep(0.0, 0.30, length(bc-vec2(-0.10, 0.12)))));
@@ -1075,6 +1260,20 @@ vec4 shipibo(vec2 g, float fw, float v, float prog, float cloth){
       cG = (cb & 64) != 0 ? uAcc[0] : uCol[0];
     }
   }
+  {                                                    // the gate: four semantic channels, each with its own gain
+    float mG, mF; gateMasks(floor(t0.r*255.0 + 0.5), g, mG, mF);
+    aP *= uGate.x; kA *= uGate.x; aGem *= uGate.x; aS *= uGate.y*mF; aT *= uGate.y*mF; kB *= uGate.w;
+    float em = uInk*uGroundOn*(1.0 - uGate.z*mG);
+    cloth *= uGate.z*mG;
+    col = uGround*uGroundOn*cloth;
+    if (em > 0.0) {
+      cP = mix(cP, uEmit, em); cS = mix(cS, uEmit, em); cT = mix(cT, uEmit*0.8, em); cA = mix(cA, uEmit, em);
+      cG = mix(cG, uEmit, em*(1.0 - step(0.3, max3(cG)))); cB = mix(cB, uEmit, em*(1.0 - step(0.3, max3(cB))));
+    }
+    if (uMono > 0.5) {
+      cP = mix(cP, vec3(1.0), 0.85); cS = mix(cS, vec3(1.0), 0.85); cT = mix(cT, vec3(0.92), 0.85); cA = mix(cA, vec3(1.0), 0.85);
+    }
+  }
   if (uGroundOn > 0.5) {                               // ink on cloth / slip: the light travels as a soft lift of the ground
     kP = aP*rP; kS = aS*rS; kT = aT*rT;
     col *= 0.90 + 0.10*uBreath + 0.10*uFlow*pulse*lit;
@@ -1093,6 +1292,7 @@ vec4 shipibo(vec2 g, float fw, float v, float prog, float cloth){
     col += mix(uCol[0], vec3(1.0), 0.6)*head*0.55;
   }
   float al = max(uGroundOn*cloth, max(max(kP, max(kA, aGem)), max(kS, max(kT, kB))));
+  gCh = vec4(max(kP, max(kA, aGem)), max(kS, kT), uGroundOn*cloth, kB)*(uBead > 0.0 ? disc : 1.0);
   return vec4(col*disc, uBead > 0.0 ? al*min(1.0, disc*1.4) : al);
 }
 
@@ -1114,9 +1314,9 @@ vec4 shipiboLayout(vec2 P, float px){
       q = rot(uCurve*0.16*env*sin(PI*min(length(u), 1.0)))*q;
       q += uCurve*0.75*ts*env*vec2(sin(3.0*PI*u.y)+0.5*sin(5.0*PI*u.x), -sin(3.0*PI*u.x)-0.5*sin(5.0*PI*u.y));
     }
-    vec2 g = q/ts + 0.5*N; float fw = px/ts*(1.0+0.6*uCurve);
+    vec2 g = contentMap(q/ts + 0.5*N, uLay == 0);      // a medallion shows the pattern only (its own ring frame) float fw = px/ts*(1.0+0.6*uCurve)/uCZoom;
     if (uLay == 0) {
-      vec2 o = abs(P) - 0.5*N*ts, oc = o - (uBorder > 0.5 ? 7.4 : (uFrameOn > 0.5 ? 0.085/ts : 1.3))*ts;
+      vec2 o = abs(P) - 0.5*N*ts, oc = o - (uVec > 0.5 ? 0.0 : (uBorder > 0.5 ? 7.4 : (uFrameOn > 0.5 ? 0.085/ts : 1.3)))*ts;
       float cloth = 1.0 - smoothstep(-px, px, max(oc.x, oc.y));
       vec4 s = shipibo(g, fw, 0.0, uDraw, cloth);
       float d = max(o.x, o.y)/ts;
@@ -1162,6 +1362,7 @@ vec4 shipiboLayout(vec2 P, float px){
     b.a = max(max(uGroundOn*cloth*(1.0-inside), rl.a), max(zz, a0));
     return vec4(s.rgb + b.rgb*(1.0-s.a), max(s.a, b.a));
   }
+  if (uLay != 0 && uLay != 3) P = rot(uFRot)*P/uCZoom;  // the other layouts: the field itself sways / zooms
   if (uLay == 2) {                                     // band: a frieze that repeats along x, bordered above and below
     float ts = 0.5/N.y;
     vec2 g = vec2(P.x/ts + uScroll.x*N.x, P.y/ts + 0.5*N.y); float fw = px/ts;
@@ -1185,12 +1386,18 @@ vec4 shipiboLayout(vec2 P, float px){
   vec2 id = floor(pc), loc = fract(pc)-0.5;
   if (uLay == 5) id.x = mod(id.x, uFolds);
   float ts = 0.84/N.y, fw = sc/ts;
+  vec2 win = vec2(0.0);
+  if (uVec > 0.5) {                                    // vector design: each cell shows a window of the panel (40 %),
+    ts = 0.84/(0.4*N.y); fw = sc/ts;                   // shifted per cell, never into the border band
+    win = (vec2(hash1(id.x*7.1 + id.y*13.7), hash1(id.x*3.3 - id.y*9.1 + 5.0)) - 0.5)*0.3*(uInner.zw - uInner.xy);
+  }
   float v = mod(id.x + 2.0*mod(id.y, 2.0), uGrid.z);
   float rank = mod(id.x*3.0 + id.y*5.0, 8.0)/8.0;       // panel by panel: each cell is drawn in its turn
   float prog = clamp(uDraw*1.7 - 0.7*rank, 0.0, 1.0);
   vec2 o = abs(loc) - 0.5*N*ts - 1.2*ts;
   float cloth = 1.0 - smoothstep(-sc, sc, max(o.x, o.y));
-  vec4 s = shipibo(loc/ts + 0.5*N, fw, v, prog, cloth);
+  vec4 s = shipibo(loc/ts + 0.5*N + win, fw, v, prog, cloth);
+  if (uVec > 0.5) return s * (1.0 - smoothstep(2.5, 5.0, fw));   // (mipmapped: only the very centre fades)
   return s * (1.0 - smoothstep(0.30, 0.60, fw));         // too small to draw (centre of the tunnel): fade to black
 }
 
@@ -1209,8 +1416,11 @@ vec3 beadCol(vec2 b, out float lit){                    // colour of bead b (int
   }
   float role = floor(t.r*255.0+0.5);
   float x = fract(t.g*2.0 + role*0.17 - uHSeqPh);
-  lit = (0.62 + 0.38*(1.0-uHSeq) + uHSeq*(0.75*x*x*x*x + 0.25*uHigh*step(0.93, hash21(m+floor(uHSeqPh*4.0))))) * dip;
-  if (role < 0.5) { lit = 0.0; return vec3(0.0); }
+  lit = (mix(0.62 + 0.38*(1.0-uHSeq), 0.88 + 0.12*(1.0-uHSeq), uHStudy) + uHSeq*(0.75*x*x*x*x + 0.25*uHigh*step(0.93, hash21(m+floor(uHSeqPh*4.0))))) * dip;
+  if (role < 0.5) {                                     // ground: the reference studies have black beads / floats
+    if (uHStudy > 0.5) { lit = 1.0; return vec3(0.016); }   // (dark, with their highlight); older motifs: no bead
+    lit = 0.0; return vec3(0.0);
+  }
   if (role > 8.5) return vec3(1.0, 0.97, 0.92);         // white: the key / eye inside an ombré frame
   if (role > 6.5) return uHC[int(role-1.0)];            // the two key colours of the colourway
   if (uHOmb > 0.0) {                                    // ombré cycling: the ramp slides ring by ring, cross-faded
@@ -1275,6 +1485,7 @@ void main(){
   vec3 col = H.rgb*(1.0-S.a) + S.rgb;
   col = max(col, 0.0); col /= max(1.0, max3(col));       // hue-preserving: never white-out
   f = vec4(col, clamp(S.a + H.a*(1.0-S.a), 0.0, 1.0));
+  fch = clamp(gCh*uAmtS + vec4(H.a*(1.0 - S.a), 0.0, 0.0, 0.0), 0.0, 1.0);
 }
 """
 
@@ -1285,8 +1496,11 @@ PAN_WRAP = POLAR_WRAP = 8.0                             # panels: variant (mod 4
 
 class DesignBuilder:
     """Builds tile maps on a daemon thread. request(key) queues (newest first), get(key) -> array | None, never blocks.
-    key = (seed, gx, gy, variants, wrap_x, form). The cache keeps the 48 most recent maps (about 20-60 kB each)."""
+    key = (seed, gx, gy, variants, wrap_x, form). The cache keeps the 48 most recent maps (about 20-60 kB each).
+    Vector keys ("vec", kind, seed, scale, aspect, tex_h, weight) build kene_vector designs (about 30 MB each at
+    1280 px): at most KEEP_VEC of them are kept."""
     KEEP = 48
+    KEEP_VEC = 3
 
     def __init__(self):
         import threading
@@ -1298,6 +1512,9 @@ class DesignBuilder:
 
     @staticmethod
     def make(key):
+        if key[0] == "vec":
+            _v, kind, seed, scale, aspect, tex_h, weight = key
+            return kene_vector.vector_design(kind, seed, scale, aspect, tex_h, weight)
         seed, gx, gy, nv, wrap, form = key
         return np.concatenate([shipibo_design(seed * 7 + v, gx, gy, wrap, form) for v in range(nv)], axis=0)
 
@@ -1308,6 +1525,9 @@ class DesignBuilder:
             self._cache[key] = data
             while len(self._cache) > self.KEEP:
                 self._cache.pop(next(iter(self._cache)))
+            vec = [k for k in self._cache if k[0] == "vec"]
+            for k in vec[:max(0, len(vec) - self.KEEP_VEC)]:
+                self._cache.pop(k)
             self.built += 1
             self.build_threads.add(threading.get_ident())
 
@@ -1378,8 +1598,17 @@ class KenePass:
         self._tex = ctx.texture(self.out_size, 4)
         self._tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._tex.repeat_x = self._tex.repeat_y = False
-        self._fbo = ctx.framebuffer(color_attachments=[self._tex])
+        # second output: the four SEMANTIC channels of the line layer on screen (R primary lines, G fine fill, B ground,
+        # A accents), after the pen, the gate and the gains, before colour: a skin source / mask for other passes
+        self.channels = ctx.texture(self.out_size, 4)
+        self.channels.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.channels.repeat_x = self.channels.repeat_y = False
+        self._fbo = ctx.framebuffer(color_attachments=[self._tex, self.channels])
         self._fbo.clear(0.0, 0.0, 0.0, 0.0)
+        self._vfront, self._vback = [], []               # vector design textures (cov, prim, acc), mipmapped
+        self._vback_key, self._vback_row, self._vback_done = None, 0, False
+        self._vdims = self._vdims_back = (1.0, 1.0)
+        self._vinner_back = None
         self._blank = True
         self.draws = 0
         self._dtex, self._dkey = None, None
@@ -1395,12 +1624,74 @@ class KenePass:
         self.hk_scroll = [0.0, 0.0]                      # beads (wrapped at HK_T)
         self.hk_polar = 0.0
         self.rot = 0.0
+        self.crawl = [0.0, 0.0]                          # single panel / medallion content scroll (fraction of the mirror period)
+        self.swim_ph = [0.0, 0.0]                        # swim warp phases (wrapped at TAU)
+        self.sway_ph = 0.0                               # rotate / zoom breathing phase (wrapped at TAU)
+        self._inner = None                               # the scrolling rect of the current design (u / tiles)
         self._hk_now = self._hk_next = self._hk_want = None
         self._hk_morph = 0.0
         self._last_t = None
         self._blend_on = _blend_query()
 
     # ---------------------------------------------------------------- tile textures
+    def _tex_h(self):
+        """Vector design texture height: ~1.6 x the output height (sharp after the panel shrinks it), 512..1536."""
+        return int(min(1536, max(512, round(self.out_size[1] * 1.6 / 64.0) * 64)))
+
+    def _vkey(self, kind, seed, scale, weight):
+        return ("vec", kind, int(seed), round(float(scale) * 8.0) / 8.0,
+                round(self.out_size[0] / self.out_size[1], 2), self._tex_h(), round(float(weight) * 4.0) / 4.0)
+
+    def _ready(self, key):
+        if key[0] != "vec":
+            return self.builder.get(key) is not None
+        return self._vpump(key)
+
+    VROWS = 192
+
+    def _vpump(self, key):
+        """Stage vector design `key` into the back textures, VROWS rows per frame (a 30 MB design never stalls one
+        frame); True once it is complete (mipmaps built) and can be swapped in."""
+        if self._vback_key == key and self._vback_done:
+            return True
+        data = self.builder.get(key)
+        if data is None:
+            return False
+        arrs = (data["cov"], data["prim"], data["acc"])
+        h, w = arrs[0].shape[:2]
+        if self._vback_key != key:
+            if not self._vback or self._vback[0].size != (w, h):
+                for t in self._vback:
+                    t.release()
+                self._vback = []
+                for _n in range(3):
+                    t = self.ctx.texture((w, h), 4, alignment=1)
+                    t.repeat_x = t.repeat_y = False
+                    self._vback.append(t)
+            self._vback_key, self._vback_row, self._vback_done = key, 0, False
+        r0 = self._vback_row
+        r1 = h if self.sync else min(h, r0 + self.VROWS)
+        for t, a in zip(self._vback, arrs):             # GL row 0 is the bottom row: rows are flipped on the way
+            t.write(np.ascontiguousarray(a[h - r1:h - r0][::-1]).tobytes(), viewport=(0, r0, w, r1 - r0))
+        self._vback_row = r1
+        if r1 >= h:
+            for t in self._vback:
+                t.build_mipmaps()
+                t.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                try:
+                    t.anisotropy = 4.0
+                except Exception:
+                    pass
+            self._vback_done = True
+            self._vdims_back = (float(data["W"]), float(data["H"]))
+            self._vinner_back = tuple(float(x) for x in data.get("inner", (0.0, 0.0, data["W"], data["H"])))
+        return self._vback_done
+
+    def design_channels(self):
+        """The whole current vector design as ONE mipmapped RGBA8 texture (R primary, G fine fill, B ground, A
+        accents; uv 0..1 = the panel, clamp-to-edge), or None while a tile style is shown. For skins."""
+        return self._vfront[0] if (self._vfront and self._dkey and self._dkey[0] == "vec") else None
+
     def _key(self, seed, layout, scale, form=1, dense=False):
         if form == F_SPINE and layout != 0:
             form = 1
@@ -1408,6 +1699,13 @@ class KenePass:
         return (int(seed), gx, gy, nv, wrap, int(form))
 
     def _upload(self, key):
+        if key[0] == "vec":                              # swap the staged back textures in
+            self._vfront, self._vback = self._vback, self._vfront
+            self._vdims = self._vdims_back
+            self._vback_key, self._vback_done = None, False
+            self._dkey, self._grid = key, (self._vdims[0], self._vdims[1], 1)
+            self._inner = self._vinner_back
+            return
         data = self.builder.get(key)
         size = (data.shape[1], data.shape[0])
         if self._dtex is None or self._dtex.size != size:
@@ -1417,6 +1715,7 @@ class KenePass:
             self._dtex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self._dtex.write(np.ascontiguousarray(data).tobytes())
         self._dkey, self._grid = key, (key[1] * F, key[2] * F, key[3])
+        self._inner = None
 
     def _design(self, key, wdt, also=()):
         """Show design `key`. Designs are built on the worker thread (never here, unless self.sync); the one on screen
@@ -1427,12 +1726,13 @@ class KenePass:
         if self.sync:
             self.builder.build_now(key)
             if key != self._dkey:
+                self._ready(key)
                 self._upload(key)
             self._mix = 1.0
             return
         for k in tuple(also) + (key,):                   # the wanted key is requested last = built first
             self.builder.request(k)
-        ready = self.builder.get(key) is not None
+        ready = key == self._dkey or self._ready(key)
         if self._dkey is None:                           # nothing on screen yet: wait for the first design, then fade in
             self._mix = 0.0
             if ready:
@@ -1456,13 +1756,15 @@ class KenePass:
 
     def release(self):
         self.builder.close()
-        for o in (self._fbo, self._tex, self._dtex, self._htex, self._vao, self._prog, self._quad):
+        for o in [self._fbo, self._tex, self.channels, self._dtex, self._htex, self._vao, self._prog, self._quad] + \
+                self._vfront + self._vback:
             try:
                 if o is not None:
                     o.release()
             except Exception:
                 pass
         self._dtex = self._htex = None
+        self._vfront, self._vback = [], []
 
     close = release
 
@@ -1476,7 +1778,20 @@ class KenePass:
         wdt = wall-clock dt, for things that must keep their own time (the bead morph, design fades)."""
         flow, trav = _val(values, "flow", 0.0, -1.0, 1.0), _val(values, "travel", 0.0, -1.0, 1.0)
         ang = _val(values, "flow_dir", 0.0, 0.0, 1.0) * TAU
-        v = dt * (0.10 * flow + 0.30 * trav)             # frame heights per second
+        mot = _val(values, "kene_motion", 0.0, 0.0, 1.0)
+        bps = min(max(_num((clock or {}).get("bpm", 124.0), 124.0), 60.0), 200.0) / 60.0
+        own = 0.025 * _val(values, "kene_crawl", 0.35, 0.0, 1.0) * mot * bps     # the studies' own crawl (beat-synced)
+        v = dt * (0.10 * flow + 0.30 * trav + (own if flow >= 0.0 else -own))  # frame heights per second
+        # single panel / medallion: the CONTENT scrolls inside the fixed window, wrapped by mirroring (seamless at
+        # any time: the accumulator wraps at one mirror period = 2 x the scrolling rect)
+        gx_, gy_ = self._grid[0], self._grid[1]
+        inner = self._inner or (0.0, 0.0, float(gx_), float(gy_))
+        sw, sh = max(inner[2] - inner[0], 1e-3), max(inner[3] - inner[1], 1e-3)
+        self.crawl[0] = (self.crawl[0] + v * math.cos(ang) * gy_ / (2.0 * sw)) % 1.0
+        self.crawl[1] = (self.crawl[1] + v * math.sin(ang) * gy_ / (2.0 * sh)) % 1.0
+        self.swim_ph[0] = (self.swim_ph[0] + dt * bps * TAU / 9.0) % TAU     # about one swell per 9 / 13 beats
+        self.swim_ph[1] = (self.swim_ph[1] + dt * bps * TAU / 13.0) % TAU
+        self.sway_ph = (self.sway_ph + dt * bps * TAU / 64.0) % TAU          # one breath per 16 bars
         self.pan[0] = (self.pan[0] + v * math.cos(ang) / 0.5) % PAN_WRAP
         self.pan[1] = (self.pan[1] + v * math.sin(ang) / 0.5) % PAN_WRAP
         gx, gy = self._grid[0], self._grid[1]
@@ -1484,7 +1799,7 @@ class KenePass:
         folds = max(2.0, round(_val(values, "folds", 8.0, 2.0, 24.0)))
         self.polar = (self.polar - dt * (0.45 * trav + 0.05 * flow) * folds / TAU * 2.0) % POLAR_WRAP
         hb = self._hb(values)
-        self.hk_scroll[0] = (self.hk_scroll[0] + v * math.cos(ang) * hb) % HK_T
+        self.hk_scroll[0] = (self.hk_scroll[0] + v * math.cos(ang) * hb) % HK_T   # beads crawl on their lattice
         self.hk_scroll[1] = (self.hk_scroll[1] + v * math.sin(ang) * hb) % HK_T
         self.hk_polar = (self.hk_polar - dt * (0.45 * trav + 0.05 * flow) * self._hnb(values) / TAU * 2.0) % HK_T
         if "rot_phase" in values:
@@ -1557,12 +1872,17 @@ class KenePass:
             sc = _val(values, "kene_scale", 0.5, 0.0, 1.0)
             stq = style_uniforms(values, None)
             form, dense = stq["form"] or _idx(values, "kene_form", len(FORMS), 1), stq["dense"]
-            self._design(self._key(pen["seed"], lay, sc, form, dense), wdt,
-                         also=(self._key(pen["next_seed"], lay, sc, form, dense),))
+            if stq["vec"] and lay != 2:                  # painted / embroidered: continuous geometry (band: tiles)
+                wq = _val(values, "kene_weight", 0.5, 0.0, 1.0)
+                self._design(self._vkey(stq["vec"], pen["seed"], sc, wq), wdt,
+                             also=(self._vkey(stq["vec"], pen["next_seed"], sc, wq),))
+            else:
+                self._design(self._key(pen["seed"], lay, sc, form, dense), wdt,
+                             also=(self._key(pen["next_seed"], lay, sc, form, dense),))
         self._beads()
         self._advance(dt, wdt, values, lay, clock)
         self._last_t = t
-        if self._dtex is None:                           # first design still being built: beads only for now
+        if self._dkey is None:                           # first design still being built: beads only for now
             amt_s = 0.0
             if amt_h <= 0.001:
                 return self._tex
@@ -1577,8 +1897,29 @@ class KenePass:
             if self._dtex is not None:
                 self._dtex.use(self.IN_UNITS[0])
             self._htex.use(self.IN_UNITS[1])
+            vec = bool(self._dkey and self._dkey[0] == "vec")
             s = self._set
             s("uD", self.IN_UNITS[0]); s("uH", self.IN_UNITS[1])
+            if vec:
+                for tx_, u in zip(self._vfront, VEC_UNITS):
+                    tx_.use(u)
+            s("uV0", VEC_UNITS[0]); s("uV1", VEC_UNITS[1]); s("uV2", VEC_UNITS[2]); s("uVec", 1.0 if vec else 0.0)
+            gs = gate_state(values)
+            s("uGate", gs["gains"]); s("uGateMode", gs["mode"]); s("uMono", gs["mono"])
+            s("uGateT", float((beat / 4.0) % 256.0))
+            s("uInk", st["ink"]); s("uEmit", tuple(st["emit"])); s("uFillC", tuple(st["fillc"]))
+            # motion: content scroll / rotation / zoom (single panel, medallion), transform of the field (other layouts),
+            # swim warp; the global rotate / spin (self.rot) and zoom faders drive it too
+            mot = _val(values, "kene_motion", 0.0, 0.0, 1.0)
+            sway = _val(values, "kene_sway", 0.5, 0.0, 1.0) * mot
+            zoomf = math.exp(0.7 * _val(values, "zoom", 0.0, -1.0, 1.0)) * (1.0 + 0.035 * sway * math.sin(self.sway_ph))
+            crot = 0.06 * sway * math.sin(self.sway_ph * 1.0 + 1.3) + (self.rot if lay in (0, 3) else 0.0)
+            s("uCRot", float(crot)); s("uCZoom", float(zoomf)); s("uFRot", float(0.06 * sway * math.sin(self.sway_ph + 1.3) + (self.rot if lay == 1 else 0.0)))
+            s("uCrawl", (float(self.crawl[0]), float(self.crawl[1])))
+            inner = self._inner or (0.0, 0.0, float(self._grid[0]), float(self._grid[1]))
+            s("uInner", tuple(float(x) for x in inner))
+            s("uSwimA", float(0.55 * _val(values, "kene_swim", 0.4, 0.0, 1.0) * mot + 0.35 * _val(values, "swim", 0.0, 0.0, 1.0)))
+            s("uSwimPh", (float(self.swim_ph[0]), float(self.swim_ph[1])))
             s("uRes", tuple(float(x) for x in self.out_size))
             s("uGrid", tuple(float(x) for x in self._grid))
             s("uLay", int(lay)); s("uWrap", 1.0 if lay == 2 else 0.0)
@@ -1590,15 +1931,19 @@ class KenePass:
             if "uCol" in self._prog:
                 self._prog["uCol"].write(np.asarray(st["cols"], dtype="f4").tobytes())
             s("uGround", st["ground"]); s("uGroundOn", st["ground_on"]); s("uTier", st["tier"]); s("uW", st["w"])
-            s("uStitch", st["stitch"]); s("uBead", st["bead"])
-            s("uArm", st["arm"]); s("uEcho2", st["echo2"]); s("uBorder", st["border"] if lay == 0 else 0.0)
-            s("uPH", 0.74 if st["border"] else (0.82 if st["frame"] else 0.90))
-            s("uArmW", float(st["arm_w"] or st["w"][0])); s("uAccOn", st["acc_on"]); s("uTwig", st["twig"])
+            s("uStitch", max(st["stitch"], gs["stitch"])); s("uBead", 0.0 if vec else st["bead"])
+            s("uArm", st["arm"]); s("uEcho2", st["echo2"]); s("uBorder", st["border"] if (lay == 0 and not vec) else 0.0)
+            s("uPH", 0.92 if vec else (0.74 if st["border"] else (0.82 if st["frame"] else 0.90)))
+            s("uArmW", float(st["arm_w"] or st["w"][0])); s("uAccOn", 1.0 if vec else st["acc_on"]); s("uTwig", st["twig"])
             s("uWob", st["wob"] if lay in (0, 3) else 0.0)
-            s("uFrameOn", 1.0 if (st["frame"] and lay == 0) else 0.0); s("uFrame", tuple(st["frame"] or (0.0, 0.0, 0.0)))
-            s("uHOmb", (max(beat, 0.0) / 8.0 * _val(values, "hk_ombre", 0.0, 0.0, 1.0)) % 6.0)
+            s("uFrameOn", 1.0 if (st["frame"] and lay == 0 and not vec) else 0.0); s("uFrame", tuple(st["frame"] or (0.0, 0.0, 0.0)))
+            omb = _val(values, "hk_ombre", 0.0, 0.0, 1.0)
+            if omb <= 0.0:                               # default: gentle ring-by-ring cycling (a step per 4 bars)
+                omb = 0.5 * _val(values, "hk_auto", 0.0, 0.0, 1.0) * _val(values, "kene_motion", 0.0, 0.0, 1.0)
+            s("uHOmb", (max(beat, 0.0) / 8.0 * omb) % 6.0)
             s("uHair", st["hair"]); s("uKnob", st["knob"]); s("uCBorder", st["cborder"])
             s("uHEdge", 0.0 if int(self._hk_now or 0) % NF == 5 else 1.0)
+            s("uHStudy", 1.0 if int(self._hk_now or 0) % NF >= 5 else 0.0)        # GRAMMAR_SPEC D-G families
             if "uAcc" in self._prog:
                 self._prog["uAcc"].write(np.asarray(st["acc"], dtype="f4").tobytes())
             curve = _val(values, "kene_curve", 0.25, 0.0, 1.0)
@@ -1653,7 +1998,7 @@ def hidden_context(size=(64, 64)):
 def default_values(**over):
     import params
     v = params.defaults()
-    v.update(flow=0.0, travel=0.0, rotate=0.0)
+    v.update(flow=0.0, travel=0.0, rotate=0.0, kene_motion=0.0, swim=0.0, zoom=0.0)   # stills: no motion unless asked
     v.update(over)
     return v
 
@@ -1716,7 +2061,13 @@ SHOTS = [
     ("study_F_bead_straps", {H: 1, "hk_motif": 7, "hk_medium": 0, "hk_colors": 6, "hk_size": 0.55}),
     ("study_F_bead_straps_green", {H: 1, "hk_motif": 7, "hk_medium": 3, "hk_colors": 8, "hk_size": 0.3, "kene_seed": 1}),
     ("study_G_key_fret", {H: 1, "hk_motif": 8, "hk_medium": 0, "hk_colors": 7, "hk_size": 1.0}),
+    # semantic gate presets (kene_gate) on the vector studies
+    ("gate_A_white_engraving", {S: 1, "kene_style": 5, "kene_seed": 3, "kene_scale": 0.6, "kene_gate": 2}),
+    ("gate_C_linework_only", {S: 1, "kene_style": 7, "kene_seed": 6, "kene_scale": 0.5, "kene_gate": 1}),
+    ("gate_C_ground_patches", {S: 1, "kene_style": 7, "kene_seed": 6, "kene_scale": 0.5, "kene_gate": 3}),
+    ("gate_C_cell_fill", {S: 1, "kene_style": 7, "kene_seed": 6, "kene_scale": 0.5, "kene_gate": 4}),
 ]
+CHANNEL_SHOTS = ("study_A_painted", "study_C_embroidered")     # also saved as <tag>_channels.png (R G B A as 2 x 2)
 # PRIVATE study references (research/kene_reference/user_refs: copyrighted, never published) next to the studies
 USER_PAIRS = [
     ("shipiboKeneSaraFlores.jpeg", (0.0, 0.0, 1.0, 1.0), "study_A_painted"),
@@ -1757,6 +2108,13 @@ def gallery(out_dir=None, out_size=(1280, 800), only=None):
         kp = KenePass(ctx, out_size)
         try:
             img = render_once(kp, default_values(**over), t=5.6, beat=11.4)
+            if tag in CHANNEL_SHOTS:
+                ch = np.frombuffer(kp.channels.read(), np.uint8).reshape(out_size[1], out_size[0], 4)[::-1]
+                h2, w2 = out_size[1] // 2, out_size[0] // 2
+                quad = np.zeros((out_size[1], out_size[0], 3), np.uint8)
+                for n, (y0, x0) in enumerate(((0, 0), (0, w2), (h2, 0), (h2, w2))):
+                    quad[y0:y0 + h2, x0:x0 + w2] = np.asarray(Image.fromarray(np.ascontiguousarray(ch[..., n])).resize((w2, h2)))[..., None]
+                Image.fromarray(quad).save(out_dir / f"{tag}_channels.png")
         finally:
             kp.release()
         st = frame_stats(img)
@@ -1812,7 +2170,10 @@ def bench(out_size=(1280, 800), frames=120):
     rows = []
     cases = [("shipibo default", {S: 1}), ("shipibo band", {S: 1, "kene_layout": 2}),
              ("shipibo mandala", {S: 1, "kene_layout": 4, "symmetry": 1.0}), ("shipibo beadwork", {S: 1, "kene_style": 4}),
-             ("hunikuin beads", {H: 1}), ("hunikuin painted", {H: 1, "hk_medium": 2}), ("both", {S: 1, H: 1})]
+             ("hunikuin beads", {H: 1}), ("hunikuin painted", {H: 1, "hk_medium": 2}), ("both", {S: 1, H: 1}),
+             ("vector painted", {S: 1, "kene_style": 5}), ("vector cloth", {S: 1, "kene_style": 6}),
+             ("vector embroidered", {S: 1, "kene_style": 7}), ("vector embr. patches", {S: 1, "kene_style": 7, "kene_gate": 3}),
+             ("vector mandala", {S: 1, "kene_style": 5, "kene_layout": 4, "symmetry": 1.0})]
     for tag, over in cases:
         kp = KenePass(ctx, out_size)
         kp.sync = True

@@ -87,6 +87,19 @@ try:
     from art_layer import ArtPass
 except ImportError:
     ArtPass = None
+try:                                                 # one image library: art uploads / AI / dreamed images everywhere
+    import image_library
+except Exception:
+    image_library = None
+try:                                                 # combinable art modes: per-mode amounts (pure Python)
+    from art_layer import art_weights, mode_sets as art_mode_sets
+except ImportError:
+    def art_weights(values):
+        use = min(max(int(math.floor(float(values.get("art_use", 0.0)) + 0.5)), 0), 5)
+        return tuple(1.0 if i == use else 0.0 for i in range(6))
+
+    def art_mode_sets(use):
+        return dict(art_use=float(min(max(int(math.floor(float(use) + 0.5)), 0), 5)))
 import surfaces as surf_model                        # multi-surface mapping model (pure Python)
 try:
     from surface_render import SurfaceRenderer       # its output stage: every surface from the one rendered frame
@@ -105,9 +118,17 @@ try:
 except ImportError:
     BeingsPass = None
 try:
+    import coilnest as coil_mod                      # [coilnest> frame-filling nest of skinned serpent bodies (l_coilnest) <coilnest]
+except ImportError:
+    coil_mod = None
+try:
     from kene_real import KenePass                   # generative kené / kenê kuin study layers (l_kene_shipibo, l_kene_hunikuin)
 except ImportError:
     KenePass = None
+try:                                                 # [transitions] visual scene transitions: B render + composite
+    import transitions as trans_mod
+except ImportError:
+    trans_mod = None
 try:                                                 # post-FX filter chain (group "filters"): dream, oil, halftone, ...
     from filters import FilterPass, active as filters_active, run as filters_run
 except ImportError:
@@ -193,7 +214,8 @@ CPU_ONLY = {"speed", "flow", "rotate", "palette", "travel", "serpent_speed", "ch
     {"l_swarm"} & set(PARAMS)) | (set(TEXT_CPU_ONLY) & set(PARAMS))            # (l_swarm is mixed inside fx_stack.LandPass)
 CPU_ONLY |= {"crowd_soft", "crowd_swarm", "crowd_beings", "crowd_ripples", "crowd_serpent"} & set(PARAMS)   # camera_layer.py
 CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "filters"}             # consumed by filters.FilterPass
-CPU_ONLY |= {"img_auto", "img_hold"} & set(PARAMS)                          # image cycling (main loop)
+CPU_ONLY |= {"img_auto", "img_hold", "img_set"} & set(PARAMS)                        # image cycling (main loop)
+CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "coilnest"}             # consumed by coilnest.CoilNestPass
 CPU_ONLY |= {n for n, v in PARAMS.items() if v[3] == "kene"} | ({"l_kene_hunikuin"} & set(PARAMS))   # kene_real.KenePass (one texture, both layers)
 RESET_GROUPS = ("space", "shape", "motion")
 # engine-drawn layers (everything but the math stack, the echo and the text overlay): see the coreOn uniform
@@ -213,13 +235,16 @@ uniform sampler2D texK;             // math stack (stack.StackPass): rgb = its l
 uniform float p_l_stack;            // 1 while that pass rendered this frame (the amount is applied inside it), else 0
 uniform sampler2D texN;             // kené / kenê kuin study layers (kene_real.KenePass): rgb = light, a = cover
 uniform float p_l_kene_shipibo;     // 1 while that pass rendered this frame (both layer amounts are applied inside it), else 0
+uniform sampler2D texC;             // [coilnest] coil nest (coilnest.CoilNestPass): rgb = light, a = cover
+uniform float p_l_coilnest;         // 1 while that pass rendered this frame (its amount is applied inside it), else 0
 uniform float coreOn;               // 1 normally; fades to 0 only when EVERY engine layer is at 0 (clean canvas): no core jewel
 uniform float t, mixAB, bass, mid, high, aspect, pxh, hasVideo, limiter, nanGuard;
 uniform float rotPh, chasePh, chaseCol, travelAct, breath, calm;
 uniform float tK, tS;               // kene clocks, wrapped at 64 on the CPU: wall pivots (t x 0.11), shimmer (t x 3)
 uniform float spinPh, spinV, p_spin_twist;   // barrel-roll phase (wrapped at TAU), signed spin speed, corkscrew amount
 uniform sampler2D texS;             // the chosen image, flat (uploaded art piece); AI textures are texA / texB
-uniform float artUse, srcAI, srcAsp;   // art_use mode (0 = fly-through relief in texR), 1 = use the AI texture, image aspect
+uniform float artW[6];              // art mode amounts 0..1: relief (texR), stencil, kaleido, tunnel, displace, melt (art_layer.art_weights)
+uniform float srcAI, srcAsp;        // 1 = use the AI texture, image aspect
 uniform float srcPh, srcTr;         // image drift phase and tunnel scroll, both wrapped at 2 (one mirrored repeat)
 // Every phase that grows for hours is integrated in double precision on the CPU and arrives here already
 // wrapped at a period where the pattern repeats exactly, so float32 never has to resolve a large number.
@@ -290,6 +315,28 @@ vec2 srcFit(vec2 p){                                                 // cover-fi
   return (a > aspect ? vec2(p.x/a, p.y) : vec2(p.x, p.y*a)/aspect) + 0.5;
 }
 float srcKey(vec3 im){ return smoothstep(0.10, 0.42, dot(im, vec3(.299,.587,.114))); }   // dark paint stays black
+// kaleidoscope / tunnel walls map the image (polar position r, th); lb = extra blur (displace samples it softer)
+float kalSlice(float th){ float hs = PI/floor(clamp(p_folds, 2.0, 24.0)+0.5); return abs(fract(th/(2.0*hs))-0.5)*2.0*hs; }
+vec3 kalImg(float r, float th, float lb){
+  float v = kalSlice(th);
+  vec2 kp = r*vec2(cos(v+srcPh*PI), sin(v+srcPh*PI));
+  return srcImg(kp*(1.15+0.25*sin(srcPh*PI)) + 0.5, 0.5+lb);
+}
+vec3 tunImg(float r, float th, float lb){ return srcImg(vec2(th/TAU*4.0, log(r)*0.75 - srcTr), max(0.0, log2(0.55/r))+lb); }
+float kalFade(float r){ return smoothstep(0.012, 0.05, r); }
+float tunFade(float r){ return smoothstep(0.02, mix(0.10, 0.45, clamp(p_depth_fog, 0.0, 1.0)), r); }
+// the mapped picture (kaleidoscope / tunnel, any amounts): rgb = image, a = its fade at the centre. Both up = a
+// kaleidoscopic tunnel (the tunnel's angle folded round the fold count, turning slowly); unequal amounts blend toward
+// the stronger mode's own picture, so every fader move is continuous (one extra fetch only while they differ)
+vec4 artPic(float r, float th, float lb){
+  float wK = artW[2], wT = artW[3];
+  if (wT <= 0.0) return vec4(kalImg(r, th, lb), kalFade(r));
+  if (wK <= 0.0) return vec4(tunImg(r, th, lb), tunFade(r));
+  vec4 kt = vec4(tunImg(r, kalSlice(th) + srcPh*PI, lb), tunFade(r));
+  float g = min(wK, wT)/max(wK, wT);
+  if (g < 1.0) kt = mix(wK > wT ? vec4(kalImg(r, th, lb), kalFade(r)) : vec4(tunImg(r, th, lb), tunFade(r)), kt, g);
+  return kt;
+}
 
 // ---- TAS "motion key": every element carries a hue index 0..1; a soft window sweeps over the index.
 // amount 0 = everything lit, 1 = only the window (plus a faint ghost of the structure).
@@ -588,6 +635,11 @@ vec3 serpColour(float u, float fi, float sr, float idx, float rim, float pat, fl
   return max(c, 0.0)*p_serpent_bright;
 }
 // <serpent-colour]
+// [serpent-skin> the coil nest's skin (coilnest.CoilNestPass.bake: 7 family bands, 8 cells along, gated by its programme)
+// along the body; at 0 none of it runs
+uniform sampler2D texSS;
+uniform float p_serpent_skin;
+// <serpent-skin]
 vec4 serpents(vec2 p){
   float n = floor(p_serpent_count+0.5), segs = floor(p_serpent_segments+0.5);
   float w0 = mix(0.020, 0.085, p_serpent_size), len = mix(0.75, 1.9, p_serpent_size);
@@ -628,6 +680,14 @@ vec4 serpents(vec2 p){
     // [serpent-colour>
     if (p_serpent_color > 0.5 || p_serpent_sat != 1.0 || p_serpent_bright != 1.0) c = serpColour(seg/segs, fi, sr, idx, rim, dia+st2, gap);
     // <serpent-colour]
+    // [serpent-skin>
+    if (p_serpent_skin > 0.0) {
+      float fam = mod(fi*3.0, 7.0), lb = clamp(bn, -1.0, 1.0);
+      vec2 su = vec2(sr*len/(1.45*w0)/8.0, (fam + 0.5 + 0.49*lb)/7.0);
+      vec3 sk = texture(texSS, su).rgb*(0.35 + 0.65*sqrt(max(1.0 - lb*lb, 0.0)));
+      c = mix(c, sk*(0.25 + 0.75*gap)*chaseKey(idx), p_serpent_skin);
+    }
+    // <serpent-skin]
     float eye = smoothstep(0.30, 0.12, length(vec2((sr-0.03)*len/w0*1.2, abs(bn)-0.45)))*step(sr, 0.09);
     c += vec3(1.0,0.95,0.8)*eye;
     acc = acc*(1.0-body) + c*body;
@@ -660,12 +720,17 @@ void main(){
     rglow += en*(0.5+0.5*cos(x*38.0));
   }
   vec2 pscr = p;                                                     // ripple-displaced screen space (serpents, fractal)
-  float amode = p_l_art > 0.0 ? floor(artUse+0.5) : -1.0, emboss = 1.0;
-  if (amode == 4.0) {
-    // art_use 4: the image displaces the pattern (its light and colour push the lattice aside) and embosses it
-    vec3 im = srcImg(srcFit(pscr*(0.94+0.04*sin(srcPh*PI))), 1.5);
-    p += (vec2(dot(im, vec3(.60,.30,.10)), dot(im, vec3(.10,.30,.60))) - 0.42)*p_l_art*0.26;
-    emboss = mix(1.0, 0.70+0.80*dot(im, vec3(.299,.587,.114)), p_l_art);
+  bool artOn = p_l_art > 0.0;
+  float emboss = 1.0, aKT = max(artW[2], artW[3]);                   // aKT: how much kaleidoscope / tunnel map the image
+  if (artOn && artW[4] > 0.0) {
+    // displace: the image pushes the lattice aside (its light and colour) and embosses it. With kaleidoscope /
+    // tunnel up it is their mapped picture (from screen space) that pushes, so the pattern bends along it
+    vec3 im = vec3(0);
+    if (aKT < 1.0) im = srcImg(srcFit(pscr*(0.94+0.04*sin(srcPh*PI))), 1.5);
+    if (aKT > 0.0) { vec3 mi = artPic(length(pscr)+1e-5, atan(pscr.y, pscr.x), 1.0).rgb; im = aKT < 1.0 ? mix(im, mi, aKT) : mi; }
+    float dw = p_l_art*artW[4];
+    p += (vec2(dot(im, vec3(.60,.30,.10)), dot(im, vec3(.10,.30,.60))) - 0.42)*dw*0.26;
+    emboss = mix(1.0, 0.70+0.80*dot(im, vec3(.299,.587,.114)), dw);
   }
   if (p_l_text > 0.0) p += textWarp(pscr, asp);                      // text modes 1 / 4: the letters bend the pattern
   if (p_l_camera > 0.0) p += camWarp(pscr, asp);                     // crowd camera: movement pushes the pattern
@@ -892,34 +957,53 @@ void main(){
     cov = max(cov, max3(fc));
   }
 
-  // ---- the chosen image (uploaded art or AI texture), used per art_use; amount = l_art
-  if (amode >= 0.0) {
-    vec3 ac = vec3(0);
-    float rK = length(pt)+1e-5, thK = atan(pt.y, pt.x);
-    if (amode == 1.0) {
-      // 1 inside the lines: the pattern is a stencil, the image is the light coming through it
-      vec3 im = srcImg(srcFit(pscr*0.92 + 0.03*vec2(cos(srcPh*PI), sin(srcPh*PI))), 0.0);
+  // ---- the chosen image (uploaded art or AI texture); amount = l_art x the mode amounts artW (art_layer.art_weights).
+  // One mode (art_use) = one weight at 1: exactly the old single-mode picture. Combined, in this order:
+  //   map    kaleidoscope / tunnel (artPic) map the image coordinates first; both = a kaleidoscopic tunnel
+  //   warp   displace (above, before the pattern) pushes the lattice with that mapped image
+  //   window stencil makes the pattern lines windows onto the (mapped) image and takes the image's light into the
+  //          lines: every light below is scaled by (1 - stencil), so nothing is exposed twice
+  //   light  the mapped picture (melt makes it pulse on the beat); melt's own full-frame image only fills in where
+  //          the map is not up (x (1 - aKT)); then the relief pass; lights add as screen (a + b(1-a)), never > 1
+  //   echo   melt runs the echo like wet paint (below)
+  // Each mode is a uniform branch on its weight: off = no fetch, no cost.
+  if (artOn) {
+    vec3 ac = vec3(0), pic = vec3(0);
+    float rK = length(pt)+1e-5, thK = atan(pt.y, pt.x), picF = 0.0;
+    float wS = artW[1], wM = artW[5], lg = 1.0 - wS;
+    if (aKT > 0.0) { vec4 pk = artPic(rK, thK, 0.0); pic = pk.rgb; picF = pk.a; }
+    if (artW[1] > 0.0) {
+      // inside the lines: the pattern is a stencil, the image is the light coming through it
+      vec3 im = pic;
+      if (aKT < 1.0) {
+        vec3 fl = srcImg(srcFit(pscr*0.92 + 0.03*vec2(cos(srcPh*PI), sin(srcPh*PI))), 0.0);
+        im = aKT > 0.0 ? mix(fl, pic, aKT) : fl;
+      }
       float m = smoothstep(0.02, 0.28, max3(col));
-      col = mix(col, (im*1.55+0.06)*m*(0.55+0.45*min(max3(col), 1.0)), p_l_art);
-    } else if (amode == 2.0) {
-      // 2 kaleidoscope source: a slowly turning slice of the image, mirrored round the fold count
-      float hsK = PI/floor(clamp(p_folds, 2.0, 24.0)+0.5);
-      float vK = abs(fract(thK/(2.0*hsK))-0.5)*2.0*hsK;
-      vec2 kp = rK*vec2(cos(vK+srcPh*PI), sin(vK+srcPh*PI));
-      vec3 im = srcImg(kp*(1.15+0.25*sin(srcPh*PI)) + 0.5, 0.5);
-      ac = im*srcKey(im)*smoothstep(0.012, 0.05, rK);
-    } else if (amode == 3.0) {
-      // 3 tunnel walls: the image wrapped round a log-polar tunnel; travel (and time) scroll it toward the viewer
-      vec3 im = srcImg(vec2(thK/TAU*4.0, log(rK)*0.75 - srcTr), max(0.0, log2(0.55/rK)));
-      ac = im*srcKey(im)*smoothstep(0.02, mix(0.10, 0.45, clamp(p_depth_fog, 0.0, 1.0)), rK);
-    } else if (amode == 5.0 || (amode < 0.5 && srcAI > 0.5)) {
-      // 5 full frame + feedback melt (the echo stage below drips it); also the flat fallback for AI textures in mode 0
-      vec3 im = srcImg(srcFit(pscr*(0.96+0.03*sin(srcPh*PI))), 0.0);
-      ac = im*srcKey(im)*(amode == 5.0 ? 0.40+0.60*exp(-beat_phase*3.0) : 1.0);
-    } else if (amode < 0.5) {
-      ac = texture(texR, pscr/asp+0.5).rgb;                          // 0 fly-through relief (art_layer.ArtPass)
+      col = mix(col, (im*1.55+0.06)*m*(0.55+0.45*min(max3(col), 1.0)), p_l_art*wS);
     }
-    ac = clamp(ac, 0.0, 1.0)*p_l_art;
+    float pulse = 0.40+0.60*exp(-beat_phase*3.0);
+    if ((artW[2] > 0.0 || artW[3] > 0.0) && lg > 0.0) {
+      // kaleidoscope: a slowly turning slice of the image mirrored round the fold count; tunnel walls: the image
+      // wrapped round a log-polar tunnel, travel (and time) scroll it toward the viewer
+      vec3 a = pic*srcKey(pic)*picF*((1.0-wM) + wM*pulse);
+      ac = clamp(a, 0.0, 1.0)*p_l_art*(aKT*lg);
+    }
+    float mw = wM*(1.0-aKT)*lg;
+    if (artW[5] > 0.0 && mw > 0.0) {
+      // full frame + feedback melt (the echo stage below drips it)
+      vec3 im = srcImg(srcFit(pscr*(0.96+0.03*sin(srcPh*PI))), 0.0);
+      vec3 a = clamp(im*srcKey(im)*pulse, 0.0, 1.0)*p_l_art*mw;
+      ac = ac + a*(1.0-ac);
+    }
+    if (artW[0] > 0.0) {
+      // fly-through relief (art_layer.ArtPass); with an AI texture as the source: the image flat, full frame
+      vec3 a;
+      if (srcAI > 0.5) { vec3 im = srcImg(srcFit(pscr*(0.96+0.03*sin(srcPh*PI))), 0.0); a = im*srcKey(im)*1.0; }
+      else a = texture(texR, pscr/asp+0.5).rgb;
+      a = clamp(a, 0.0, 1.0)*p_l_art*artW[0];
+      ac = ac + a*(1.0-ac);
+    }
     col = col*emboss + ac*(1.0-clamp(col, 0.0, 1.0));
     cov = max(cov, max3(ac));
   }
@@ -937,6 +1021,15 @@ void main(){
     col = col*(1.0-0.92*kn.a) + kn.rgb;
     cov = max(cov, max(kn.a, max3(kn.rgb)));
   }
+
+  // [coilnest> coil nest (coilnest.CoilNestPass): rgb = light, a = how much it hides (1 over the whole frame with black
+  // crevices); the layer amount is already applied in the pass. The beings and serpents still slither over it.
+  if (p_l_coilnest > 0.0) {
+    vec4 cn = clamp(texture(texC, pscr/asp+0.5), 0.0, 1.0);
+    col = col*(1.0-cn.a) + cn.rgb;
+    cov = max(cov, max3(cn.rgb));
+  }
+  // <coilnest]
 
   // ---- beings (beings.BeingsPass): rgb = light, a = silhouette; the layer amount is already applied in the pass
   if (p_l_beings > 0.0) {
@@ -978,7 +1071,7 @@ void main(){
   float dk = dtK > 0.0 ? dtK : 1.0;
   vec2 q = (v_uv-0.5)*asp; float fr = (0.0015+0.002*mid)*(1.0-hold)*dk, z = pow(mix(0.9955-0.004*bass, 1.0, hold), dk);
   q = (rot(fr)*q*z)/asp+0.5;
-  float melt = amode == 5.0 ? p_l_art*(1.0-hold) : 0.0;              // art_use 5: the echo runs like wet paint
+  float melt = artOn ? p_l_art*artW[5]*(1.0-hold) : 0.0;             // art melt: the echo runs like wet paint
   q += (fbm2(v_uv*vec2(5.0, 3.0)+vec2(swN[4], swN[5]))*0.010 + vec2(0.0, 0.0030*(0.4+fbm(v_uv*vec2(22.0, 1.5)))))*melt*dk;
   bool held = hold > 0.999;                                          // fully frozen: copy the texel, no resampling
   vec3 prev = held ? texelFetch(prevFrame, ivec2(gl_FragCoord.xy), 0).rgb : texture(prevFrame,q).rgb;
@@ -1269,6 +1362,29 @@ def load_remote_token(path, given=None):
 
 
 _SNAP_SEQ = itertools.count()
+
+
+def prog_names(prog):
+    """[perf] A moderngl Program's member names as a frozenset, cached on the program. moderngl.Program has no
+    __contains__, so `name in prog` walks every member through a generator: done once per uniform per frame it cost
+    ~37k Python steps a frame (default look 138 -> 86 fps headless once ~80 params were added; tests/test_perf_budget.py)."""
+    names = getattr(prog, "_lv_names", None)
+    if names is None:
+        names = frozenset(prog)
+        try:
+            prog._lv_names = names
+        except AttributeError:                       # a program type without __dict__: just not cached
+            pass
+    return names
+
+
+def _see_in(ctl, jpg):
+    """[online-see] The assistant's picture of the output -> the ONLINE plugin (encoder thread; dropped while off)."""
+    try:
+        from plugins.online import protocol as _online_protocol
+        _online_protocol.snapshot_in(ctl, jpg)
+    except Exception:
+        pass
 
 
 def save_snapshot(path, data, size, width=768):
@@ -1618,9 +1734,11 @@ def texture_files(folder):
     return sorted(out)
 
 
-def _make_texture(ctx, fp):
+def _make_texture(ctx, fp, max_side=None):
     img = Image.open(fp)
     img.load()                                   # full decode now, so truncated files raise here
+    if max_side and max(img.size) > max_side:    # art uploads in the AI layer (up to 4096 px): keep VRAM bounded
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
     img = img.convert("RGB").transpose(Image.FLIP_TOP_BOTTOM)
     tex = ctx.texture(img.size, 3, img.tobytes())
     tex.repeat_x = tex.repeat_y = True
@@ -1641,24 +1759,26 @@ def select_recent(files, cap=TEX_CAP, keep=()):
 
 
 def _tex_candidates(folder, bad=None, cap=TEX_CAP, keep=()):
-    """[(path, mtime)] of the textures that should be loaded, in name order. A file in `bad` is skipped until
-    its mtime changes (it was rewritten), then it is tried again."""
+    """[(key, path, mtime)] of the textures that should be loaded, in key order. `folder` is the textures/ folder
+    (key = file name, as always) or a ready list of (key, path) (image_library.layer_files: art uploads are
+    "art/<name>"). A file in `bad` is skipped until its mtime changes (it was rewritten), then it is tried again."""
+    entries = folder if isinstance(folder, list) else [(fp.name, fp) for fp in texture_files(folder)]
     cands = []
-    for fp in texture_files(folder):
+    for key, fp in entries:
         try:
             mtime = fp.stat().st_mtime
         except OSError:
             continue
-        if bad is not None and bad.get(fp.name) == mtime:
+        if bad is not None and bad.get(key) == mtime:
             continue
-        cands.append((fp, mtime))
-    chosen = set(select_recent([(fp.name, m) for fp, m in cands], cap, keep))
-    return [(fp, m) for fp, m in cands if fp.name in chosen]
+        cands.append((key, fp, mtime))
+    chosen = set(select_recent([(k, m) for k, _, m in cands], cap, keep))
+    return [(k, fp, m) for k, fp, m in cands if k in chosen]
 
 
 def wanted_textures(folder, bad=None, cap=TEX_CAP, keep=()):
     """Names the library should hold right now (cheap: directory listing only)."""
-    return [fp.name for fp, _ in _tex_candidates(folder, bad, cap, keep)]
+    return [k for k, _, _ in _tex_candidates(folder, bad, cap, keep)]
 
 
 def load_textures(ctx, folder, existing=None, max_new=None, bad=None, cap=TEX_CAP, keep=()):
@@ -1668,22 +1788,22 @@ def load_textures(ctx, folder, existing=None, max_new=None, bad=None, cap=TEX_CA
     existing = existing or []
     have = {name: tex for name, tex in existing if name != "noise"}
     cands = _tex_candidates(folder, bad, cap, keep)
-    names = [fp.name for fp, _ in cands]
+    names = [k for k, _, _ in cands]
     for name in [n for n in have if n not in names]:
         have.pop(name).release()                 # deleted, or evicted by the cap
     loaded = 0
-    for fp, mtime in cands:
-        if fp.name in have:
+    for key, fp, mtime in cands:
+        if key in have:
             continue
         if max_new is not None and loaded >= max_new:
             break
         try:
-            have[fp.name] = _make_texture(ctx, fp)
+            have[key] = _make_texture(ctx, fp, 1024 if key.startswith("art/") else None)
             loaded += 1
         except Exception as ex:
-            print(f"[tex] skipped {fp.name}: {ex}")
+            print(f"[tex] skipped {key}: {ex}")
             if bad is not None:
-                bad[fp.name] = mtime
+                bad[key] = mtime
     texs = [(n, have[n]) for n in names if n in have]
     noise = [t for n, t in existing if n == "noise"]
     if texs:
@@ -2227,6 +2347,12 @@ def main():
         except Exception as ex:
             print(f"[l_stack] disabled: {ex}")
     extra.append(dict(param="l_stack", gate=1.0, uniform="texK", unit=16, obj=stack_obj, fails=0))
+    if coil_mod is not None and "l_coilnest" in PARAMS:   # [coilnest> after every other layer (it may wear one as a skin)
+        try:
+            extra.append(dict(param="l_coilnest", gate=1.0, uniform="texC", unit=18, obj=coil_mod.CoilNestPass(ctx, (rw, rh)),
+                              fails=0))
+        except Exception as ex:
+            print(f"[l_coilnest] disabled: {ex}")    # <coilnest]
     own_stack = stack_mod.StackState() if stack_mod is not None else None   # used when the controller has no stack
     # [skins> environment skins: ONE texture array on unit 22, shared by the 3D decks and the travel tunnel. With no
     # skin assigned nothing below costs anything (the decks keep their original programs, the tunnel block is skipped).
@@ -2238,6 +2364,104 @@ def main():
         _land = next((e["obj"] for e in extra if e["param"] == "l_land"), None)
         sk_st["ready"] = False                       # skins are INACTIVE until switched on: nothing compiled, no VRAM
     scene_plain, scene_skin = (scene_prog, scene_vao), None
+    # [skins> LAYERS AS SKINS: engine layers -> one small texture array (materials.LayerHub, unit 23). Nothing is
+    # drawn, copied or allocated until a slot (or a creature body) requests a layer; then at most once per frame,
+    # copied from the show's own render when the layer is up, else drawn by its own 512 px instance.
+    skin_hub, hub_st = None, dict(frame=-1, vals=None, uni=None, has_video=False, fbo=None, own={})
+    if skins is not None:
+        skin_hub = guarded("skins", skin_mod.LayerHub, ctx, size=512)
+    if skin_hub is not None:
+        skins.hub = skin_hub
+        _ex_by = {e["param"]: e for e in extra}
+        _hub_cls = dict(l_kene_shipibo=KenePass, l_beings=BeingsPass, l_text=TextPass, l_fractal=FractalPass,
+                        l_stack=stack_mod.StackPass if stack_mod is not None else None)
+
+        def _hub_render(param, o, vv):           # the same calls the layer loop makes, on the small instance
+            if param == "l_fractal":
+                return o.render(dict(vv, rotate=vv["rotate"] + vv.get("spin", 0.0) * SPIN_RATE / 0.6), clock, T,
+                                ph.travel, [tuple(map(float, c)) for c in pal])
+            if param == "l_beings":
+                return o.render(dict(vv, chase_phase=chase % 1.0), clock, T, dts, smr, pal)
+            if param == "l_kene_shipibo":
+                return o.render(dict(vv, chase_phase=chase % 1.0, rot_phase=ph.rot + ph.spin), clock, T, dts, smr, pal)
+            if param == "l_text":
+                return o.render(vv, clock, T, dts, smr, pal)
+            if param == "l_stack":
+                return o.render(the_stack().frame, 1.0, pal) if the_stack() is not None and the_stack().frame else None
+            return None
+
+        def _hub_draw(param, over, attr=None):
+            def draw(size):
+                cls = _hub_cls.get(param)
+                if cls is None or hub_st["vals"] is None:
+                    return None
+                o = hub_st["own"].get(param)
+                if o is None:
+                    o = hub_st["own"][param] = cls(ctx, (size, size))
+                tex = _hub_render(param, o, dict(hub_st["vals"], **over))
+                return getattr(o, attr, None) if attr else tex
+            return draw
+
+        def _hub_free(param):
+            o = hub_st["own"].pop(param, None)
+            if o is not None and hasattr(o, "release"):
+                guarded("skins", o.release)
+
+        def _hub_vis(param, key=None, attr=None):
+            def vis():
+                ex = _ex_by.get(param)
+                if ex is None or ex.get("drawn") != hub_st["frame"]:
+                    return None
+                if key is not None and hub_st["vals"].get(key, 0.0) <= 0.001:
+                    return None
+                return getattr(ex["obj"], attr, None) if attr else ex.get("tex")
+            return vis
+
+        def _hub_scene_only(param, size=256):     # layers drawn INSIDE the scene shader: the scene alone, that layer only
+            def draw(_size):
+                u = hub_st["uni"]
+                if u is None:
+                    return None
+                if hub_st["fbo"] is None:
+                    _t = ctx.texture((size, size), 4, dtype="f1")
+                    hub_st["fbo"] = (_t, ctx.framebuffer([_t]))
+                _t, _fb = hub_st["fbo"]
+                prog, vao = scene_plain
+                over = {k: 0.0 for k in u if k.startswith("p_l_")}
+                over.update({f"p_{param}": 1.0, "p_master": 1.0, "p_blackout": 0.0, "limiter": 0.0, "aspect": 1.0,
+                             "pxh": 1.0 / size, "hasVideo": 0.0, "coreOn": 0.0})
+                prev, vp = ctx.fbo, ctx.viewport
+                _fb.use()
+                ctx.viewport = (0, 0, size, size)
+                for k, v in over.items():
+                    if k in prog:
+                        prog[k].value = v
+                vao.render(moderngl.TRIANGLE_STRIP)
+                for k in over:                        # the show's values back (preview redraws read the program)
+                    if k in prog and k in u and not isinstance(u[k], np.ndarray):
+                        prog[k].value = u[k]
+                prev.use()
+                ctx.viewport = vp
+                return _t
+            return draw
+
+        _reg = skin_hub.register
+        _reg("kene", draw=_hub_draw("l_kene_shipibo", dict(l_kene_shipibo=1.0, l_kene_hunikuin=0.0)),
+             visible=_hub_vis("l_kene_shipibo", "l_kene_shipibo"), release=lambda: _hub_free("l_kene_shipibo"))
+        _reg("beadstudy", draw=_hub_draw("l_kene_shipibo", dict(l_kene_shipibo=0.0, l_kene_hunikuin=1.0)),
+             visible=_hub_vis("l_kene_shipibo", "l_kene_hunikuin"), release=lambda: _hub_free("l_kene_shipibo"))
+        # kené 4-channel semantic output (R primary, G fine fill, B ground, A accents), KenePass.channels
+        _reg("kene4", draw=_hub_draw("l_kene_shipibo", dict(l_kene_shipibo=1.0, l_kene_hunikuin=0.0), attr="channels"),
+             visible=_hub_vis("l_kene_shipibo", "l_kene_shipibo", attr="channels"), release=lambda: _hub_free("l_kene_shipibo"),
+             label="Kené study, 4 channels")
+        for _p, _n in (("l_beings", "beings"), ("l_text", "text"), ("l_fractal", "fractal"), ("l_stack", "stack")):
+            _reg(_n, draw=_hub_draw(_p, {_p: 1.0}), visible=_hub_vis(_p), release=lambda _p=_p: _hub_free(_p))
+        for _p, _n in (("l_kene", "blocks"), ("l_beads", "beads"), ("l_lines", "lines")):
+            _reg(_n, draw=_hub_scene_only(_p), every=2)      # the whole scene shader at 256 px: every other frame
+        _reg("camera", visible=lambda: (cam.tex_m if cam is not None and getattr(cam, "on", False)
+                                        and getattr(cam, "tex_m", None) is not None else None))
+        _reg("video", visible=lambda: video.tex if hub_st["has_video"] else None)
+        _reg("output", visible=lambda: disp, phase="post")   # <skins]
 
     def skin_scene():                            # the scene program with the tunnel-skin block: compiled ONCE. A failed
         nonlocal scene_skin                      # compile is remembered (False): no retry per frame, the tunnel stays
@@ -2254,9 +2478,13 @@ def main():
         sk_st["ready"] = True                    # (a short stall at that deliberate moment, never at a later skin swap)
         if _land is not None:
             _land.skins = skins
+        for _bx in extra:                        # [beings> the sprite creature's skinned fill (compiled once, here) <beings]
+            if _bx["param"] == "l_beings" and _bx["obj"] is not None:
+                _bx["obj"].skins = skins
         if not headless:
             skin_scene()                         # <skins]
     preview = guarded("preview", PreviewTap, ctx) if PreviewTap is not None and not headless else None
+    asnap = None                                 # [online-see] the assistant's 640x400 tap: made on its first request
     filt = None                                  # post-FX filter chain (filters.py); never called while every filter is off
     if FilterPass is not None:
         try:
@@ -2272,6 +2500,32 @@ def main():
         print("[flashguard] " + ("on: 3 flashes / s at most" if fguard is not None else "NOT RUNNING: the output is unguarded"))
     controller = make_controller(headless, args.live_controller)
     print(f"[control] {type(controller).__name__}")
+    # [transitions> the composite program compiles now; its framebuffers only on the first visual transition.
+    # LV_TRANSITIONS=0 switches it off (recalls then MORPH); LV_TRANS_TIMING=1 prints GPU ms per transition frame.
+    trans_pass = None
+    if trans_mod is not None and getattr(controller, "trans", None) is not None and os.environ.get("LV_TRANSITIONS", "1") != "0":
+        trans_pass = guarded("transition", trans_mod.TransitionPass, ctx)
+        if trans_pass is not None:
+            controller.trans.engine_ok = True
+            if os.environ.get("LV_TRANS_TIMING") and headless and not args.governor:   # GL timers cannot nest
+                trans_pass.timing = []                                                 # inside the governor's
+
+    def trans_run(tr, uni, lay_b, prog, vao, pal_a):
+        """B = the scene program once more with B's private values, into the private B target; then A -> B in disp."""
+        b = tr["b"]
+        ub = dict(uni)
+        ub.update(ph.uniforms(b, args.phase_offset if headless else 0))
+        for n in tr["priv"]:
+            ub["p_" + n] = b[n]
+        for ex in extra:                             # pass layers: B's own amount of what was drawn (0 if not drawn)
+            if "p_" + ex["param"] in uni:
+                ub["p_" + ex["param"]] = lay_b.get(ex["param"], 0.0)
+        if "p_serpent_skin" in uni:                  # the skin strip was baked for A only when A needed it
+            ub["p_serpent_skin"] = b.get("serpent_skin", 0.0) if uni["p_serpent_skin"] > 0.0 else 0.0
+        bt = trans_pass.render_b(prog, vao, uni, ub, pal_a, palette_stops(b["palette"]), (rw, rh), tr["scale"])
+        trans_pass.composite(disp, tr, rw / rh, bt)
+        return True
+    # <transitions]
     gov = None                                   # resource governor (show mode, or headless with --governor)
     if gov_mod is not None and not sheet and (args.governor or not headless):
         gov = guarded("governor", gov_mod.for_engine, ctx, controller, args.governor)
@@ -2532,6 +2786,10 @@ def main():
         """{"cmd": "art_pick", "source": "art" | "ai", "name": file name (optional), "use": mode 0..5 (optional)}:
         choose the image the art layer uses, by name. Unknown names leave the current image alone."""
         name, source = str(c.get("name") or ""), str(c.get("source") or "art").lower()
+        if source == "any":                          # one library: the art piece of that name, else the AI texture
+            obj = next((e["obj"] for e in extra if e["param"] == "l_art"), None)
+            names = obj.library() if obj is not None else []
+            source = "art" if any(n == name or Path(n).stem == name for n in names) else "ai"
         if source == "ai":
             controller.set("art_source", 1.0)
             if name:
@@ -2545,7 +2803,9 @@ def main():
                 controller.set("art_index", float(hit))
         use = c.get("use")
         if isinstance(use, (int, float)) and not isinstance(use, bool) and math.isfinite(use):
-            controller.set("art_use", float(use))
+            for k, v in art_mode_sets(use).items():  # a mode pick = that mode's amount 1, the others 0
+                if k in PARAMS:
+                    controller.set(k, v)
 
     def text_show(c):
         """{"cmd": "text_show" | "text", "text", "font", "align", "warm"}: the words the text layer draws."""
@@ -2624,6 +2884,7 @@ def main():
                     continue
                 kind = c.get("cmd") or c.get("type")
                 if kind == "snapshot": st["snap"] = True
+                elif kind == "assist_snap": st["asnap"] = True          # [online-see] one picture for the assistant
                 elif kind == "art_pick": guarded("art_pick", art_pick, c, now)
                 elif kind == "show_texture": st["show"] = (str(c.get("name", "")), now + 10.0)
                 elif kind == "next_video": guarded("video", video.next)
@@ -2763,19 +3024,34 @@ def main():
 
             # ---- AI textures: hot-reload (new gen_* files show up within ~2 s; while the library is still
             # streaming in, a couple of files every quarter second), cycling, cross-fade, show-on-request
-            if not headless and now - last_scan > (0.25 if tex_pending else 2.0):
+            # img_set (image_library.layer_files): 0 = textures/ exactly as before; 1 art uploads, 2 both, 3 the picked
+            # set; a show request for an art upload ("art/<name>") is loaded whatever the set
+            _iset = int(round(vals.get("img_set", 0.0))) if (image_library is not None and "img_set" in PARAMS) else 0
+            _shw = st["show"][0] if st["show"] is not None else ""
+            _xtra = (_shw,) if image_library is not None and _shw.startswith("art/") else ()
+            _tsig = (_iset, image_library.meta_sig(args.art) if _iset == 3 else None, _xtra)
+            _tnew = _tsig != st.get("tex_sig")
+            if _tnew:
+                if _iset == 3:
+                    st["tex_picked"] = image_library.load_meta(args.art)["picked"]
+                st["tex_sig"] = _tsig
+            tex_src = args.textures if (_iset == 0 and not _xtra) else guarded(
+                "tex", image_library.layer_files, _iset, args.textures, args.art, st.get("tex_picked", ()), _xtra, default=None) or args.textures
+            if (not headless or (_tnew and tex_src is not args.textures)) and (_tnew or now - last_scan > (0.25 if tex_pending else 2.0)):
                 last_scan = now
                 cur_name, nxt_name = texs[ti][0], texs[tj][0]
-                want = wanted_textures(args.textures, bad_tex, keep=(cur_name, nxt_name))
+                want = wanted_textures(tex_src, bad_tex, keep=(cur_name, nxt_name))
                 have = [n for n, _ in texs]
                 tex_pending = bool(want) and want != have
                 if tex_pending:
-                    texs = load_textures(ctx, args.textures, texs, max_new=2, bad=bad_tex, keep=(cur_name, nxt_name))
+                    texs = load_textures(ctx, tex_src, texs, max_new=None if headless else 2, bad=bad_tex, keep=(cur_name, nxt_name))
                     if [n for n, _ in texs] != have:
                         ti = next((i for i, (n, _) in enumerate(texs) if n == cur_name), 0)
                         tj = next((i for i, (n, _) in enumerate(texs) if n == nxt_name), (ti + 1) % len(texs)) if fade_t0 is not None else (ti + 1) % len(texs)
                         print(f"[tex] library now {len(texs)}")
                     tex_pending = want != [n for n, _ in texs]
+                if _tnew and cur_name not in want and want and fade_t0 is None:
+                    st["next"] = True                # a new image set: cross-fade into it
             tc = ph.tex
             if st["show"] is not None:
                 want_name, until = st["show"]
@@ -2826,14 +3102,25 @@ def main():
                 guarded("governor", gov.frame, vals, getattr(controller, "base", None)); gov.timer.begin_frame()
             # ---- video loop + optional offscreen passes (only when their layer is up: zero cost otherwise)
             has_video = video.update(dts, now, active=vals.get("l_video", 0.0) > 0.001, wait=2.0 if headless else 0.0)
+            _tr = None                                   # [transitions> B's values while a visual transition runs
+            if trans_pass is not None and getattr(getattr(controller, "trans", None), "active", None) is not None:
+                _tr = guarded("transition", controller.trans.frame, vals, default=None)
+            _vals_a, _pal_a = vals, pal
+            if _tr is not None:                          # the offscreen passes draw once, at max(A, B) amount;
+                vals = _tr["pass_vals"]                  # their palette glides A -> B with the mask
+                pal = _pal_a + (palette_stops(_tr["b"]["palette"]) - _pal_a) * _tr["e"]   # <transitions]
             layer_on = {}
-            # art_use: 0 = the relief fly-through pass (uploaded art only); 1..5 = the compositor uses the flat image
+            # art modes (art_layer.art_weights: art_use one-hot, or the art_mix_* amounts with art_combine on):
+            # relief = the fly-through pass (uploaded art only); the others = the compositor uses the flat image
             # (uploaded piece or, with art_source 1 / no art loaded, the AI texture on show)
-            art_mode, src_ai, src_asp = int(round(vals.get("art_use", 0.0))), vals.get("art_source", 0.0) > 0.5, 1.0
+            art_w, src_ai, src_asp = art_weights(vals), vals.get("art_source", 0.0) > 0.5, 1.0
+            art_flat = any(w > 0.0 for w in art_w[1:])   # a mode that needs the flat image (texS) besides the relief
             for ex in extra:
                 amount = max(vals.get(k, 0.0) for k in ex.get("keys", (ex["param"],)))
                 layer_on[ex["param"]] = 0.0
-                if ex["param"] == "l_art" and amount > 0.001 and (art_mode != 0 or src_ai or ex["obj"] is None or ex["fails"] >= 5):
+                if ex["param"] == "l_art" and amount > 0.001 and not any(art_w):
+                    continue                             # COMBINE on with every mode amount at 0: nothing to draw
+                if ex["param"] == "l_art" and amount > 0.001 and (art_w[0] <= 0.0 or src_ai or ex["obj"] is None or ex["fails"] >= 5):
                     got, loading = None, False
                     if not src_ai and ex["obj"] is not None:
                         # wall time (held by freeze only): speed 0 must not stall a piece switch
@@ -2860,6 +3147,9 @@ def main():
                         fvals = dict(vals, rotate=vals["rotate"] + vals.get("spin", 0.0) * SPIN_RATE / 0.6)
                         tex = ex["obj"].render(fvals, clock, T, ph.travel, [tuple(map(float, c)) for c in pal])
                     elif ex["param"] == "l_beings":
+                        if skins is not None:        # [beings> the sprite image is picked in the skin slot beings:sprite <beings]
+                            ex["obj"].skin_frame = ((getattr(controller, "skins", None) or own_skins).frame
+                                                    if sk_st.get("ready") else None)
                         tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0), clock, T, dts, smr, pal)
                     elif ex["param"] == "l_kene_shipibo":
                         tex = ex["obj"].render(dict(vals, chase_phase=chase % 1.0, rot_phase=ph.rot + ph.spin), clock, T, dts, smr, pal)
@@ -2869,21 +3159,52 @@ def main():
                         tex = ex["obj"].render(the_stack().frame, amount, pal)
                     elif ex["param"] == "l_land":
                         tex = ex["obj"].render(vals, clock, T, ph.travel, None, pal, smr, spin_phase=ph.spin)
+                    elif ex["param"] == "l_coilnest":        # [coilnest> skin: procedural / SKINS slot / LayerHub layer
+                        _cs, _lay, _hub = int(round(vals.get("coil_skin", 0.0))), None, skins.hub if skins is not None else None
+                        if _cs in (2, 3) and _hub is not None:
+                            _id = "lines4" if _cs == 2 else coil_mod.HUB_IDS[min(max(int(round(vals.get("coil_layer", 0.0))), 0), len(coil_mod.HUB_IDS) - 1)]
+                            _i = _hub.request(_id)
+                            _lay = ("hub", _hub, _i, coil_mod.LAYER_KENE4 if _cs == 2 else coil_mod.LAYER_COLOUR) if _i >= 0 else None
+                        tex = ex["obj"].render(vals, clock, T, dts, smr, pal, layer=_lay,
+                                               skins=skins if _cs == 1 and sk_st.get("ready") else None)   # <coilnest]
                     else:
                         tex = ex["obj"].render(dict(vals, spin_phase=ph.spin), clock, T, ph.travel, dts)
                     tex.use(ex["unit"])
+                    if ex["param"] == "l_art" and art_flat:  # relief + flat modes at once: the same piece, flat
+                        got = guarded("art", ex["obj"].current, default=None)
+                        if got:
+                            got[0].use(8)
+                            src_asp = got[1]
+                    ex["tex"], ex["drawn"] = tex, frame  # [skins] a skin may copy this frame's layer (LayerHub) <skins]
                     layer_on[ex["param"]], ex["fails"] = ex.get("gate", amount), 0
                 except Exception as err:
                     ex["fails"] += 1
                     print(f"[{ex['param']}] render failed ({ex['fails']}/5): {err}")
                 if gov: gov.timer.stop()             # close this pass's GPU timer (success or failure)
+            vals, pal = _vals_a, _pal_a                  # [transitions] A's own values again for everything below
 
+            # [serpent-skin> the scene's serpents wear the coil nest's skin (one 512x448 bake, only while used)
+            _ss_on = 0.0
+            if vals.get("serpent", 0.0) > 0.0 and vals.get("serpent_skin", 0.0) > 0.0:
+                _cx = next((e for e in extra if e["param"] == "l_coilnest" and e["obj"] is not None and e["fails"] < 5), None)
+                if _cx is not None:
+                    try:
+                        _cs, _lay, _hub = int(round(vals.get("coil_skin", 0.0))), None, skins.hub if skins is not None else None
+                        if _cs in (2, 3) and _hub is not None:
+                            _i = _hub.request("lines4" if _cs == 2 else coil_mod.HUB_IDS[min(max(int(round(vals.get("coil_layer", 0.0))), 0), len(coil_mod.HUB_IDS) - 1)])
+                            _lay = ("hub", _hub, _i, coil_mod.LAYER_KENE4 if _cs == 2 else coil_mod.LAYER_COLOUR) if _i >= 0 else None
+                        _cx["obj"].bake(vals, clock, T, dts, smr, pal, layer=_lay).use(29)
+                        _ss_on = 1.0
+                    except Exception as err:
+                        _cx["fails"] += 1
+                        print(f"[serpent_skin] bake failed ({_cx['fails']}/5): {err}")
+            # <serpent-skin]
             # ---- scene pass (ping-pong feedback)
             src, dst = frame % 2, (frame + 1) % 2
             fbos[dst].use()
             ctx.viewport = (0, 0, rw, rh)
             texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
-            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, texK=16, texN=17, mixAB=mix,
+            uni = dict(texA=0, texB=1, prevFrame=2, texV=3, texF=4, texR=5, texL=7, texG=6, texT=10, texTT=11, texK=16, texN=17, texC=18, mixAB=mix,
                        bass=smr[0], mid=smr[1], high=smr[2], aspect=rw / rh, pxh=1.0 / rh,
                        hasVideo=1.0 if has_video else 0.0, limiter=limiter.value, nanGuard=0.0 if args.no_nan_guard else 1.0,
                        chasePh=chase % 1.0, chaseCol=(chase * 0.15) % 1.0, breath=breath, calm=calm,
@@ -2897,12 +3218,25 @@ def main():
             core_want = min(1.0, 8.0 * max([vals[n] for n in CORE_LAYERS] or [1.0])) if on_canvas else 1.0
             st["core"] = core_want if headless else st.get("core", 1.0) + (core_want - st.get("core", 1.0)) * (1.0 - math.exp(-dt / 0.3))
             uni["coreOn"] = st["core"]
-            uni.update(texS=8, artUse=float(art_mode), srcAI=1.0 if src_ai else 0.0, srcAsp=src_asp,
+            uni.update(texS=8, artW=art_w, srcAI=1.0 if src_ai else 0.0, srcAsp=src_asp,
                        srcPh=(ph.swim * 0.035) % 2.0, srcTr=(ph.travel * 0.45 + ph.T * 0.04) % 2.0)
             for name, v in vals.items():
                 uni[f"p_{name}"] = v
             uni["p_blackout"] = bo
             uni.update({f"p_{k2}": v2 for k2, v2 in layer_on.items()})
+            _lay_b = None
+            if _tr is not None:                          # [transitions> each render shows its own share of a pass
+                _lay_b = {}
+                for ex in extra:
+                    k = ex["param"]
+                    if layer_on.get(k, 0.0) > 0.0:
+                        ks = ex.get("keys", (k,))
+                        au = max(_tr["pass_vals"].get(q, 0.0) for q in ks)
+                        if au > 1e-6:
+                            uni[f"p_{k}"] = layer_on[k] * min(1.0, max(vals.get(q, 0.0) for q in ks) / au)
+                            _lay_b[k] = layer_on[k] * min(1.0, max(_tr["b"].get(q, 0.0) for q in ks) / au)   # <transitions]
+            if "serpent_skin" in vals:                   # [serpent-skin] never sample the strip unless it was baked this frame
+                uni["p_serpent_skin"], uni["texSS"] = vals["serpent_skin"] * _ss_on, 29
             if cam is not None:                      # crowd camera: mask / flow on units 12 / 13 (p_l_camera 0 while off)
                 uni.update(guarded("camera", cam.uniforms, vals, uni, default=None) or {"p_l_camera": 0.0})
             # [filters> post-FX chain: while a filter is on, the scene draws without limiter / master / blackout and
@@ -2917,19 +3251,27 @@ def main():
                 scene_prog, scene_vao = skin_scene() or scene_plain
                 if scene_prog is not scene_plain[0]:
                     skins.bind(scene_prog, "tunnel")     # GL: not guarded <skins]
-            for kname, v in uni.items():
-                if kname in scene_prog:
+            _snames = prog_names(scene_prog)             # [perf] a set: `k in program` walks every member (moderngl
+            for kname, v in uni.items():                 # has no __contains__), per uniform, per frame
+                if kname in _snames:
                     if isinstance(v, np.ndarray):
                         scene_prog[kname].write(v.tobytes())
                     else:
                         scene_prog[kname].value = v
-            if "pal" in scene_prog:
+            if "pal" in _snames:
                 scene_prog["pal"].write(np.ascontiguousarray(pal, dtype="f4").tobytes())
-            if "rip" in scene_prog:
+            if "rip" in _snames:
                 scene_prog["rip"].write(ripples.tobytes())
             if gov: gov.timer.start("scene")
             scene_vao.render(moderngl.TRIANGLE_STRIP)
             if gov: gov.timer.stop()
+            if _tr is not None:                          # [transitions> B (small, private) + the A -> B composite, in
+                if gov: gov.timer.start("transition")    # place on disp: filters, flash guard, Spout, preview, mapping
+                _ok = guarded("transition", trans_run, _tr, uni, _lay_b, scene_prog, scene_vao, pal, default=False)
+                if gov: gov.timer.stop()                 # and the recorder all see the composite; the echo never sees B
+                if not _ok:
+                    guarded("transition", controller.trans.engine_failed)   # finish at once, never stall half-way
+            # <transitions]
             if filt_on:                                  # [filters> in place on disp, before Spout / preview / mapping
                 if gov: gov.timer.start("filters")
                 filt_ok = filters_run(filt, disp, vals, clk, dt, limiter.value, vals["master"], bo, pal)
@@ -2939,7 +3281,7 @@ def main():
                 texs[ti][1].use(0); texs[tj][1].use(1); pp[src].use(2); video.tex.use(3)
                 for kname, v in (("limiter", limiter.value), ("p_master", vals["master"]), ("p_blackout", bo)):
                     uni[kname] = v                       # real values back (PreviewTap's redraws use them too)
-                    if kname in scene_prog:
+                    if kname in _snames:
                         scene_prog[kname].value = v
                 if filt_ok:
                     filt_fails = 0
@@ -2969,6 +3311,18 @@ def main():
             if preview is not None and remote.running:   # panel monitor + layer panel (only while a panel is watching):
                 # output frame, preview-only layer mix, or one layer thumbnail; never touches the projector frame
                 guarded("preview", preview.service, remote, disp, scene_prog, scene_vao, uni)
+            if st.get("asnap") or asnap is not None:     # [online-see> ONLINE assistant (SEE THE OUTPUT): ONE picture of the
+                # guarded output (after filters + flash guard, before mapping); asynchronous readback, JPEG encoded off
+                # the GL thread, handed to the plugin (dropped there unless it asked for it and ONLINE is on)
+                if asnap is None and PreviewTap is not None:
+                    asnap = guarded("assist-snap", PreviewTap, ctx, (640, 400), 80)
+                if asnap is None:
+                    st["asnap"] = False
+                else:
+                    guarded("assist-snap", asnap.collect)
+                    if st.get("asnap") and guarded("assist-snap", asnap.snap, disp,
+                                                   lambda jpg, c=controller: _see_in(c, jpg), default=False):
+                        st["asnap"] = False              # <online-see]
             if st["snap"]:                           # one readback per request, PNG encode off the GL thread
                 st["snap"] = False
                 try:
@@ -3042,6 +3396,12 @@ def main():
             if args.test:
                 lim_hist.append(limiter.value)
 
+            if skin_hub is not None:                 # [skins> layers as skins: requested layers -> the 512 px array
+                hub_st.update(frame=frame, vals=vals, uni=uni, has_video=has_video)    # (one dict check when none)
+                _hq = gov.skin_quality() if gov and hasattr(gov, "skin_quality") else 0
+                skin_hub.run("scene", _hq)           # GL: not guarded (a failing SOURCE is caught inside)
+                skin_hub.run("post", _hq)
+                skin_hub.end_frame()                 # <skins]
             frame += 1
             if sheet:
                 if frame == shot_at:
@@ -3106,12 +3466,25 @@ def main():
             guarded("exit", amap.close)
         if cam is not None:
             guarded("exit", cam.close)               # CAMERA OFF: the worker quits and releases the webcam
+        if trans_pass is not None:                   # [transitions] tests / benchmarks read this line
+            if headless or trans_pass.timing:
+                tm = trans_pass.timing or []
+                med = (lambda i: sorted(x[i] for x in tm)[len(tm) // 2] if tm else 0.0)
+                print(f"[transition] draws={trans_pass.draws} timed={len(tm)} b_ms={med(0):.3f} comp_ms={med(1):.3f}")
+            guarded("exit", trans_pass.release)
         if fguard is not None:                       # [flashguard]
             if headless:                             # tests read this line
                 print("[flashguard] " + " ".join(f"{k}={v}" for k, v in fguard.summary().items()))
             guarded("exit", fguard.release)
         if filt is not None:                         # [filters]
             guarded("exit", filt.release)
+        if skin_hub is not None:                     # [skins]
+            if headless:
+                print("[skin layers] " + " ".join(f"{k}={v}" for k, v in skin_hub.status().items() if k != "sources"))
+            guarded("exit", skin_hub.release)
+            for _o in list(hub_st["own"].values()):
+                if hasattr(_o, "release"):
+                    guarded("exit", _o.release)
         if skins is not None:                        # [skins]
             if headless:
                 print(f"[skins] binds={skins.binds} uploads={skins.lib.uploads} vram_mb={skins.status()['vram_mb']} "

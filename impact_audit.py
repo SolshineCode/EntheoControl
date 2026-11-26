@@ -33,6 +33,9 @@ CONTEXT = {
     "chase_width": dict(chase=1.0), "chase_rate": dict(chase=1.0), "chase_mode": dict(chase=1.0),
     "ripple": "ripple", "ripple_decay": "ripple",
     "art_source": dict(l_art=1.0, art_use=2.0), "art_use": dict(l_art=1.0),
+    "art_combine": dict(l_art=1.0, art_source=1.0, art_mix_stencil=1.0, art_mix_kaleido=1.0),
+    **{f"art_mix_{m}": dict(l_art=1.0, art_source=1.0, art_combine=1.0)
+       for m in ("relief", "stencil", "kaleido", "tunnel", "displace", "melt")},
     "swarm_vortex": dict(l_swarm=1.0), "swarm_turb": dict(l_swarm=1.0), "swarm_trail": dict(l_swarm=1.0), "swarm_tint": dict(l_swarm=1.0),
 }
 GROUP_CONTEXT = {"fractal": dict(l_fractal=1.0), "art": dict(l_art=1.0), "land": dict(l_land=1.0)}

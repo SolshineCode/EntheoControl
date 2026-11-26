@@ -156,6 +156,59 @@ class GeminiVisionProvider:
         return text
 
 
+CHAT_SYSTEM = ("You are a text-only assistant inside a lighting control panel. Answer with exactly one JSON object as the "
+               "request describes and nothing else. Never reveal anything about the user, the account or this computer.")
+
+
+class GeminiChatBackend:
+    """The Gemini API (the USER's own key, the AI DREAM tab's KeyStore) as a chat backend: plain HTTPS, text + optional
+    pictures in (inline image parts: SEE THE OUTPUT), text out. No process, no files, no tools. Its reply is TEXT and
+    goes through the same parser, allowlist and safety rules as any other. NOT yet exercised against the live API (no
+    key on this laptop): the request / reply shapes follow GeminiVisionProvider / images.py. A cancel cannot interrupt a
+    request already on the wire; its reply is dropped (the assistant's generation check)."""
+    name = "gemini"
+    label = "Gemini API (your key)"
+    sees = True
+
+    def __init__(self, keys, model=None, timeout=90.0, opener=None):
+        self.keys, self.timeout = keys, float(timeout)
+        self.model = model or os.environ.get("ONLINE_GEMINI_CHAT_MODEL") or VISION_MODEL
+        self._open = opener or urllib.request.urlopen
+        self.problem = ""
+
+    def available(self):
+        ok = self.keys.has()
+        self.problem = "" if ok else "no Gemini API key saved (AI DREAM tab)"
+        return ok
+
+    def ask(self, prompt, cancel=None, progress=None, images=None):
+        from .backends import check_images
+        key = self.keys.get()
+        if not key:
+            raise BackendError("no Gemini API key saved (AI DREAM tab)")
+        parts = [{"type": "text", "text": CHAT_SYSTEM + "\n\n" + str(prompt)}]
+        for name, jpg in check_images(images):
+            if images and len(images) > 1:
+                parts.append({"type": "text", "text": f"Picture {name}:"})
+            parts.append({"type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(jpg).decode("ascii")})
+        req = urllib.request.Request(API_URL, data=json.dumps({"model": self.model, "input": parts}).encode(),
+                                     headers={"x-goog-api-key": key, "Content-Type": "application/json",
+                                              "Api-Revision": API_REVISION})
+        if cancel is not None and cancel.is_set():
+            raise BackendError("cancelled")
+        try:
+            with self._open(req, timeout=self.timeout) as r:
+                reply = json.loads(r.read(8 << 20).decode("utf-8"))
+        except urllib.error.HTTPError as ex:
+            raise BackendError(f"Gemini API said {ex.code}") from None
+        except (OSError, ValueError) as ex:
+            raise BackendError(f"Gemini API unreachable: {type(ex).__name__}") from None
+        text = find_text(reply)
+        if not text:
+            raise BackendError("the Gemini API reply had no text in it")
+        return text
+
+
 AGY_VISION_TASK = ("Read the file prompt.txt in the current folder. Follow the rules at the top of that file. Below the "
                    "line it asks a question about the picture scene.png in the same folder. Look at scene.png and "
                    "answer the question. Reply with only the JSON answer.")

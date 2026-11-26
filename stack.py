@@ -181,8 +181,11 @@ COMPOSED = [
              grad=1.0, stops=RUBY),
         dict(gen=6, count=5, warp=0.65, freq=2.4, duty=0.04, soft=0.2, glow=0.4, even=0.85, speed=0.10, spin=0.012,
              angle=0.1, phase=0.0, blend=1, opacity=0.75, grad=1.0, stops=ROYAL),
-        dict(gen=1, freq=1.2, duty=0.025, soft=0.3, glow=0.7, even=0.9, speed=0.10, blend=1, opacity=0.55, stops=GOLD),
-        dict(VIGNETTE, freq=0.45),
+        dict(gen=1, freq=1.2, duty=0.025, soft=0.3, glow=0.8, even=0.9, speed=0.10, blend=1, opacity=0.8, stops=GOLD),
+        # ten spokes through every star tip (seen on the render: angle 0 lands on the tips, 0.05 on the inner corners)
+        dict(gen=3, count=10, duty=0.03, soft=0.3, glow=0.5, even=0.95, speed=0.0, spin=0.012, angle=0.0, blend=1,
+             opacity=0.45, stops=GOLD),
+        dict(VIGNETTE, freq=0.56),
     ]),
     # two counter-wound log spirals braided over / under, depth rings flying out of the core
     ("tunnel_weave", [

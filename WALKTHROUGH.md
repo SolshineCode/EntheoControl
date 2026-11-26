@@ -114,6 +114,16 @@ Nothing you switch off is lost. Power buttons never edit your faders.
 3. Click **SET SAFE…** and then pad 9: that is now where PANIC goes.
 4. Switch **AUTOPILOT** on (top bar) and watch it step through your scenes. Switch it off again.
 
+## 10a. Doors and portals (3 min)
+
+1. On **SCENES**, in the Transition card, press **DOORS** and Beats **4**. Click pad 10.
+   You should see two doors swing open in the current pattern, with the old picture on the door panels and pad 10's look behind them.
+2. Press **PORTAL**, drag the dot on the Origin pad to the top left, and click pad 9.
+   You should see a ring of light grow from that corner and pad 9's look inside it.
+3. Press **PATTERN REVEAL** and click pad 10: the new look comes through the bright lines first, then fills the frame.
+4. Press **SET FOR A SCENE…**, then pad 10: pad 10 now always opens with a pattern reveal. Press **MORPH** for the rest.
+5. Start a long transition (16 beats) and press PANIC: it stops at once on the safe scene.
+
 ## 10b. Themes and sound tags (5 min)
 
 1. Open **LAYERS**, make the beings look the way you like, and tap the small camera on the Beings row.

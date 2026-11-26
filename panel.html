@@ -253,6 +253,21 @@ select{background:var(--btn);color:var(--txt);border:1px solid var(--line);borde
 .art.wait{opacity:.6}
 .pmodes .tile{min-width:112px;min-height:64px;font-size:14px}
 .pmodes .tiles{padding:0;margin-bottom:6px}
+.amodes .amode{display:flex;flex-direction:column;gap:4px}
+.srcf{display:flex;gap:5px;flex-wrap:wrap;margin:6px 0}.srcf button{min-height:30px;padding:2px 10px;font-size:11px;letter-spacing:.08em}
+.srcf button.on{background:var(--acc2);color:#00110f;border-color:var(--acc2)}
+.pick .art .sm{position:absolute;right:3px;top:3px;min-height:24px;min-width:28px;padding:0 6px;font-size:14px;line-height:1;background:#000b;z-index:2}
+.pick .art .fv{position:absolute;left:4px;top:2px;color:#ffd54a;font-size:14px;text-shadow:0 0 3px #000}
+.pick .art.inset::before{content:"";position:absolute;left:5px;bottom:20px;width:8px;height:8px;border-radius:50%;background:var(--acc3,#e7f);box-shadow:0 0 5px #000}
+.pick .art.dreamed b{background:#5b2a8a}
+#srcmenu{position:fixed;z-index:60;display:none;flex-direction:column;gap:4px;padding:8px;border-radius:10px;background:#0b1013;border:1px solid var(--line);box-shadow:0 8px 30px #000c;min-width:190px;max-width:260px}
+#srcmenu.on{display:flex}#srcmenu .t{font-size:11px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px}
+#srcmenu button{min-height:34px;text-align:left;padding:4px 10px;font-size:12px}#srcmenu button.dn{color:#ff8a8a}
+@media(pointer:coarse){.pick .art .sm{min-height:40px;min-width:40px}#srcmenu button{min-height:44px}.srcf button{min-height:44px}}
+.amodes .amode .sl.hz{height:16px;width:100%;min-width:0}
+.amodes .tile.acomb{border-style:dashed;letter-spacing:.08em}
+.amodes .tile.acomb.on{border-style:solid;color:#00110f;background:var(--acc2);border-color:var(--acc2)}
+.amodes.comb .amode .tile.on{box-shadow:0 0 0 2px color-mix(in srgb,var(--acc2) 45%,transparent)}
 .pql{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:8px}
 .lyr{display:grid;grid-template-columns:minmax(200px,320px) minmax(300px,1fr);gap:12px;align-items:start}
 .lyr .monimg{display:block;width:100%;aspect-ratio:16/10;background:#000;border:1px solid var(--line);border-radius:8px;object-fit:contain}
@@ -565,6 +580,36 @@ function mkTiles(name,tabId){
   });
   return box;
 }
+/* art use modes: the one-mode selector (art_use) or, with COMBINE on (art_combine), any number of modes at once,
+   each with its own amount (art_mix_*, mini fader under its chip). In one-mode a mode button sets that mode's
+   amount to 1 and the others to 0 (= art_layer.mode_sets), so COMBINE starts from the look on screen. */
+var ART_MIXK=['relief','stencil','kaleido','tunnel','displace','melt'].map(function(m){return 'art_mix_'+m;});
+function mkArtModes(tabId){
+  if(!P.art_combine||!ART_MIXK.every(function(n){return P[n];}))return mkTiles('art_use',tabId);
+  var p=P.art_use,box=h('div','tiles amodes'),tl=h('div','tl'),cb=h('button','tile acomb','COMBINE'),items=[];
+  box.dataset.mt='param:art_use';cb.dataset.mt='param:art_combine';
+  cb.title='COMBINE: any number of modes at once, each with its own amount (e.g. Inside the lines + Kaleidoscope)';
+  add(box,h('div','fl',p.label),tl);tl.appendChild(cb);
+  function comb(){return Math.round(B.art_combine)>0;}
+  cb.addEventListener('click',function(){if(learnMode)return;
+    if(comb()){var best=0;ART_MIXK.forEach(function(n,k){if(B[n]>B[ART_MIXK[best]])best=k;});   /* back to one mode: the strongest */
+      if(B[ART_MIXK[best]]>0)setParam('art_use',best);setParam('art_combine',0);}
+    else{if(!ART_MIXK.some(function(n){return B[n]>0;}))setParam(ART_MIXK[clamp(Math.round(B.art_use),0,5)],1);setParam('art_combine',1);}});
+  ART_MIXK.forEach(function(n,i){
+    var w=h('div','amode'),b=h('button','tile',(p.options&&p.options[i])||String(i)),mem=1;
+    var sl=mkSlider({lo:0,hi:1,def:1,get:function(){return B[n];},set:function(v){setParam(n,v);},live:function(){return V[n];}});
+    sl.dataset.mt='param:'+n;sl.title='amount of this mode (double-click = full)';
+    b.addEventListener('click',function(){if(learnMode)return;
+      if(!comb()){setParam('art_use',i);ART_MIXK.forEach(function(m,k){setParam(m,k===i?1:0);});return;}
+      if(B[n]>0){mem=B[n];setParam(n,0);}else setParam(n,mem>0.05?mem:1);});              /* combine: on / off, keeps its amount */
+    add(w,b,sl);tl.appendChild(w);items.push([b,sl,n]);
+  });
+  reg(tabId,function(){var c=comb(),cur=Math.round(B.art_use),lv=Math.round(V.art_use);
+    cb.classList.toggle('on',c);box.classList.toggle('comb',c);
+    items.forEach(function(it,k){it[0].classList.toggle('on',c?B[it[2]]>0:k===cur);it[0].classList.toggle('live',!c&&k===lv&&lv!==cur);
+      it[1].style.display=c?'':'none';if(c)it[1].draw();});});
+  return box;
+}
 function card(title,grow){var c=h('div','card'+(grow?' grow':''));if(title)c.appendChild(h('h2',null,title));return c;}
 function segm(box,opts,get,set){          /* opts: [[value,label],...] */
   var bs=opts.map(function(o){var b=h('button',null,o[1]);b.addEventListener('click',function(){if(!learnMode){set(o[0]);draw();}});box.appendChild(b);return b;});
@@ -601,9 +646,11 @@ var VIDEO=['l_video','luma_key'].filter(function(n){return P[n];});
 META.groups.forEach(function(g){
   var t=GROUP_TAB[g];if(!t)return;
   var names=META.params.filter(function(p){return p.group===g&&!p.trigger&&VIDEO.indexOf(p.name)<0;}).map(function(p){return p.name;});
+  var amx=g==='art'&&P.art_combine&&P.art_use;                        /* combinable art modes: see mkArtModes */
+  if(amx)names=names.filter(function(n){return n!=='art_combine'&&ART_MIXK.indexOf(n)<0;});
   var tiles=names.filter(function(n){return P[n].options;}),fad=names.filter(function(n){return !P[n].options&&!P[n].stepped;});
   if(tiles.length){var c1=card((GROUP_NAME[g]||g)+': modes'),col=h('div');col.style.cssText='display:flex;flex-direction:column;gap:6px';
-    tiles.forEach(function(n){col.appendChild(mkTiles(n,t));});add(c1,col);
+    tiles.forEach(function(n){col.appendChild(amx&&n==='art_use'?mkArtModes(t):mkTiles(n,t));});add(c1,col);
     if(g==='beings')pages[t].insertBefore(c1,pages[t].firstChild);else pages[t].appendChild(c1);}
   if(fad.length){var c2=card(GROUP_NAME[g]||g),r=h('div','frow');fad.forEach(function(n){r.appendChild(mkFader(n,t));});add(c2,r);pages[t].appendChild(c2);}
 });
@@ -612,6 +659,80 @@ META.groups.forEach(function(g){
 var AUTO_BARS=[[4,'4'],[8,'8'],[16,'16'],[32,'32'],[64,'64'],[128,'128']];
 function morphSeg(label){return lseg(label||'Morph time (bars)',[[0,'CUT'],[1,'1'],[2,'2'],[4,'4'],[8,'8'],[16,'16']],function(){return X.morph;},function(v){X.morph=v;grab('morph');send({cmd:'morph',bars:v},'morph');});}
 function quantSeg(label){return lseg(label||'Quantize recall to next',[['off','OFF'],['beat','BEAT'],['bar','BAR'],['phrase','PHRASE']],function(){return X.quantize;},function(v){X.quantize=v;grab('quantize');send({cmd:'quantize',q:v},'quantize');});}
+/* [transitions] the default visual transition for scene / theme / preset recalls (doors, iris, portal ...):
+   kind pads (MIDI-learnable: transition:<kind>), length in beats (a knob: transition:len), mode, origin pad, end / cancel */
+var TRN=null;
+function trDef(){return (X.trans&&X.trans.default)||null;}
+function trSend(spec){X.trans=Object.assign({},X.trans||{},{default:spec});grab('trans');send({cmd:'transition',op:'default',spec:spec},'trans');draw();}
+function trSet(k,v){var d=trDef();if(!d)return;var o=Object.assign({},d);o[k]=v;if(k==='beats')delete o.secs;trSend(o);}
+function transMini(){                      /* PERFORM: one line (kind + beats); the full picker lives on SCENES */
+  TRN=TRN||(META&&META.transitions)||null;
+  var w=h('div');if(!TRN)return w;
+  var k=h('select'),b=h('select');k.title='Transition for scene recalls (full picker + origin: SCENES tab)';b.title='Beats';
+  [['morph','MORPH']].concat(TRN.kinds.map(function(x){return [x,String(TRN.names[x]||x).toUpperCase()];})).forEach(function(o){var e=h('option',null,o[1]);e.value=o[0];k.appendChild(e);});
+  [1,2,4,8,16].forEach(function(n){var e=h('option',null,n+' b');e.value=String(n);b.appendChild(e);});
+  k.addEventListener('change',function(){var d=trDef();trSend(k.value==='morph'?null:Object.assign({kind:k.value},TRN.defaults[k.value],d&&d.beats?{beats:d.beats}:{}));});
+  b.addEventListener('change',function(){trSet('beats',Number(b.value));});
+  var r=h('div');r.style.cssText='display:flex;gap:4px';add(r,k,b);add(w,h('div','lab','Transition'),r);w.firstChild.style.marginBottom='4px';
+  reg(null,function(){var d=trDef();if(document.activeElement!==k)k.value=d?d.kind:'morph';b.disabled=!d;if(d&&document.activeElement!==b)b.value=String(d.beats||4);});
+  return w;
+}
+function transBox(compact){
+  TRN=TRN||(META&&META.transitions)||null;
+  var w=h('div','trbox');if(!TRN)return w;
+  if(!document.getElementById('trcss')){var st=h('style');st.id='trcss';st.textContent=
+    '.trbox{display:flex;flex-direction:column;gap:6px}.trbox .seg{flex-wrap:wrap}.trbox .seg button{padding:4px 8px;font-size:11px}'+
+    '.trrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:flex-end}.trorg{width:160px;height:100px;background:#0b0b10;border:1px solid #333;'+
+    'border-radius:6px;touch-action:none;cursor:crosshair}.trst{font-size:11px;min-width:120px}.trbar{height:4px;background:#333;border-radius:2px;overflow:hidden}'+
+    '.trbar i{display:block;height:100%;width:0;background:#ffb21a}';document.head.appendChild(st);}
+  var lab=h('div','lab',compact?'Transition':'Transition (scene / theme / preset recalls)');
+  var kinds=h('div','seg');kinds.title='MORPH = the plain parameter glide. The others draw the new look a second time and open it through the old one. MIDI LEARN, then tap one: a pad picks it.';
+  var opts=[['morph','MORPH']].concat(TRN.kinds.map(function(k){return [k,String(TRN.names[k]||k).toUpperCase()];}));
+  var kb=opts.map(function(o){var b=h('button',null,o[1]);b.dataset.mt='transition:'+o[0];
+    b.addEventListener('click',function(){if(learnMode)return;var d=trDef();trSend(o[0]==='morph'?null:Object.assign({kind:o[0]},TRN.defaults[o[0]],d&&d.beats?{beats:d.beats}:{}));});kinds.appendChild(b);return b;});
+  var len=h('div','seg'),LENS=[1,2,4,8,16];len.dataset.mt='transition:len';len.title='Length in beats (MIDI LEARN: a knob)';
+  var lb=LENS.map(function(n){var b=h('button',null,String(n));b.addEventListener('click',function(){if(!learnMode)trSet('beats',n);});len.appendChild(b);return b;});
+  var lw=h('div');add(lw,h('div','lab','Beats'),len);
+  var md=h('div','seg'),mw=h('div'),mdKind=null,mb=[];add(mw,h('div','lab','Style'),md);
+  var nn=h('div','seg'),nw=h('div'),nKind=null,nb=[];add(nw,h('div','lab','Panels / sides / cells'),nn);
+  var row=h('div','trrow');add(row,lw,mw,nw);
+  add(w,lab,kinds,row);
+  var org=null,od=null,stx=h('div','dim trst'),bar=h('div','trbar'),fill=h('i'),endb=h('button',null,'END NOW'),canb=h('button',null,'CANCEL');
+  bar.appendChild(fill);
+  endb.addEventListener('click',function(){send({cmd:'transition',op:'finish'});});
+  canb.addEventListener('click',function(){send({cmd:'transition',op:'cancel'});});
+  canb.dataset.mt='transition:cancel';
+  var row2=h('div','trrow'),sw=h('div');add(sw,stx,bar);sw.style.minWidth='140px';
+  if(!compact){
+    org=h('canvas','trorg');org.width=160;org.height=100;org.title='Origin: tap / drag where the portal, iris, zoom and shatter start';
+    var drag=false,setO=function(e){var r=org.getBoundingClientRect(),x=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),y=Math.min(1,Math.max(0,1-(e.clientY-r.top)/r.height));
+      X.trans=Object.assign({},X.trans||{},{origin:[x,y]});grab('trans');send({cmd:'transition',op:'origin',x:x,y:y},'trorg');draw();};
+    org.addEventListener('pointerdown',function(e){if(learnMode)return;drag=true;try{org.setPointerCapture(e.pointerId);}catch(_){ }setO(e);});
+    org.addEventListener('pointermove',function(e){if(drag)setO(e);});
+    ['pointerup','pointercancel'].forEach(function(n){org.addEventListener(n,function(){drag=false;});});
+    var asg=h('button',null,'SET FOR A SCENE\u2026');asg.title='Then tap a scene pad: that scene always uses this transition (pick MORPH first to clear it)';
+    asg.addEventListener('click',function(){sceneMode='trans';banner('Tap a scene pad: it keeps this transition (MORPH clears it)',2600);draw();});
+    var ow=h('div');add(ow,h('div','lab','Origin'),org);add(row2,ow,sw,endb,canb,asg);
+  } else add(row2,sw,endb,canb);
+  w.appendChild(row2);
+  reg(null,function(){
+    var d=trDef(),k=d?d.kind:'morph',t=X.trans||{};
+    kb.forEach(function(b,i){b.classList.toggle('on',opts[i][0]===k);});
+    lb.forEach(function(b,i){b.classList.toggle('on',!!d&&d.beats===LENS[i]);b.disabled=!d;});
+    if(mdKind!==k){mdKind=k;md.textContent='';mb=[];var ms=(TRN.modes||{})[k]||[];
+      ms.forEach(function(m){var b=h('button',null,m.toUpperCase());b.addEventListener('click',function(){if(!learnMode)trSet('mode',m);});md.appendChild(b);mb.push([m,b]);});}
+    mw.style.display=mb.length?'':'none';mb.forEach(function(x){x[1].classList.toggle('on',!!d&&d.mode===x[0]);});
+    if(nKind!==k){nKind=k;nn.textContent='';nb=[];var r=(TRN.n||{})[k];var vals=!r?[]:k==='doors'?[1,2,4]:k==='slide'?[1,2,4]:k==='iris'?[3,4,5,6,8,12]:[4,6,10,16,24];
+      vals.forEach(function(v){var b=h('button',null,String(v));b.addEventListener('click',function(){if(!learnMode)trSet('n',v);});nn.appendChild(b);nb.push([v,b]);});}
+    nw.style.display=nb.length?'':'none';nb.forEach(function(x){x[1].classList.toggle('on',!!d&&d.n===x[0]);});
+    var a=t.active;stx.textContent=a?(String(TRN.names[a.kind]||a.kind)+' '+Math.round(a.t*100)+'%'+(t.queued?' \u00b7 next waiting':'')):(t.dip?'dip (MORPH fallback)':(d?'ready: '+String(TRN.names[k]||k):'MORPH'));
+    fill.style.width=(a?a.t*100:0)+'%';endb.disabled=canb.disabled=!a;
+    if(org){var g=org.getContext('2d'),o=t.origin||[0.5,0.5],use=d&&['iris','portal','zoom','shatter'].indexOf(k)>=0;
+      g.clearRect(0,0,160,100);g.strokeStyle='#333';g.beginPath();g.moveTo(80,0);g.lineTo(80,100);g.moveTo(0,50);g.lineTo(160,50);g.stroke();
+      g.fillStyle=use?'#ffb21a':'#555';g.beginPath();g.arc(o[0]*160,(1-o[1])*100,6,0,6.283);g.fill();}
+  });
+  return w;
+}
 function autoBarsSeg(label){return lseg(label||'Every (bars)',AUTO_BARS,function(){return X.auto.bars;},function(v){autoSet('bars',v);});}
 function autoOrderSeg(label){return lseg(label||'Order',[['random','RANDOM'],['next','NEXT']],function(){return X.auto.mode;},function(v){autoSet('mode',v);});}
 function autoDriftSeg(label){var dr=lseg(label||'Drift (slow random walk)',[[false,'OFF'],[true,'ON']],function(){return X.auto.drift;},function(v){autoSet('drift',v);});dr.firstChild.nextSibling.dataset.mt='drift';return dr;}
@@ -710,7 +831,7 @@ function mkDrawer(title,wide){               /* an overlay card like the MOD edi
   PF.xfade=mkDrawer('Scene crossfader: blend two saved scenes by hand');
   add(hs,h('span','pfsp'),PF.xfade.btn('A / B FADER','pffull'),sm);
   PF.sceneGrid=mkScenes('perform',false);zs.appendChild(PF.sceneGrid);
-  var tr=h('div','pftr');add(tr,morphSeg('Morph (bars)'),quantSeg('Quantize'),autoBarsSeg('Autopilot every (bars)'),autoOrderSeg('Autopilot order'));zs.appendChild(tr);
+  var tr=h('div','pftr');add(tr,morphSeg('Morph (bars)'),quantSeg('Quantize'),transMini(),autoBarsSeg('Autopilot every (bars)'),autoOrderSeg('Autopilot order'));zs.appendChild(tr);
 
   /* ---- zone 2: macros */
   var MAC=['zoom','speed','spin','travel','symmetry','chase','trails'].filter(function(n){return P[n];});
@@ -1058,6 +1179,7 @@ function sceneAct(i,e){
   else if(m==='clear'){send({cmd:'scene_clear',i:i});X.scenes.occ[i]=0;grab('scenes');}
   else if(m==='safe'){send({cmd:'safe',i:i});X.scenes.safe=i;grab('scenes');}
   else if(m==='decka'||m==='deckb'){if(X.scenes.occ[i]){var o={};o[m==='decka'?'a':'b']=i;xfSet(o);}else banner('Scene '+(i+1)+' is empty',1200);}
+  else if(m==='trans'){if(X.scenes.occ[i]){send({cmd:'transition',op:'scene',i:i,spec:trDef()});banner('Scene '+(i+1)+': '+(trDef()?String((TRN&&TRN.names[trDef().kind])||trDef().kind):'MORPH (its own transition cleared)'),1600);}else banner('Scene '+(i+1)+' is empty',1200);}
   else if(X.scenes.occ[i]){var c={cmd:'scene_recall',i:i};if(e&&e.altKey)c.now=true;send(c);}
   if(m!=='recall'&&!(e&&e.shiftKey&&sceneMode==='recall')){sceneMode='recall';}
   draw();
@@ -1087,13 +1209,14 @@ function autoSet(k,v){X.auto[k]=v;grab('auto');var c={cmd:'autopilot'};c[k]=v;se
 (function(){
   var pg=pages.scenes,c=card('Scenes',true);c.style.flexBasis='700px';
   var modes=h('div','seg');modes.style.marginBottom='10px';
-  segm(modes,[['recall','RECALL'],['save','SAVE TO…'],['clear','CLEAR…'],['safe','SET SAFE…'],['decka','DECK A…'],['deckb','DECK B…']],function(){return sceneMode;},function(v){sceneMode=v;});
+  segm(modes,[['recall','RECALL'],['save','SAVE TO…'],['clear','CLEAR…'],['safe','SET SAFE…'],['decka','DECK A…'],['deckb','DECK B…'],['trans','TRANSITION…']],function(){return sceneMode;},function(v){sceneMode=v;});
   add(c,modes,mkScenes('scenes',true));
   add(c,h('div','dim','Recall waits for the quantize boundary, then morphs. SAFE marks the scene PANIC jumps to.'));c.lastChild.style.cssText='font-size:11px;margin-top:8px';
   pg.appendChild(c);
   var c2=card('Transition');c2.style.cssText='display:flex;flex-direction:column;gap:12px';
   add(c2,morphSeg());
   add(c2,quantSeg());
+  add(c2,transBox(false));                     /* [transitions] */
   var ini=h('button',null,'RESET ALL FADERS + MODS'),it=0;
   ini.addEventListener('click',function(){if(!it){ini.textContent='TAP AGAIN TO RESET';ini.classList.add('arm');it=setTimeout(function(){it=0;ini.textContent='RESET ALL FADERS + MODS';ini.classList.remove('arm');},2500);return;}
     clearTimeout(it);it=0;ini.textContent='RESET ALL FADERS + MODS';ini.classList.remove('arm');send({cmd:'init'});});
@@ -1894,14 +2017,74 @@ function pickSource(kind,i,name){
   draw();
 }
 function texNow(){return pickTexT>now()?pickTex:(L.tex||'');}
+/* ---- one image library (image_library.py): every image usable everywhere */
+var SRC_FILTERS=[['all','ALL','every image'],['art','ART','uploaded / saved art pieces'],['ai','AI','AI generations and seed textures'],
+  ['dream','DREAMED','dreamified images'],['fav','\u2605','favourites']],srcF='all';
+try{srcF=localStorage.getItem('pf_srcf')||'all';}catch(_){}
+function srcItems(){
+  if(Array.isArray(SRC.items))return SRC.items;                      /* older server: build the list from art + tex */
+  return SRC.tex.map(function(t){return {id:'ai:'+t.name,kind:'ai',name:t.name,title:t.name,ai:t.ai,t:t.t,dreamed:/^gen_dream_/i.test(t.name)};})
+    .concat(SRC.art.map(function(a){return {id:'art:'+a.name,kind:'art',name:a.name,title:a.name,t:0,dreamed:/_dream_/i.test(a.name)};}));
+}
+function srcPass(it,f){return f==='all'||(f==='art'&&it.kind==='art'&&!it.dreamed)||(f==='ai'&&it.kind==='ai'&&!it.dreamed)||
+  (f==='dream'&&!!it.dreamed)||(f==='fav'&&!!it.fav);}
+function libPost(body){
+  return fetch('library',{method:'POST',cache:'no-store',headers:{'X-Token':K,'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json().catch(function(){return {};}).then(function(d){d._code=r.status;return d;});})
+    .catch(function(){return {_code:0,error:'no connection'};});
+}
+function libDone(d,ok){if(d._code===200){srcT=-1e9;loadSources();if(ok)banner(ok,1800);}else banner(d.error||'that did not work',3200);return d._code===200;}
+function srcUseArt(it,ix){
+  if(it.kind==='art'){pickSource('art',ix,it.name);return;}
+  banner('Copying the AI image into the art library (a depth map follows for the fly-through)...',2500);
+  libPost({op:'import',kind:'ai',name:it.name}).then(function(d){if(libDone(d))pickSource('art',d.index,d.name);});
+}
+function srcUseLayer(it){
+  var key=it.kind==='art'?'art/'+it.name:it.name;send({cmd:'show_texture',name:key});pickTex=key;pickTexT=now()+2500;
+  if(P.l_ai&&B.l_ai<0.05){fadeParam('l_ai',0.7,700);banner('AI texture layer was off: fading it in',1600);}draw();
+}
+var srcMenuEl=null;
+function srcMenu(it,ix,anchor){
+  if(!srcMenuEl){srcMenuEl=h('div');srcMenuEl.id='srcmenu';document.body.appendChild(srcMenuEl);
+    document.addEventListener('pointerdown',function(e){if(srcMenuEl.classList.contains('on')&&!srcMenuEl.contains(e.target))srcMenuEl.classList.remove('on');},true);
+    window.addEventListener('keydown',function(e){if(e.key==='Escape'&&srcMenuEl.classList.contains('on')){srcMenuEl.classList.remove('on');e.preventDefault();e.stopImmediatePropagation();}},true);}
+  var m=srcMenuEl,PN=window.__panel||{};m.textContent='';m.appendChild(h('div','t',(it.title||it.name)+'  \u00b7  '+it.name));
+  function act(lab,tip,fn,cls){var b=h('button',cls||null,lab);b.title=tip;b.addEventListener('click',function(){m.classList.remove('on');fn();});m.appendChild(b);}
+  act('USE AS ART','the art layer shows it in every art mode'+(it.kind==='ai'?' (copied into the art library once, with a depth map for the relief)':''),function(){srcUseArt(it,ix);});
+  act('IN THE AI LAYER','the AI-texture layer cross-fades to it',function(){srcUseLayer(it);});
+  act(it.picked?'REMOVE FROM PICKED SET':'ADD TO PICKED SET','the AI-texture layer cycles the picked set when Image set = Picked set',function(){
+    libPost({op:it.picked?'unpick':'pick',kind:it.kind,name:it.name}).then(function(d){
+      if(libDone(d,it.picked?'Removed from the picked set':'Added to the picked set')&&!it.picked&&P.img_set&&Math.round(B.img_set)!==3)
+        banner('Added. Set "Image set" to Picked set (LAYERS / Sources) to cycle only these',3200);});});
+  act(it.fav?'\u2605 UNFAVOURITE':'\u2606 FAVOURITE','favourites: the \u2605 filter',function(){libPost({op:it.fav?'unfav':'fav',kind:it.kind,name:it.name}).then(function(d){libDone(d);});});
+  act('SKIN','put it on the skin slot selected in the SKINS card',function(){
+    if(PN.skinTo)PN.skinTo(it.kind,it.name);else banner('Skins are not available in this build',2500);});
+  act('SPRITE CREATURE','the sprite creature (BEINGS, form "Sprite (your image)") wears this image',function(){
+    send({cmd:'skin',op:'assign',env:'beings',slot:'sprite',kind:it.kind,name:it.name});banner('Sprite image set: pick the Sprite form in BEINGS',2500);});
+  act('DREAM FROM\u2026','img2img: a new AI image grown from this one, guided by your words',function(){
+    var w=window.prompt('Dream from this image. Words for the new image:',it.title&&it.title!==it.name?it.title:'');
+    if(w&&w.trim()){send({cmd:'gen',prompt:w.trim().slice(0,500),init:{kind:it.kind,name:it.name},strength:0.55});banner('Dreaming from '+(it.title||it.name)+'...',2500);}});
+  act('DREAMIFY\u2026','real DeepDream of this image -> a new image in the library',function(){
+    if(PN.dreamify)PN.dreamify(it.kind,it.name);else banner('DREAMIFY is not available',2500);});
+  if(it.kind==='ai')act('SAVE TO ART\u2026','copy into the art library (title = its prompt) so it can be uploaded-art everywhere',function(){
+    var t=window.prompt('Title for the art piece:',it.title||'');if(t===null)return;
+    libPost({op:'import',kind:'ai',name:it.name,title:t}).then(function(d){libDone(d,'Saved to the art library: '+(t||d.name));});});
+  act('DELETE','delete this image file',function(){
+    if(!window.confirm('Delete "'+(it.title||it.name)+'"? The file is removed from the '+(it.kind==='art'?'art library':'AI textures')+'.'))return;
+    libPost({op:'delete',kind:it.kind,name:it.name}).then(function(d){libDone(d,'Deleted');});},'dn');
+  m.classList.add('on');
+  var r=anchor.getBoundingClientRect(),w=m.offsetWidth,hh=m.offsetHeight;
+  m.style.left=Math.max(8,Math.min(window.innerWidth-w-8,r.right-w))+'px';
+  m.style.top=Math.max(8,Math.min(window.innerHeight-hh-8,r.bottom+4))+'px';
+}
 function mkPicker(tabId,compact){
   var c=card(compact?null:'Sources: uploaded art + AI images  (click = use it now)',true),useB=null;c.style.flexBasis=compact?'420px':'560px';
   if(compact){                                                        /* title row + a drawer for the use modes */
     var hd=h('div','pfh');add(hd,h('h2',null,'Sources'),h('span','pfsp'));c.appendChild(hd);c.classList.add('pfsrc');
-    if(P.art_use){var ud=mkDrawer('How the picked image is used'),um=h('div','pmodes');um.appendChild(mkTiles('art_use',tabId));
+    if(P.art_use){var ud=mkDrawer('How the picked image is used'),um=h('div','pmodes');um.appendChild(mkArtModes(tabId));
       if(P.art_source)um.appendChild(mkTiles('art_source',tabId));ud.body.appendChild(um);useB=ud.btn('');hd.appendChild(useB);}
     var mb=h('button','pffull','UPLOAD\u2026');mb.title='ART tab: upload and manage pieces';mb.addEventListener('click',function(){setTab(pages.art?'art':'ai');});hd.appendChild(mb);
-  }else if(P.art_use){var mo=h('div','pmodes');mo.appendChild(mkTiles('art_use',tabId));
+  }else if(P.art_use){var mo=h('div','pmodes');mo.appendChild(mkArtModes(tabId));
     if(P.art_source)mo.appendChild(mkTiles('art_source',tabId));c.appendChild(mo);}
   if(!compact){
     var ql=h('div','pql'),qs=[];
@@ -1910,31 +2093,43 @@ function mkPicker(tabId,compact){
       w.dataset.mt='param:'+n;add(w,l,sl);ql.appendChild(w);qs.push(function(){sl.draw();setTxt(l,d[1]+' '+B[n].toFixed(2));});});
     c.appendChild(ql);
   }
+  if(!compact&&P.img_set)ql.appendChild(mkTiles('img_set',tabId));    /* which images the AI-texture layer cycles */
+  var fl=h('div','srcf'),fbs=[];
+  SRC_FILTERS.forEach(function(f){var b=h('button',null,f[1]);b.title=f[2];b.addEventListener('click',function(){srcF=f[0];
+    try{localStorage.setItem('pf_srcf',srcF);}catch(_){}key='?';draw();});fl.appendChild(b);fbs.push([f[0],b]);});
   var grid=h('div','pick'+(compact?' strip':'')),info=h('div','dim'),key='?',els=[];info.style.cssText='font-size:11px;margin-top:6px';
+  if(!compact)c.appendChild(fl);                                      /* PERFORM strip: no filter row (one screen), shows ALL */
   add(c,grid,info);
   reg(tabId,function(){
     var done=((C&&C.ai&&C.ai.done)||[]).map(function(d){return d.name;}).join('|');
     if(done!==srcAi){srcAi=done;srcT=-1e9;}                          /* a fresh AI image: list it right away */
     if(now()-srcT>4000)loadSources();
     if(qs)qs.forEach(function(f){f();});
-    var k=SRC.art.map(function(a){return a.name;}).join('|')+'#'+SRC.tex.map(function(t){return t.name+t.t;}).join('|');
+    fbs.forEach(function(f){f[1].classList.toggle('on',f[0]===srcF);});
+    var myF=compact?'all':srcF,items=srcItems(),k=myF+'#'+items.map(function(it){return it.id+it.t+(it.fav?'*':'')+(it.picked?'+':'');}).join('|');
     if(k!==key){key=k;grid.textContent='';els=[];
-      SRC.tex.forEach(function(t){var d=h('div','art tex'),im=h('img');im.loading='lazy';im.alt='';
-        im.src='tex-thumb/'+encodeURIComponent(t.name)+'?k='+encodeURIComponent(K)+'&t='+t.t;d.title=t.name;
-        add(d,im,h('b',t.ai?'ai':'',t.ai?'AI':'TEX'));d.addEventListener('click',function(){if(!learnMode)pickSource('tex',-1,t.name);});
-        grid.appendChild(d);els.push(['tex',t.name,d]);});
-      SRC.art.forEach(function(a,i){var d=h('div','art'),im=h('img');im.loading='lazy';im.alt='';
-        im.src='art-thumb/'+encodeURIComponent(a.name)+'?k='+encodeURIComponent(K);d.title=a.name;
-        add(d,im,h('b',null,'ART '+(i+1)));d.addEventListener('click',function(){if(!learnMode)pickSource('art',i,a.name);});
-        grid.appendChild(d);els.push(['art',i,d]);});
-      if(!els.length)grid.appendChild(h('div','dim','No images yet: upload art (ART tab) or dream one (AI DREAM tab).'));}
+      /* thumbnails keep the old contract (class "art", + "tex" for textures/, title = file name): DREAMIFY and the
+         skin cards decorate / drag them by it */
+      items.forEach(function(it){if(!srcPass(it,myF))return;
+        var ai=it.kind==='ai',ix=ai?-1:SRC.art.map(function(a){return a.name;}).indexOf(it.name);
+        var d=h('div','art'+(ai?' tex':'')+(it.dreamed?' dreamed':'')+(it.picked?' inset':'')),im=h('img'),mb=h('button','sm','\u22ef');
+        im.loading='lazy';im.alt='';d.title=it.name;d.dataset.lt=it.title||it.name;
+        im.src=(ai?'tex-thumb/':'art-thumb/')+encodeURIComponent(it.name)+'?k='+encodeURIComponent(K)+(ai?'&t='+it.t:'');
+        mb.title='everything you can do with this image';
+        mb.addEventListener('click',function(e){e.stopPropagation();e.preventDefault();if(!learnMode)srcMenu(it,ix,mb);});
+        add(d,im,h('b',ai&&it.ai?'ai':'',it.dreamed?'DREAM':ai?(it.ai?'AI':'TEX'):'ART '+(ix+1)),mb);
+        if(it.fav)d.appendChild(h('span','fv','\u2605'));
+        d.addEventListener('click',function(){if(!learnMode){if(ai)pickSource('tex',-1,it.name);else pickSource('art',ix,it.name);}});
+        grid.appendChild(d);els.push(ai?['tex',it.name,d]:['art',ix,d]);});
+      if(!els.length)grid.appendChild(h('div','dim',items.length?'Nothing in this filter.':'No images yet: upload art (ART tab) or dream one (AI DREAM tab).'));}
     var ai=Math.round(B.art_index||0),tn=texNow(),asrc=P.art_source?Math.round(B.art_source):-1;
     els.forEach(function(e){e[2].classList.toggle('on',e[0]==='art'?(e[1]===ai&&asrc!==1):e[1]===tn);});
     var off=P.l_art&&B.l_art<0.05;info.classList.toggle('warn',!!off);
-    if(useB){var up=P.art_use,ui=Math.round(B.art_use)-Math.round(up.lo);setTxt(useB,'USE: '+((up.options&&up.options[ui])||ui)+' \u25be');}
+    if(useB){var up=P.art_use,ui=Math.round(B.art_use)-Math.round(up.lo),cm=P.art_combine&&Math.round(B.art_combine)>0;
+      setTxt(useB,'USE: '+(cm?'COMBINED ('+ART_MIXK.filter(function(n){return P[n]&&B[n]>0;}).length+')':((up.options&&up.options[ui])||ui))+' \u25be');}
     setTxt(info,compact?(off?'ART LAYER OFF: tap an image and it fades in.  ':'')+SRC.tex.length+' textures \u00b7 '+SRC.art.length+' art pieces':
       (off?'THE ART LAYER IS OFF (opacity 0), so nothing shows yet: click an image and it fades in, or raise "Art pieces" in the Layers panel.  ':'')+
-      SRC.tex.length+' textures, '+SRC.art.length+' art pieces.  Teal frame = AI texture in use, pink = art piece.'+
+      SRC.tex.length+' textures, '+SRC.art.length+' art pieces.  Teal frame = AI texture in use, pink = art piece; \u22ef = use as art / in the AI layer / skin / sprite / dream / save / delete.'+
       '  Tip: SOLO the art layer in the Layers panel to see it alone in the monitor.');
   });
   return c;
@@ -2095,6 +2290,7 @@ function merge(d){
   var names={};for(n in cm)names[n]=1;for(n in M)names[n]=1;
   for(n in names)if(!held('m:'+n)){if(cm[n])M[n]=cm[n];else delete M[n];}
   if(!held('morph'))X.morph=c.morph;if(!held('quantize'))X.quantize=c.quantize;if(!held('glide'))X.glide=c.glide;
+  if(c.trans&&!held('trans'))X.trans=c.trans;       /* [transitions] default / origin / running one */
   if(!held('srate'))X.strobe_rate=c.strobe_rate;if(!held('src'))X.src=c.clock.src;if(!held('auto'))X.auto=c.autopilot;
   if(Array.isArray(c.bypass)&&!held('bypass'))X.bypass=c.bypass;if(c.seq&&!held('seq'))X.seq=c.seq;if(c.xfade&&!held('xfade'))X.xfade=c.xfade;
   if(!held('trig'))X.trig=c.trig;if(!held('scenes'))X.scenes=c.scenes;if(!held('cue'))X.cue_ch=c.midi.cue_ch;
@@ -2523,17 +2719,28 @@ st.textContent=
  '.onl-h button{min-height:26px;padding:0 8px}.onl-eng{margin:0 0 10px}.onl-eng .dim{color:var(--dim);font-size:12px;margin-top:4px}.onl-eng .priv{color:var(--acc3);font-size:12px;margin-top:4px}'+
  '.seg button:disabled{opacity:.4;cursor:not-allowed}'+
  '.onl-opt{display:flex;gap:8px;align-items:flex-start;font-size:12px;color:var(--dim)}.onl-opt input{margin-top:2px;width:18px;height:18px;flex:none}'+
- '.onl-key{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}.onl-key input{flex:1 1 200px;min-width:0;background:#0a070d;border:1px solid var(--line);border-radius:8px;padding:6px 8px}';
+ '.onl-key{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}.onl-key input{flex:1 1 200px;min-width:0;background:#0a070d;border:1px solid var(--line);border-radius:8px;padding:6px 8px}'+
+ /* SEE THE OUTPUT: pictures in the chat, the per-message toggle, the look-and-adjust loop */
+ '.onl-imgs{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.onl-imgs figure{margin:0}.onl-imgs img{display:block;width:min(220px,40vw);aspect-ratio:8/5;object-fit:cover;border-radius:6px;border:1px solid var(--line);background:#000}'+
+ '.onl-imgs figcaption{font-size:11px;color:var(--dim);text-transform:uppercase}.onl-m.loop{align-self:center;color:var(--acc2);font-size:12px;text-align:center}'+
+ '.onl-m.system .row{display:flex;gap:6px;justify-content:center;margin-top:6px}.onl-m.system .row button{min-height:32px}.onl-m.system .row button.pri{background:var(--acc3);border-color:var(--acc3);color:#000;font-weight:800}'+
+ '.onl-see{display:flex;flex-direction:column;gap:4px}.onl-see select{background:#0a070d;border:1px solid var(--line);border-radius:6px;color:inherit;padding:2px 4px}.onl-see .cost{color:var(--acc3);font-size:12px}'+
+ '.onl-loopst{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--acc2)}.onl-loopst button{min-height:28px}';
 document.head.appendChild(st);
 function $(i){return document.getElementById(i);}
 function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
 function send(c){c.cmd='online';if(window.__panel&&window.__panel.send)window.__panel.send(c);}
 var O={on:false,mode:'suggest',backend:'claude',engine:'local'},have=false;
+var KS=new URLSearchParams(location.search).get('k')||'';
 var PRIV='Prompts (and frames, for dream-from-frame) are sent to Google; usage limits apply.';
-var CHATPRIV='While ONLINE is on, your message and the current settings are sent to the chosen assistant (the Claude Code CLI, or agy if you allowed the Google CLI tools; each uses its own login on this laptop). Nothing is sent while ONLINE is off.';
+var CHATPRIV='While ONLINE is on, your message and the current settings are sent to the chosen assistant (the Claude Code CLI or agy, each with its own login on this laptop, or the Gemini API with your own key), plus one picture of the output when you tick Show the assistant the output. Nothing is sent while ONLINE is off.';
 function toggle(){send({op:'enable',on:!O.on});}
 function ask(inp){var t=(inp.value||'').trim();if(!t)return;if(!O.on){note('Switch ONLINE on first');return;}
-  send({op:'ask',text:t.slice(0,1000)});inp.value='';}
+  var c={op:'ask',text:t.slice(0,1000)};
+  if(inp===ui.ta&&ui.see&&ui.see.checked&&!ui.see.disabled){c.see=true;if(ui.loop.checked)c.loop=+ui.loopN.value||3;}
+  send(c);inp.value='';if(ui.see){ui.see.checked=false;ui.loop.checked=false;ui.loop.disabled=true;}}
+function pics(list){var w=el('div','onl-imgs');(list||[]).forEach(function(i){var f=el('figure'),im=el('img');
+  im.src='online-snap/'+(+i.id)+'?k='+encodeURIComponent(KS);im.alt=i.label||'picture';f.appendChild(im);f.appendChild(el('figcaption',null,i.label||''));w.appendChild(f);});return w;}
 function note(t){var b=$('banner');if(b){b.textContent=t;b.classList.add('on');setTimeout(function(){b.classList.remove('on');},1500);}}
 function seg(opts,cur,fn){var s=el('div','seg');opts.forEach(function(o){var b=el('button',null,o[1]);b.dataset.v=o[0];
   b.addEventListener('click',function(){fn(o[0]);});s.appendChild(b);});s._set=function(v){[].forEach.call(s.children,function(b){b.classList.toggle('on',b.dataset.v===v);});};s._set(cur);return s;}
@@ -2548,7 +2755,8 @@ var pg=$('pg-assistant'),ui={};
 if(pg){
   var c=el('div','card grow onlc');c.style.flexBasis='640px';c.appendChild(el('h2',null,'Online assistant: describe what you want, it proposes the changes'));
   var r=el('div','row');ui.sw=el('button','big onl-sw','ONLINE OFF');ui.sw.id='onlbig';ui.sw.addEventListener('click',toggle);
-  ui.be=seg([['claude','CLAUDE CODE'],['agy','AGY (GEMINI)']],O.backend,function(v){
+  ui.be=seg([['claude','CLAUDE CODE'],['agy','AGY (GEMINI)'],['gemini','GEMINI API (YOUR KEY)']],O.backend,function(v){
+    if(v==='gemini'&&!O.has_key){note('Save your own Gemini API key on AI DREAM first');return;}
     if(v==='agy'&&!O.cli_google){note('agy is opt-in: tick Allow Google CLI tools first (on the laptop itself)');return;}send({op:'backend',backend:v});});ui.be.id='onlbe';
   ui.mo=seg([['suggest','SUGGEST'],['autopilot','AUTOPILOT']],O.mode,function(v){send({op:'mode',mode:v});});ui.mo.id='onlmode';
   var can=el('button',null,'CANCEL');can.addEventListener('click',function(){send({op:'cancel'});});
@@ -2566,6 +2774,19 @@ if(pg){
   ui.ta.placeholder='e.g. "slower and deeper, emerald palette, bring in the jaguar"   Enter = send, Shift+Enter = new line';
   ui.ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask(ui.ta);}});
   var go=el('button','big','SEND');go.id='onlsend';go.addEventListener('click',function(){ask(ui.ta);});inr.appendChild(ui.ta);inr.appendChild(go);c.appendChild(inr);
+  /* SEE THE OUTPUT: per message, default off, reset after each send */
+  var so=el('div','onl-see');so.id='onlseebox';
+  var l1=el('label','onl-opt');ui.see=el('input');ui.see.type='checkbox';ui.see.id='onlsee';l1.appendChild(ui.see);
+  ui.seeT=el('span');ui.seeT.id='onlseeT';l1.appendChild(ui.seeT);so.appendChild(l1);
+  var l2=el('label','onl-opt');ui.loop=el('input');ui.loop.type='checkbox';ui.loop.id='onlloop';ui.loop.disabled=true;l2.appendChild(ui.loop);
+  var lt=el('span',null,'Look-and-adjust loop: after its changes are applied (by you in SUGGEST, at once in AUTOPILOT) and have settled, it looks again and refines, at most ');
+  ui.loopN=el('select');ui.loopN.id='onlloopn';for(var li=1;li<=6;li++){var op=el('option',null,String(li));op.value=String(li);if(li===3)op.selected=true;ui.loopN.appendChild(op);}
+  lt.appendChild(ui.loopN);lt.appendChild(document.createTextNode(' steps. It stops when you touch a fader or switch, PANIC, CANCEL or ONLINE OFF; every step can be undone.'));l2.appendChild(lt);so.appendChild(l2);
+  so.appendChild(el('div','cost','Cost: every look-and-adjust step is one more model call with a picture (the usual limit of 6 requests a minute applies).'));
+  ui.see.addEventListener('change',function(){ui.loop.disabled=!ui.see.checked;if(!ui.see.checked)ui.loop.checked=false;});
+  ui.loopSt=el('div','onl-loopst');ui.loopSt.id='onlloopst';ui.loopStT=el('span');ui.loopStB=el('button',null,'STOP LOOP');ui.loopStB.id='onlloopstop';
+  ui.loopStB.addEventListener('click',function(){send({op:'loop_stop'});});ui.loopSt.appendChild(ui.loopStT);ui.loopSt.appendChild(ui.loopStB);ui.loopSt.style.display='none';
+  c.appendChild(so);c.appendChild(ui.loopSt);
   pg.appendChild(c);
   var c2=el('div','card onlc');c2.style.cssText='flex:1 1 300px;max-width:520px';c2.appendChild(el('h2',null,'Applied by the assistant (undo any batch)'));
   ui.hist=el('div');ui.hist.id='onlhist';c2.appendChild(ui.hist);pg.appendChild(c2);
@@ -2629,11 +2850,22 @@ function draw(){
       if(!on)ui.log.appendChild(el('div','dim',O.missing?'The online plugin is not installed (plugins/online).':'ONLINE is off. The show runs fully offline; switch it on to chat with the assistant.'));
       else if(!(O.msgs||[]).length)ui.log.appendChild(el('div','dim','No messages yet.'));
       (on?O.msgs||[]:[]).forEach(function(m){var d=el('div','onl-m '+m.role,m.text);
+        if(m.imgs&&m.imgs.length)d.appendChild(pics(m.imgs));
+        if(m.confirm!=null){var cr=el('div','row'),ok=el('button','pri','SEND THIS PICTURE'),no=el('button',null,"DON'T SEND");
+          ok.dataset.act='see_ok';no.dataset.act='see_drop';
+          ok.addEventListener('click',function(){send({op:'see_ok',id:m.confirm});});no.addEventListener('click',function(){send({op:'see_drop',id:m.confirm});});
+          cr.appendChild(ok);cr.appendChild(no);d.appendChild(cr);}
         if(m.role==='assistant')d.appendChild(el('small',null,(m.label||m.backend||'')+(m.secs!=null?'  ·  '+(+m.secs).toFixed(1)+' s':'')+(m.warn?'  ·  '+m.warn:'')));
         ui.log.appendChild(d);if(m.prop!=null&&props[m.prop])ui.log.appendChild(propBox(props[m.prop],false));});
       if(atEnd)ui.log.scrollTop=ui.log.scrollHeight;}
     var b=O.busy,bl=b&&O.backends&&O.backends[b.backend]?O.backends[b.backend].label:(b?b.backend:'');
-    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(b.backend==='agy'?'  (agy takes 20 s or more)':'')+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):(O.notice||O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
+    ui.stat.textContent=!on?'':b?bl+' is thinking…  '+(+b.secs).toFixed(0)+' s'+(b.backend==='agy'?'  (agy takes 20 s or more)':'')+(O.queue>1?'  ·  '+(O.queue-1)+' waiting':''):O.looking?'Taking a picture of the output…':(O.notice||O.note||'Ready. Mode: '+String(O.mode||'').toUpperCase()+'.');
+    var be=(O.backends||{})[O.backend]||{},sees=!!be.sees&&on;
+    if(!sees){ui.see.checked=false;ui.loop.checked=false;ui.loop.disabled=true;}ui.see.disabled=!sees;
+    ui.seeT.textContent='Show the assistant the output: ONE 640x400 picture of the projector output (after filters and the flash guard, before mapping) goes with this message; you see the exact picture in the chat. Off after each message.'
+      +(on&&!be.sees?'  '+(be.label||O.backend)+' is text only here: it cannot be shown a picture without tools.':'')+(on?'':'  Needs ONLINE.');
+    var L=on?O.loop:null,PH={look:'taking a picture',confirm:'waiting for you to confirm the picture',ask:'the assistant is looking',apply:'waiting for you to APPLY (or DISMISS to end)',settle:'letting the change settle',rate:'waiting'};
+    ui.loopSt.style.display=L?'':'none';if(L)ui.loopStT.textContent='Look-and-adjust: step '+L.step+' of '+L.n+'  ·  '+(PH[L.phase]||L.phase)+(L.why?'  ·  '+L.why:'');
   }
   if(ui.hist){var hk=JSON.stringify(O.history||[]);if(hk!==keyHist){keyHist=hk;ui.hist.textContent='';
     var hs=(O.history||[]).slice().reverse();if(!hs.length)ui.hist.appendChild(el('div','dim','Nothing applied yet.'));
@@ -2803,7 +3035,7 @@ window.addEventListener('panelstate',function(e){
   if(sel===null&&S.layers.length)sel=S.layers[S.layers.length-1].id;
   /* a --fresh start opens SIMPLE on BUILD, once per launch; after that the browser's own choice stands */
   if(CAN.fresh){var seen='';try{seen=localStorage.getItem('fresh_seen')||'';}catch(_){}
-    if(seen!==String(CAN.fresh)){try{localStorage.setItem('fresh_seen',String(CAN.fresh));}catch(_){}setMode('simple');PN.setTab('build');}}
+    if(seen!==String(CAN.fresh)){try{localStorage.setItem('fresh_seen',String(CAN.fresh));}catch(_){}PN.setTab('build');}}   /* user 2026-11-26: never force SIMPLE; FULL stays the default */
 });
 
 /* ---------------- icons */
@@ -3372,6 +3604,7 @@ function poll(){
   });
 }
 function open(kind,name){cur={kind:kind,name:name};buildPop();pop.classList.add('on');poll();}
+if(window.__panel)window.__panel.dreamify=open;                     /* the Sources picker's action menu */
 function decorate(root){
   [].forEach.call((root||document).querySelectorAll('.pick .art'),function(el){
     if(el._dm||!el.title)return;el._dm=1;
@@ -3674,6 +3907,7 @@ function mkCard(tabId,envs,title){
   sw.addEventListener('click',function(){ON=!ON;onHold=Date.now()+900;send({op:'enable',on:ON});decorate();PN.draw();});
   c.appendChild(sw);c.appendChild(offn);
   var sel=null,tiles=[],FW=[],body=h('div','skenvs'),ctl=h('div','skctl'),strip=h('div','skstrip'),sname=h('div','skenv'),note=h('div','sknote'),stripKey='';
+  PN.skinTo=function(kind,name){if(sel)assign(sel.env,sel.slot,kind,name);else PN.banner('Tap a skin slot in the SKINS card first, then SKIN',2600);};   /* Sources picker action menu */
   envs.forEach(function(E){
     var eg=h('div');eg.appendChild(h('div','skenv',E.label));var row=h('div','skrow');
     E.slots.forEach(function(sl){
@@ -3707,6 +3941,42 @@ function mkCard(tabId,envs,title){
   ti.addEventListener('input',function(){if(!sel)return;var x=ti.value,v=[1,3,5].map(function(i){return +(parseInt(x.substr(i,2),16)/255).toFixed(3);});edit(sel.env,sel.slot,{tint:v});send({op:'set',env:sel.env,slot:sel.slot,set:{tint:v}},'sk:tint');});
   FW.push(function(d){if(document.activeElement!==ti)ti.value='#'+d.tint.map(function(v){return ('0'+Math.round(v*255).toString(16)).slice(-2);}).join('');});
   ctl.appendChild(tw);c.appendChild(ctl);
+  /* skin STACK: up to 2 layers on top of the slot (an image or a LIVE engine layer), each with blend, opacity,
+     colour-by-channel (4-channel line layers), floating patches and scroll. {"op":"layer"/"layer_clear"} */
+  var OV=MS.overlays,LS=MS.layer_sources||{},lay=h('div','skctl');lay.style.marginTop='4px';
+  function ldef(){var d={src:null,gate:[1,1,1,1]},f;for(f in OV.num)d[f]=OV.num[f].default;for(f in OV['int'])d[f]=OV['int'][f].default;return d;}
+  function lget(i){var d=slot(sel.env,sel.slot),L=(d.layers||[])[i];if(!L)return null;var o=ldef(),f;for(f in L)o[f]=L[f];return o;}
+  function lset(i,patch){var k=sel.env+':'+sel.slot,s=S.slots[k]=S.slots[k]||{},ls=s.layers=(s.layers||[null,null]).slice(),o=ls[i]||{},f;
+    for(f in patch)o[f]=patch[f];ls[i]=o;hold[k]=Date.now()+700;send({op:'layer',env:sel.env,slot:sel.slot,i:i,set:patch},'skl:'+i+Object.keys(patch).join());PN.draw();}
+  if(OV)[0,1].forEach(function(i){
+    var w=h('div','skf'),l=h('div','lab'),src=document.createElement('select'),bl=document.createElement('select'),
+        op=document.createElement('input'),pt=document.createElement('input'),rm=h('button',null,'COLOUR BY CHANNEL'),x=h('button',null,'REMOVE');
+    l.appendChild(h('span',null,'Layer '+(i+1)+' on top'));l.appendChild(x);w.appendChild(l);
+    [['','(none)']].concat(Object.keys(LS).map(function(n){return ['layer:'+n,'LIVE · '+LS[n]];})).forEach(function(o){var e=document.createElement('option');e.value=o[0];e.textContent=o[1];src.appendChild(e);});
+    var cur=document.createElement('option');cur.value='img';cur.textContent='(the image picked in the strip)';src.appendChild(cur);
+    OV.blend.forEach(function(n,j){var e=document.createElement('option');e.value=j;e.textContent=n;bl.appendChild(e);});
+    [op,pt].forEach(function(r){r.type='range';r.min=0;r.step=0.01;r.style.width='100%';});op.max=2;pt.max=1;
+    var lo=h('div','lab'),lp=h('div','lab');lo.appendChild(h('span',null,'Opacity'));lp.appendChild(h('span',null,'Floating patches'));
+    [src,bl].forEach(function(e){e.style.cssText='min-height:30px;width:100%';});
+    w.appendChild(src);w.appendChild(bl);w.appendChild(lo);w.appendChild(op);w.appendChild(lp);w.appendChild(pt);w.appendChild(rm);
+    src.addEventListener('change',function(){if(!sel)return;var v=src.value;
+      if(!v){send({op:'layer_clear',env:sel.env,slot:sel.slot,i:i});var k=sel.env+':'+sel.slot;if(S.slots[k]&&S.slots[k].layers)S.slots[k].layers[i]=null;hold[k]=Date.now()+700;PN.draw();return;}
+      if(v==='img'){var d=slot(sel.env,sel.slot);if(!d.src||d.src.kind==='layer'){PN.banner('Pick an image for the slot first',1600);return;}lset(i,{src:{kind:d.src.kind,name:d.src.name}});return;}
+      lset(i,{src:{kind:'layer',name:v.slice(6)}});});
+    x.addEventListener('click',function(){src.value='';src.dispatchEvent(new Event('change'));});
+    bl.addEventListener('change',function(){if(sel&&lget(i))lset(i,{blend:+bl.value});});
+    op.addEventListener('input',function(){if(sel&&lget(i))lset(i,{opacity:+(+op.value).toFixed(2)});});
+    pt.addEventListener('input',function(){if(sel&&lget(i))lset(i,{noise:+(+pt.value).toFixed(2)});});
+    rm.addEventListener('click',function(){var L=sel&&lget(i);if(L)lset(i,{remap:L.remap?0:1});});
+    FW.push(function(){var L=lget(i),on=!!(L&&L.src);
+      if(document.activeElement!==src)src.value=on?(L.src.kind==='layer'?'layer:'+L.src.name:'img'):'';
+      [bl,op,pt,rm,x].forEach(function(e){e.disabled=!on;});
+      if(on){if(document.activeElement!==bl)bl.value=L.blend;if(document.activeElement!==op)op.value=L.opacity;if(document.activeElement!==pt)pt.value=L.noise;rm.classList.toggle('on',!!L.remap);}});
+    lay.appendChild(w);});
+  var exb=h('button',null,'EXAMPLE WORLD: KENÉ-TYPE LINES OVER AI SKINS');exb.style.cssText='min-height:34px;margin-top:6px';
+  exb.title='loads a ready-made skin set on every world (replaces the skins on show)';
+  exb.addEventListener('click',function(){send({op:'example',name:'kene_cloth_world'});PN.banner('Example skins loaded on every world',1800);});
+  c.appendChild(lay);c.appendChild(exb);
   var g=h('div','skgen'),gi=document.createElement('input'),gb=h('button',null,'GENERATE A SKIN'),gx=h('button',null,'CANCEL');
   gi.type='text';gi.maxLength=400;gi.placeholder='describe a skin: "glowing coral lattice", "molten gold filigree"…';gi.id='skgen-'+tabId;
   gi.addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter')gb.click();});
@@ -3716,12 +3986,13 @@ function mkCard(tabId,envs,title){
   pg.insertBefore(c,tabId==='land'&&pg.firstChild?pg.firstChild.nextSibling:pg.firstChild);
   PN.reg(tabId,function(){
     sw.textContent='SKINS: '+(ON?'ON':'OFF');sw.classList.toggle('on',ON);offn.style.display=ON?'none':'';
-    [body,sname,tip,strip,g,note].forEach(function(x){x.style.display=ON?'':'none';});
-    if(!ON){ctl.style.display='none';return;}                         /* off: no requests, no controls */
+    [body,sname,tip,strip,g,note,exb].forEach(function(x){x.style.display=ON?'':'none';});
+    if(!ON){ctl.style.display='none';lay.style.display='none';return;}                         /* off: no requests, no controls */
     loadSrc();
     tiles.forEach(function(t){var d=slot(t.env,t.slot),u=thumb(d.src);
       if(u!==t.url){t.url=u;t.th.style.backgroundImage=u?'url("'+u+'")':'';t.th.textContent=u?'':'PROCEDURAL';}
-      t.fn.textContent=d.src?d.src.name:'built-in look';t.el.classList.toggle('has',!!d.src);t.cl.style.display=d.src?'':'none';
+      var nl=(d.layers||[]).filter(function(L){return L&&L.src;}).length;
+      t.fn.textContent=(d.src?(d.src.kind==='layer'?'LIVE '+d.src.name:d.src.name):'built-in look')+(nl?' +'+nl:'');t.el.classList.toggle('has',!!d.src||nl>0);t.cl.style.display=d.src?'':'none';
       t.el.classList.toggle('sel',!!sel&&sel.env===t.env&&sel.slot===t.slot);});
     var k=SRC.tex.map(function(t){return t.name;}).join('|')+'#'+SRC.art.map(function(a){return a.name;}).join('|');
     if(k!==stripKey){stripKey=k;strip.textContent='';
@@ -3731,7 +4002,7 @@ function mkCard(tabId,envs,title){
         e.addEventListener('click',function(){if(!sel){PN.banner('Tap a slot first, then an image',1600);return;}assign(sel.env,sel.slot,s.kind,s.name);});
         strip.appendChild(e);});
       if(!strip.firstChild)strip.appendChild(h('div','sknote','No images yet: upload art (ART tab) or dream one (AI DREAM tab), or generate a skin below.'));}
-    ctl.style.display=sel?'':'none';g.style.opacity=sel?'1':'.5';
+    ctl.style.display=sel?'':'none';lay.style.display=sel&&OV?'':'none';g.style.opacity=sel?'1':'.5';
     if(sel){var d=slot(sel.env,sel.slot);sname.textContent=sel.E.label+' · '+sel.slot+(d.src?'':'  (procedural: pick an image to skin it)');FW.forEach(function(f){f(d);});
       [].forEach.call(strip.children,function(e){e.classList.toggle('on',!!d.src&&e.title===d.src.name&&e.dataset.kind===d.src.kind);});}
     else sname.textContent='';
@@ -3744,6 +4015,9 @@ function mkCard(tabId,envs,title){
 var decks=MS.envs.filter(function(e){return e.host==='land';}),tun=MS.envs.filter(function(e){return e.host==='scene';});
 if(decks.length&&PN.P.l_land)mkCard('land',decks,'SKINS: put an image on the walls of a 3D world');
 if(tun.length)mkCard('motion',tun,'SKINS: put an image on the travel tunnel');
+/* [beings> sprite creature: SPRITE = your own image (alpha kept: it IS the creature), FILL = a skin inside its silhouette (look "Skinned fill") <beings] */
+var bei=MS.envs.filter(function(e){return e.host==='beings';});
+if(bei.length&&PN.P.l_beings)mkCard('beings',bei,'SPRITE CREATURE: drop your own image on SPRITE (being "Sprite (your image)"); FILL = a skin inside it');
 var lastT=0;
 window.addEventListener('panelstate',function(e){var d=e.detail,t=Date.now();if(!d||!d.skins||t-lastT<250)return;lastT=t;
   try{if(t>onHold&&ON!==!!d.skins.on){ON=!!d.skins.on;decorate();PN.draw();}
