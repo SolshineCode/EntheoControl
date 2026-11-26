@@ -284,19 +284,23 @@ try:
 except Exception:                                  # the module is optional: without it the decks are as they were
     _mat = None
 
-_SK_PX = "float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y, zr = p.z - uCam.z;"
-_SK_SCREEN = "skTap(%d, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y))"
+# f = one pixel's footprint on the surface (grown with distance: far detail is filtered a little harder than
+# strictly needed, which is what stops far-wall sparkle), zr = distance along the travel axis
+_SK_PX = "float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t), zr = p.z - uCam.z;"
+_SK_SCREEN = "skTap(%s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0) + N.xy*0.14, vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y))"
 SKIN_HOOKS = [
     # corridor: slot 0 = the vault, slot 1 = floor + ceiling
     ("      col = mix(pc*facets*0.55, mix(pc*1.5, vec3(1.0, 0.86, 0.5), 0.4), lines);\n", """
       { bool fl = (1.65 - abs(p.y)) < (rad - length(p.xy)); int s = fl ? 1 : 0;
         if (skA[s].w > 0.0005) {
           """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
-          if (mp > 1.5) S = skTap(s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
-          else if (mp > 0.5) S = skTri(s, vec3(p.xy, zr), fl ? vec3(0.0, 1.0, 0.0) : vec3(normalize(p.xy), 0.0), f);
+          vec3 N = fl ? vec3(0.0, -sign(p.y), 0.0) : vec3(-normalize(p.xy), 0.0);
+          float lit = skLight(N, rd, t, float(i));
+          if (mp > 1.5) S = """ + _SK_SCREEN % "s" + """;
+          else if (mp > 0.5) S = skTri(s, vec3(p.xy, zr), N, f);
           else if (fl) S = skTap(s, vec2(p.x + step(0.0, p.y)*1.7, zr), vec2(f, 0.0), vec2(0.0, f*clamp(t/1.65, 1.0, 64.0)));
           else S = skTap(s, vec2(ang/TAU, zr), vec2(f/(TAU*rad), 0.0), vec2(0.0, f*clamp(t/rad, 1.0, 64.0)));
-          col = skMix(s, col, S, lines, 0.62 + 0.38*facets);
+          col = skMix(s, col, S, lines, (0.66 + 0.34*facets)*lit);
         } }
 """, "after"),
     # torus: slot 0 = the tube, slot 1 = the torus side chambers
@@ -304,33 +308,41 @@ SKIN_HOOKS = [
       { int s = dTor > dTube ? 1 : 0;
         if (skA[s].w > 0.0005) {
           """ + _SK_PX + """ vec3 S; float mp = skB[s].x;
-          if (mp > 1.5) S = skTap(s, (v_uv - 0.5)*vec2(uRes.x/uRes.y, 1.0), vec2(1.0/uRes.y, 0.0), vec2(0.0, 1.0/uRes.y));
-          else if (mp > 0.5) S = skTri(s, vec3(q.xy, zr), vec3(normalize(q.xy), 0.0), f);
+          vec3 N = vec3(-normalize(q.xy - (s == 0 ? ctr : vec2(0.0))), 0.0);
+          float lit = skLight(N, rd, t, float(i));
+          if (mp > 1.5) S = """ + _SK_SCREEN % "s" + """;
+          else if (mp > 0.5) S = skTri(s, vec3(q.xy, zr), N, f);
           else S = skTap(s, vec2(atan(q.y, q.x)/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
-          col = skMix(s, col, S, edge, 0.55 + 0.45*lead);
+          col = skMix(s, col, S, edge, (0.60 + 0.40*lead)*lit);
         } }
 """, "before"),
     # vortex: the stained-glass panes are the "lines" (the lead between them stays dark)
     ("      col *= exp(-t*0.06);\n", """
       if (skA[0].w > 0.0005) {
         """ + _SK_PX + """ vec3 S; float mp = skB[0].x;
-        if (mp > 1.5) S = """ + _SK_SCREEN % 0 + """;
-        else if (mp > 0.5) S = skTri(0, vec3(p.xy, zr), vec3(normalize(p.xy), 0.0), f);
+        vec3 N = vec3(-normalize(p.xy), 0.0);
+        float lit = skLight(N, rd, t, float(i));
+        if (mp > 1.5) S = """ + _SK_SCREEN % "0" + """;
+        else if (mp > 0.5) S = skTri(0, vec3(p.xy, zr), N, f);
         else S = skTap(0, vec2(ang/TAU, zr), vec2(f/(TAU*1.9), 0.0), vec2(0.0, f*clamp(t/1.9, 1.0, 64.0)));
-        col = skMix(0, col, S, lead*(0.35 + 0.65*step(0.3, vG.z)), 0.30 + 0.70*lead);
+        col = skMix(0, col, S, lead*(0.35 + 0.65*step(0.3, vG.z)), (0.40 + 0.60*lead)*(1.0 - 0.35*smoothstep(0.1, 0.6, vG.x))*lit);
       }
 """, "before"),
-    # hex domes: latitude / longitude of the shell (the domes are fixed in the world: no travel follow)
+    # hex domes: ONE image per honeycomb cell (cell-local coordinates: no polar stretch, the rims hide the joins);
+    # the domes are fixed in the world, so there is no travel follow
     ("      col *= (0.85 + uMid*0.5)*exp(-t*0.07);\n", """
       if (skA[0].w > 0.0005) {
-        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y; vec3 S; float mp = skB[0].x;
-        if (mp > 1.5) S = """ + _SK_SCREEN % 0 + """;
+        float f = t*max(tan(radians(uFov)*0.5), 0.25)/uRes.y*(1.0 + 0.05*t); vec3 S; float mp = skB[0].x;
+        vec3 N = -n*sign(dot(n, -rd) + 1e-4);
+        float lit = skLight(N, rd, t, float(i))*smoothstep(0.0, 0.15, abs(dot(n, rd)));   // silhouettes fall to black
+        if (mp > 1.5) S = """ + _SK_SCREEN % "0" + """;
         else if (mp > 0.5) S = skTri(0, q, n, f);
-        else S = skTap(0, vec2(atan(n.y, n.x)/TAU, acos(clamp(n.z, -1.0, 1.0))/PI), vec2(f/(TAU*1.6), 0.0), vec2(0.0, f/(PI*1.3)));
-        col = skMix(0, col, S, rim, 0.45 + 0.55*cell);
+        else S = skTap(0, suv + vec2(uSh, 0.0) - hx.zw + 0.5, vec2(f*nx/(TAU*2.4), 0.0), vec2(0.0, f*ny/(PI*2.65)));
+        col = skMix(0, col, S, rim, (0.50 + 0.50*cell)*lit);
       }
 """, "before"),
 ]
+GLOW_ANCHOR = "\n  col += palC("          # each world adds its own coloured haze once, after the march
 
 
 def skinned_source(mode):
@@ -339,7 +351,10 @@ def skinned_source(mode):
     fs = LAND_FS[mode]
     if fs.count(anchor) != 1 or fs.count(HEADER) != 1:
         raise ValueError(f"skin hook anchor not found in landscape {mode}")
+    if fs.count(GLOW_ANCHOR) != 1:
+        raise ValueError(f"glow anchor not found in landscape {mode}")
     fs = fs.replace(HEADER, HEADER + _mat.GLSL)
+    fs = fs.replace(GLOW_ANCHOR, "\n  col += skDim*palC(")       # a skinned surface dims the world's coloured haze
     return fs.replace(anchor, add + anchor if where == "before" else anchor + add)
 
 TRAIL_FS = """
@@ -800,7 +815,8 @@ class LandPass:
             c = self._comp
             c["texA"].value, c["texB"].value, c["texS"].value = 0, 1, 2
             c["uX"].value, c["uLand"].value, c["uSwarm"].value = x, land if land > 0.001 else 0.0, swarm if stex else 0.0
-            c["uDisp"].value = min(max(_f(v, "land_disp"), 0.0), 1.0)
+            # the radial prism split turns fine image detail into rainbow mush: much gentler while a deck is skinned
+            c["uDisp"].value = min(max(_f(v, "land_disp"), 0.0), 1.0) * (0.35 if self.skinned_decks else 1.0)
             c["uHasB"].value = 1.0 if has_b else 0.0
             c["uBlend"].value = _idx(v, "land_blend", 7)
             c["uRaw"].value = 1.0 if self.debug_raw else 0.0

@@ -68,7 +68,7 @@ PERIODIC = (S_POLAR, S_TUNNEL)                       # the pattern plane's u axi
 # numeric fields: name -> (min, max, default, label, hint). Scene morphs interpolate them; MIDI / mods address them.
 NUM = {
     "freq":       (0.25, 48.0, 6.0, "Bands", "how many bands fit the frame height"),
-    "duty":       (0.02, 0.98, 0.5, "Band width", "lit part of each band"),
+    "duty":       (0.02, 1.0, 0.5, "Band width", "lit part of each band (1 = no gap)"),
     "soft":       (0.0, 1.0, 0.08, "Edge softness", "0 = razor edge (still antialiased)"),
     "angle":      (0.0, 1.0, 0.0, "Direction", "which way the bands run and travel"),
     "phase":      (0.0, 1.0, 0.0, "Phase offset", "slides this layer against the others, in bands"),
@@ -91,6 +91,7 @@ NUM = {
     # look fields, APPENDED 2026-11-26 (0 = the plain flat band of the first version)
     "glow":       (0.0, 1.0, 0.0, "Glow", "neon halo into the gaps + a hot core in each band"),
     "bevel":      (0.0, 1.0, 0.0, "Bevel", "shades each band like a lit tube"),
+    "even":       (0.0, 1.0, 0.0, "Even line weight", "lines keep one width where the pattern squeezes or fans out"),
 }
 # stepped fields: name -> (min, max, default, label, option names | None). Scene morphs snap them at the midpoint.
 INT = {
@@ -109,70 +110,106 @@ FIELDS = tuple(NUM) + tuple(INT)
 OPS = ("add", "set", "del", "move", "dup", "clear", "mod", "reset", "replace")
 
 JEWEL = [[0.0, 0.00, 0.85, 0.80], [0.25, 1.00, 0.05, 0.55], [0.5, 1.00, 0.70, 0.05], [0.75, 0.28, 0.10, 1.00]]
-# gradients that hold together as one family of light each (neighbouring hues + one accent)
+# curated families of light: two or three neighbouring jewel hues and one accent each
+ROYAL = [[0.0, 0.32, 0.14, 1.00], [0.35, 0.04, 0.50, 1.00], [0.7, 1.00, 0.76, 0.20]]              # indigo, sapphire, gold
+RUBY = [[0.0, 0.50, 0.10, 1.00], [0.4, 1.00, 0.08, 0.38], [0.75, 1.00, 0.80, 0.50]]               # violet, ruby, champagne
+VERDIGRIS = [[0.0, 0.00, 0.88, 0.48], [0.4, 0.00, 0.58, 0.78], [0.75, 1.00, 0.50, 0.14]]          # emerald, teal, copper
 AURORA = [[0.0, 0.00, 0.95, 0.80], [0.3, 0.05, 0.45, 1.00], [0.6, 0.55, 0.12, 1.00], [0.85, 1.00, 0.10, 0.65]]
 EMBER = [[0.0, 1.00, 0.82, 0.25], [0.3, 1.00, 0.42, 0.04], [0.6, 0.90, 0.08, 0.22], [0.85, 0.50, 0.04, 0.55]]
 SUNSET = [[0.0, 1.00, 0.76, 0.12], [0.28, 1.00, 0.32, 0.10], [0.55, 0.95, 0.08, 0.55], [0.8, 0.40, 0.10, 0.95]]
 JADE = [[0.0, 0.00, 0.90, 0.55], [0.35, 0.45, 1.00, 0.25], [0.65, 1.00, 0.80, 0.15], [0.85, 0.00, 0.70, 0.75]]
 ICE = [[0.0, 0.80, 1.00, 1.00], [0.35, 0.10, 0.70, 1.00], [0.7, 0.25, 0.15, 0.95]]
 PEACOCK = [[0.0, 0.00, 0.80, 0.75], [0.25, 0.05, 0.95, 0.40], [0.5, 1.00, 0.78, 0.10], [0.75, 0.45, 0.10, 1.00]]
-# what "+ ADD LAYER" gives for each generator: luminous line work on black that reads at once and invites a tweak
+GOLD = [[0.0, 1.00, 0.80, 0.30], [0.5, 1.00, 0.62, 0.16]]
+# what "+ ADD LAYER" gives for each generator: fine luminous filaments on black (crisp core, tight halo, faint bloom)
 GEN_PRESETS = {
-    G_STRIPES: dict(freq=6.0, angle=0.08, speed=0.25, duty=0.42, soft=0.1, bevel=0.75, glow=0.35, stops=JEWEL),
-    G_RINGS: dict(freq=6.0, speed=0.3, duty=0.3, soft=0.2, glow=0.7, bevel=0.3, grad=1.0, stops=SUNSET),
-    G_SPIRAL: dict(freq=3.5, count=5, speed=0.3, wave=1, duty=0.36, soft=0.2, glow=0.65, bevel=0.5, grad=1.0, stops=AURORA),
-    G_RAYS: dict(count=16, spin=0.03, speed=0.0, duty=0.3, soft=0.5, glow=0.8, grad=1.0, stops=EMBER),
-    G_CHECKER: dict(freq=6.0, speed=0.2, angle=0.125, soft=0.05,
-                    stops=[[0.0, 0.05, 0.85, 0.80], [0.5, 0.45, 0.12, 1.00]]),
-    G_WAVES: dict(freq=6.0, wave=1, duty=0.26, soft=0.3, warp=0.5, warp_freq=1.5, warp_speed=0.25, speed=0.15, glow=0.75,
-                  grad=1.0, stops=AURORA),
-    G_POLY: dict(freq=5.0, count=6, speed=0.25, duty=0.28, soft=0.15, glow=0.7, bevel=0.3, grad=1.0, stops=JADE),
-    G_NOISE: dict(freq=16.0, speed=0.4, soft=0.1, angle=0.25, bevel=0.7, glow=0.3, grad=1.0, stops=PEACOCK),
+    G_STRIPES: dict(freq=9.0, angle=0.08, speed=0.2, duty=0.14, soft=0.25, glow=0.9, stops=ROYAL),
+    G_RINGS: dict(freq=9.0, speed=0.25, duty=0.12, soft=0.25, glow=0.9, grad=1.0, stops=RUBY),
+    G_SPIRAL: dict(freq=5.0, count=6, speed=0.25, wave=1, duty=0.14, soft=0.25, glow=0.9, even=0.7, grad=1.0, stops=AURORA),
+    G_RAYS: dict(count=24, spin=0.02, speed=0.0, duty=0.10, soft=0.3, glow=0.9, even=0.85, grad=1.0, stops=EMBER),
+    G_CHECKER: dict(freq=6.0, speed=0.15, angle=0.125, soft=0.05, glow=0.85,
+                    stops=[[0.0, 0.05, 0.55, 1.00], [0.5, 0.50, 0.14, 1.00]]),
+    G_WAVES: dict(freq=9.0, wave=1, duty=0.12, soft=0.25, warp=0.5, warp_freq=1.5, warp_speed=0.2, speed=0.12, glow=0.9,
+                  even=0.9, grad=1.0, stops=VERDIGRIS),
+    G_POLY: dict(freq=8.0, count=6, speed=0.2, duty=0.12, soft=0.2, glow=0.9, even=0.8, grad=1.0, stops=VERDIGRIS),
+    # noise bands: a data stream of filaments, each its own weight and level, gently bent (not a barcode)
+    G_NOISE: dict(freq=14.0, speed=0.15, soft=0.25, duty=0.16, angle=0.25, glow=0.75, even=0.6, warp=0.22, warp_freq=0.8,
+                  warp_speed=0.08, grad=1.0, stops=ROYAL),
 }
 # ---- look sheets (tools/math_look.py): combinations worth showing, motion strips, composed stacks
 SHOWCASE = [
-    ("Polar stripes = spiral arms", [dict(gen=0, space=1, freq=9, angle=0.12, duty=0.34, glow=0.6, bevel=0.5, grad=1.0, stops=AURORA)]),
-    ("Tunnel checker", [dict(gen=4, space=2, freq=10, angle=0.0, soft=0.05)]),
-    ("Tunnel stripes (log spiral)", [dict(gen=0, space=2, freq=10, angle=0.1, duty=0.4, glow=0.5, bevel=0.7, grad=1.0, stops=SUNSET)]),
-    ("Kaleidoscope 8 x stripes", [dict(gen=0, space=3, folds=8, freq=10, angle=0.07, duty=0.3, glow=0.7, grad=1.0, stops=PEACOCK)]),
-    ("Kaleidoscope 6 x waves", [dict(gen=5, space=3, folds=6, glow=0.8, stops=ICE)]),
+    ("Polar stripes = spiral arms", [dict(gen=0, space=1, freq=10, angle=0.12, even=0.7, grad=1.0, stops=AURORA)]),
+    ("Tunnel checker", [dict(gen=4, space=2, freq=10, angle=0.0)]),
+    ("Tunnel stripes (log spiral)", [dict(gen=0, space=2, freq=12, angle=0.1, duty=0.2, bevel=0.6, glow=0.8, grad=1.0, stops=SUNSET)]),
+    ("Kaleidoscope 8 x stripes", [dict(gen=0, space=3, folds=8, freq=12, angle=0.07, grad=1.0, stops=PEACOCK)]),
+    ("Kaleidoscope 6 x waves", [dict(gen=5, space=3, folds=6, stops=ICE)]),
     ("Mirror XY x noise bands", [dict(gen=7, space=6, angle=0.1)]),
     ("Floor checker", [dict(gen=4, space=7, freq=3, angle=0.0)]),
-    ("Floor stripes", [dict(gen=0, space=7, freq=5, glow=0.5, bevel=0.6)]),
-    ("Stars (polygons 5, warp 0.7)", [dict(gen=6, count=5, warp=0.7)]),
-    ("Flower rings (rings, warp 0.6)", [dict(gen=1, warp=0.6, warp_freq=3.0, freq=7)]),
-    ("Blend ADD: stripes + rings", [dict(gen=0, blend=0), dict(gen=1, blend=0, opacity=0.8)]),
-    ("Blend MASK: gradient through rays", [dict(gen=0, freq=4, duty=0.98, soft=0.0, grad=1.0, angle=0.25, bevel=0.0, glow=0.0, stops=AURORA),
-                                           dict(gen=3, count=10, blend=4, glow=0.0, soft=0.3)]),
-    ("Blend DIFFERENCE: stripes x rings", [dict(gen=0, freq=7, angle=0.05, bevel=0.0, glow=0.0), dict(gen=1, freq=5, blend=3, glow=0.0, bevel=0.0)]),
-    ("Blend MULTIPLY: waves x checker", [dict(gen=5, freq=4, duty=0.6), dict(gen=4, freq=5, blend=2, soft=0.3)]),
-    ("Blend OVER: rays over rings", [dict(gen=1, freq=6, duty=0.9, glow=0.0), dict(gen=3, count=8, blend=6, duty=0.35)]),
-    ("Follow the show palette", [dict(gen=0, color=1, freq=6, angle=0.15)]),
+    ("Floor stripes", [dict(gen=0, space=7, freq=6, angle=0.25, grad=1.0, stops=RUBY)]),
+    ("Stars (polygons 5, warp 0.7)", [dict(gen=6, count=5, warp=0.7, stops=RUBY)]),
+    ("Flower rings (rings, warp 0.6)", [dict(gen=1, warp=0.6, warp_freq=3.0, even=0.8)]),
+    ("Blend ADD: stripes + rings", [dict(gen=0, blend=0), dict(gen=1, blend=0, stops=GOLD, opacity=0.8)]),
+    ("Blend MASK: gradient through rays", [dict(gen=0, freq=3, duty=1.0, soft=0.0, grad=1.0, angle=0.25, glow=0.0, stops=AURORA),
+                                           dict(gen=3, count=12, blend=4, duty=0.3, glow=0.6, even=0.0, soft=0.4)]),
+    ("Blend DIFFERENCE: line rings x line rings", [dict(gen=1, freq=14, duty=0.3, glow=0.4, soft=0.3, cx=-0.12, grad=1.0, stops=ROYAL),
+                                                   dict(gen=1, freq=14, duty=0.3, glow=0.4, soft=0.3, cx=0.12, blend=3, grad=1.0, stops=ROYAL)]),
+    ("Blend MULTIPLY: gradient x checker", [dict(gen=1, freq=1.5, duty=1.0, glow=0.0, grad=1.0, stops=RUBY), dict(gen=4, freq=7, blend=2)]),
+    ("Blend OVER: rays over rings", [dict(gen=1, stops=ROYAL), dict(gen=3, count=12, blend=6, stops=GOLD, grad=0.0)]),
+    ("Follow the show palette", [dict(gen=0, color=1, angle=0.15)]),
 ]
 MOTION_ROWS = [
-    ("Stripes preset (scroll)", [dict(gen=0)]),
+    ("Stripes preset (scroll 0.2 bands/s)", [dict(gen=0)]),
     ("Spiral preset (scroll + arms)", [dict(gen=2)]),
-    ("Tunnel stripes (fly-in)", [dict(gen=0, space=2, freq=10, angle=0.1, duty=0.4, glow=0.5, bevel=0.7, grad=1.0, speed=0.8, stops=SUNSET)]),
-    ("Rays, rotation 0.1 turn/s + pulse", [dict(gen=3, spin=0.1, pulse=0.6, sync=1)]),
+    ("Tunnel stripes (fly-in 0.4 bands/s)", [dict(gen=0, space=2, freq=12, angle=0.1, duty=0.2, bevel=0.6, glow=0.8, grad=1.0, speed=0.4, stops=SUNSET)]),
+    ("Rays, rotation 0.06 turn/s + soft pulse", [dict(gen=3, spin=0.06, pulse=0.35, sync=1)]),
 ]
+VIGNETTE = dict(gen=1, freq=0.5, duty=0.35, soft=1.0, wave=0, blend=4, speed=0.0, phase=0.5, glow=0.0, bevel=0.0, even=0.0,
+                grad=0.0, name="Vignette", stops=[[0.0, 1, 1, 1], [0.5, 1, 1, 1]])   # mask: light the middle, rest fades to black
+SAPPHIRE = [[0.0, 0.05, 0.40, 1.00], [0.5, 0.30, 0.12, 1.00]]
 COMPOSED = [
+    # two-centre interference: two fine ring gratings drifting through each other; the beats draw the big shapes
     ("moire_rings", [
-        dict(gen=1, freq=16, duty=0.5, soft=0.0, speed=0.10, cx=-0.12, grad=0.0, glow=0.0, bevel=0.0, stops=[[0.0, 0.75, 1.0, 1.0], [0.5, 0.75, 1.0, 1.0]]),
-        dict(gen=1, freq=16, duty=0.5, soft=0.0, speed=-0.10, cx=0.12, blend=3, grad=0.0, glow=0.0, bevel=0.0, stops=[[0.0, 0.75, 1.0, 1.0], [0.5, 0.75, 1.0, 1.0]]),
-        dict(gen=1, freq=0.55, duty=0.98, soft=0.0, wave=1, blend=2, speed=0.04, grad=1.0, glow=0.0, bevel=0.0, stops=AURORA),
+        dict(gen=1, freq=18, wave=0, duty=0.22, soft=0.0, speed=0.08, cx=-0.1, glow=0.0, bevel=0.0, even=0.0, bright=1.2,
+             grad=1.0, stops=SAPPHIRE),
+        dict(gen=1, freq=18, wave=0, duty=0.22, soft=0.0, speed=-0.08, cx=0.1, glow=0.0, bevel=0.0, even=0.0, bright=1.2,
+             blend=1, grad=1.0, stops=GOLD),
+        dict(VIGNETTE),
     ]),
+    # pentagram + its dual (rotated 36 deg, same radius): one decagram lattice, turning slowly as one piece
     ("star_lattice", [
-        dict(gen=6, count=5, warp=0.65, freq=4.5, duty=0.22, soft=0.15, glow=0.8, bevel=0.3, speed=0.2, spin=0.02, grad=1.0, stops=PEACOCK),
-        dict(gen=6, count=5, warp=0.65, freq=4.5, duty=0.10, soft=0.3, glow=0.7, speed=-0.2, spin=-0.02, angle=0.1, blend=1, opacity=0.55, grad=1.0, stops=SUNSET),
-        dict(gen=3, count=20, duty=0.10, soft=0.6, glow=0.5, spin=-0.015, blend=4, opacity=0.35, stops=[[0.0, 1.0, 1.0, 1.0], [0.5, 1.0, 1.0, 1.0]]),
+        dict(gen=6, count=5, warp=0.65, freq=2.4, duty=0.05, soft=0.2, glow=0.45, even=0.85, speed=0.10, spin=0.012,
+             grad=1.0, stops=RUBY),
+        dict(gen=6, count=5, warp=0.65, freq=2.4, duty=0.04, soft=0.2, glow=0.4, even=0.85, speed=0.10, spin=0.012,
+             angle=0.1, phase=0.0, blend=1, opacity=0.75, grad=1.0, stops=ROYAL),
+        dict(gen=1, freq=1.2, duty=0.025, soft=0.3, glow=0.7, even=0.9, speed=0.10, blend=1, opacity=0.55, stops=GOLD),
+        dict(VIGNETTE, freq=0.45),
     ]),
+    # two counter-wound log spirals braided over / under, depth rings flying out of the core
     ("tunnel_weave", [
-        dict(gen=0, space=2, freq=12, angle=0.085, duty=0.38, soft=0.1, bevel=0.85, glow=0.3, speed=0.5, grad=1.0, stops=SUNSET),
-        dict(gen=0, space=2, freq=12, angle=0.915, duty=0.38, soft=0.1, bevel=0.85, glow=0.3, speed=0.5, blend=6, grad=1.0, stops=AURORA),
-        dict(gen=1, freq=0.9, duty=0.85, soft=1.0, wave=0, blend=2, speed=0.0, phase=0.5, stops=[[0.0, 1, 1, 1], [0.5, 1, 1, 1]], glow=0.0, bevel=0.0),
+        dict(gen=0, space=2, freq=10, angle=0.085, duty=0.10, soft=0.2, bevel=0.35, glow=0.65, even=0.7, speed=0.22,
+             grad=1.0, stops=RUBY),
+        dict(gen=0, space=2, freq=10, angle=0.915, duty=0.10, soft=0.2, bevel=0.35, glow=0.65, even=0.7, speed=0.22,
+             blend=6, grad=1.0, stops=ROYAL),
+        dict(gen=0, space=2, freq=4, angle=0.0, duty=0.03, soft=0.3, glow=0.8, even=0.8, speed=0.22, blend=1, opacity=0.5,
+             stops=GOLD),
+        dict(VIGNETTE, freq=0.38, duty=0.45),
     ]),
 ]
-CANVAS_START = dict(gen=G_STRIPES, name="Stripes", freq=6.0, angle=0.08, speed=0.25, duty=0.42, soft=0.1, bevel=0.75, glow=0.35, stops=JEWEL)
+# the showpieces as named presets for the panel / clips: {"cmd": "stack", "op": "replace", "stack": look["stack"]}
+LOOK_NAMES = {"moire_rings": ("Op-art moire", "two fine ring gratings drifting through each other"),
+              "star_lattice": ("Star lattice", "pentagram + dual decagram, turning slowly, ruby / sapphire / gold"),
+              "tunnel_weave": ("Tunnel weave", "counter-wound log spirals braided over / under, flying in")}
+
+
+def looks():
+    out = []
+    for key, layers in COMPOSED:
+        name, hint = LOOK_NAMES[key]
+        out.append(dict(key=key, name=name, hint=hint, stack=dict(v=VERSION, layers=[dict(x) for x in layers], mods={})))
+    return out
+
+
+CANVAS_START = dict(gen=G_STRIPES, name="Stripes", freq=9.0, angle=0.08, speed=0.2, duty=0.14, soft=0.25, glow=0.9, stops=ROYAL)
 
 
 # ------------------------------------------------------------------------------------------------ validation
@@ -809,6 +846,20 @@ def structure(v):
     return dict(fu=fu, fv=fv, gu=gu, gv=gv, wu=wu, wv=wv, kc=kc, D=D, hp=hp, W=W, xor=xor)
 
 
+def _wref(v, s):
+    """Nominal band coordinate per frame height (before zoom): what "even line weight" measures the local band
+    density against. Angular terms are taken at radius 0.3, the floor at a third of the way to the horizon."""
+    ring = 1.0 / (TAU * 0.3)
+    if v["gen"] in RADIAL:
+        return max(0.25, math.hypot(s["fu"], s["fv"] * ring))
+    if v["space"] == S_POLAR:
+        return max(0.25, math.hypot(s["fu"] * ring, s["fv"]))
+    if v["space"] == S_TUNNEL:
+        return max(0.25, math.hypot(s["fu"], s["fv"]) * ring)
+    f = max(0.25, math.hypot(s["fu"], s["fv"]))
+    return f * 2.8 if v["space"] == S_FLOOR else f
+
+
 def _resolve(v, ph, dt, bpm, beat, hold, palette, aspect, k=0):
     """One layer (modulated values `v`, phases `ph`) -> the uniform block the shader reads. Advances ph by dt."""
     gen, space = v["gen"], v["space"]
@@ -879,7 +930,7 @@ def _resolve(v, ph, dt, bpm, beat, hold, palette, aspect, k=0):
         F=(min(1.0, max(0.0, ph["op"])), v["grad"], (v["hue"] + ph["hue"]) % 1.0 + k, v["sat"]),
         G=(bright, float(len(stops)), s["D"], s["hp"]),
         H=(float(v["folds"]), 1.0 if space in PERIODIC else 0.0, 1.0 if s["xor"] else 0.0, 0.0),
-        I=(v["glow"], v["bevel"], 0.0, 0.0),
+        I=(v["glow"], v["bevel"], v["even"], _wref(v, s) * scale),
         stops=[(c[1], c[2], c[3], c[0]) for c in stops])
 
 
@@ -890,7 +941,7 @@ def meta():
         num=[dict(name=k, lo=v[0], hi=v[1], default=v[2], label=v[3], hint=v[4]) for k, v in NUM.items()],
         int=[dict(name=k, lo=v[0], hi=v[1], default=v[2], label=v[3], options=v[4]) for k, v in INT.items()],
         generators=list(GENERATORS), spaces=list(SPACES), waves=list(WAVES), blends=list(BLENDS),
-        presets={str(g): default_layer(g) for g in range(len(GENERATORS))})
+        presets={str(g): default_layer(g) for g in range(len(GENERATORS))}, looks=looks())
 
 
 # ------------------------------------------------------------------------------------------------ the GL pass
@@ -913,7 +964,8 @@ uniform vec4 uE[8];      // warp wave vector u, v, duty, softness
 uniform vec4 uF[8];      // opacity, gradient smoothness, hue shift (turns), saturation
 uniform vec4 uG[8];      // brightness, stop count, colour cycle length D, hash period
 uniform vec4 uH[8];      // folds, circular space flag, xor checker flag, -
-uniform vec4 uI[8];      // glow, bevel, -, -
+uniform vec4 uI[8];      // glow, bevel, even line weight, nominal band coordinate per frame height
+uniform float pxh;       // one pixel in frame heights
 uniform vec4 uStops[48]; // 6 per layer: rgb + position
 uniform float aspect, amount;
 in vec2 v_uv; out vec4 f;
@@ -954,6 +1006,7 @@ float profile(int wv, float fx, float w, float duty, float soft){
     return pow(c, (1.0-duty)/max(duty, 0.02));
   }
   if (wv == 1) {                                     // square: crisp band, edge = one pixel or the softness
+    if (duty >= 0.999) return 1.0;                   // no gap: no edge (a seam line otherwise, the edge fell to half)
     float hw = 0.5*duty, s = max(0.75*w, soft*min(hw, 0.5-hw));
     return 1.0 - smoothstep(hw-s, hw+s, t);
   }
@@ -990,7 +1043,7 @@ void main(){
     else if (spc == 4) { uv = vec2(abs(p.x), p.y); uB2 = uv.x; }
     else if (spc == 5) { uv = vec2(p.x, abs(p.y)); }
     else if (spc == 6) { uv = abs(p); uB2 = uv.x; }
-    else if (spc == 7) { float d = abs(p.y), z = 0.25/max(d, 1e-3); uv = vec2(p.x*z, z); uB2 = uv.x; fade = smoothstep(0.0, 0.10, d); }
+    else if (spc == 7) { float d = abs(p.y), z = 0.25/max(d, 1e-3); uv = vec2(p.x*z, z); uB2 = uv.x; fade = smoothstep(0.012, 0.20, d); fade *= fade; }
 
     // ---- generator: band coordinate x (one band per unit), its pixel footprint w, band index k
     float x, w, val, k;
@@ -1012,6 +1065,15 @@ void main(){
         float l1 = profile(wv, fract(x1), w1, duty, soft), l2 = profile(wv, fract(x2), w2, duty, soft);
         val = wv == 2 ? 1.0-(1.0-l1)*(1.0-l2) : l1*l2;   // triangle: a grid of lines; sine: a lattice of dots
         k = c1+c2;
+      }
+      if (uI[i].x > 0.0) {                           // glow: obsidian tiles, the light runs along their edges
+        float e1 = (0.5-abs(fract(x1)-0.5)), e2 = (0.5-abs(fract(x2)-0.5));
+        float e = min(e1/max(w1, 1e-5), e2/max(w2, 1e-5));              // distance to the nearest tile edge, in pixels
+        float wpx = 0.5/max(w, 1e-5);                                   // half a tile, in pixels
+        float line = smoothstep(1.8, 0.6, e) + 0.55*exp(-e/(0.10*wpx+1.0)) + 0.16*exp(-e/(0.34*wpx+1.0));
+        float keepf = 1.0 - smoothstep(0.25, 0.6, w);
+        val = mix(val, val*0.10 + min(line, 1.0)*(0.35+0.65*val), uI[i].x*keepf);
+        hot = uI[i].x*keepf*0.5*smoothstep(1.4, 0.3, e);
       }
       val = mix(val, 0.5, smoothstep(0.5, 1.2, w));
     } else {
@@ -1044,6 +1106,10 @@ void main(){
         float hk = mod(k, hp);
         dk = clamp(duty*(0.35+1.3*h11(hk)), 0.03, 0.97); gain = 0.3+0.7*h11(hk+17.3);
       }
+      if (uI[i].z > 0.0) {                           // even line weight: measure the band in screen space
+        float ratio = clamp(uI[i].w*pxh/max(w, 1e-6), 0.2, 5.0);
+        fx = clamp(0.5 + (fx-0.5)*mix(1.0, ratio, uI[i].z), 0.0, 1.0);
+      }
       val = profile(wv, fx, w, dk, soft)*gain;
       float glow = uI[i].x, bev = uI[i].y;
       if (glow > 0.0 || bev > 0.0) {
@@ -1055,10 +1121,11 @@ void main(){
           spec = bev*keepf*pow(max(1.0-abs(nn+0.38)*2.2, 0.0), 4.0)*0.55*step(tt, hw);
         }
         if (glow > 0.0) {                                             // neon: a halo that dies out across the gap
+          // a filament: crisp core (the band itself), a tight saturated halo, a faint wide bloom into the gap
           float gap = max(0.5-hw, 0.02), d = max(tt-hw, 0.0)/gap;
-          float halo = exp(-d*3.4)*(1.0-d*d);
-          val = max(val, glow*keepf*0.62*max(halo, 0.0)*gain);
-          hot = glow*keepf*0.75*pow(clamp(1.0-tt/hw, 0.0, 1.0), 2.5);
+          float halo = 0.60*exp(-d*9.0) + 0.20*exp(-d*2.4)*(1.0-d);
+          val = max(val, glow*keepf*max(halo, 0.0)*gain);
+          hot = glow*keepf*0.55*pow(clamp(1.0-tt/hw, 0.0, 1.0), 2.0);
         }
       }
       val = mix(val, dk*(wv == 1 ? 1.0 : 0.6)*gain, smoothstep(0.5, 1.2, w));   // finer than a pixel: the mean
@@ -1078,7 +1145,7 @@ void main(){
     if (uF[i].y > 0.0) col = mix(cs, gradient(sb, nst, fract((gen == 4 ? kk+0.5 : x)/D)), uF[i].y);
     if (uF[i].z > 0.0) col = max(hueRot(col, uF[i].z*TAU), 0.0);
     col = max(mix(vec3(dot(col, vec3(0.299, 0.587, 0.114))), col, uF[i].w), 0.0);
-    col = (mix(col, vec3(1.0), clamp(hot, 0.0, 1.0)) + vec3(spec))*uG[i].x;
+    col = (mix(col, mix(vec3(1.0), col, 0.25), clamp(hot, 0.0, 1.0)) + vec3(spec))*uG[i].x;   // heat stays tinted
 
     // ---- blend onto the layers below
     float o = uF[i].x;
@@ -1092,7 +1159,8 @@ void main(){
     else { acc = mix(acc, col, o*val); keep *= 1.0-o*val; }                    // over: the bands cover, gaps are clear
   }
   acc = max(acc, 0.0);
-  acc /= max(1.0, max3(acc));                        // hue-preserving clip
+  float mx = max3(acc);                              // soft shoulder on the brightest channel (hue kept): where
+  if (mx > 0.8) acc *= (0.8 + 0.2*tanh((mx-0.8)/0.2))/mx;         // layers cross they glow, they do not chalk out
   if (!(acc.r >= 0.0 && acc.g >= 0.0 && acc.b >= 0.0)) acc = vec3(0.0);
   if (!(keep >= 0.0)) keep = 1.0;
   f = vec4(acc*amount, clamp((1.0-keep)*amount, 0.0, 1.0));
@@ -1164,6 +1232,8 @@ class StackPass:
                 prog[name].write(data)
         if "uStops" in prog:
             prog["uStops"].write(stops)
+        if "pxh" in prog:
+            prog["pxh"].value = 1.0 / self.out_size[1]
         prog["aspect"].value = self.aspect
         prog["amount"].value = float(min(1.0, max(0.0, amount)))
         self._vao.render(self._mgl.TRIANGLE_STRIP)

@@ -98,7 +98,7 @@ COTTON = ((1.0, 0.93, 0.80), (0.95, 0.85, 0.68), (0.80, 0.70, 0.55), (0.85, 0.72
 ACCENTS = ((1.0, 0.16, 0.10), (1.0, 0.62, 0.08), (1.0, 0.86, 0.15))       # small filled blocks: red, ochre, yellow
 PAINT_GROUND, PAINT_INK = (0.93, 0.91, 0.87), (0.16, 0.14, 0.13)           # spec A: cream #E9E4DB.., ink #2A2522
 PAINT_ACC = ((0.68, 0.24, 0.14), (0.80, 0.65, 0.16), (0.80, 0.65, 0.16))  # rust #A8361F.., ochre #C9A227..
-CLOTH_FIELD, CLOTH_INK, CLOTH_BORDER = (0.80, 0.76, 0.70), (0.17, 0.14, 0.13), (0.23, 0.21, 0.19)   # spec B
+CLOTH_FIELD, CLOTH_INK, CLOTH_BORDER = (0.945, 0.90, 0.835), (0.17, 0.14, 0.13), (0.23, 0.21, 0.19)   # spec B (#D9CFC0 on screen)
 MAG_GROUND = (0.72, 0.15, 0.36)                                            # spec C: raspberry #C2285A
 CLOTH_GROUND, MUD_INK = (0.80, 0.72, 0.56), (0.10, 0.06, 0.035)          # README 1.6: black / chocolate on cream
 SLIP_GROUND, OXIDE_RED, CERAMIC_BLACK = (0.84, 0.78, 0.64), (0.66, 0.17, 0.07), (0.07, 0.05, 0.04)
@@ -518,13 +518,13 @@ def _spine_panel(seed, gx, gy):
     lab = np.ones((ny, nx), np.uint8)
     yy, xx = np.mgrid[0:ny, 0:nx]
     x, y = xx - cx, yy - cy
-    half = int(rng.integers(4, 7))                                              # the central lozenge (elongated hexagon)
+    half = int(rng.integers(3, 5))                                              # the central lozenge (elongated hexagon)
     lab[(np.abs(x) <= np.minimum(2, half + 1 - np.abs(y))) & (np.abs(y) <= half + 1)] = 2
     top = ny // 2 - 8
-    joints = sorted({int(v) for v in np.linspace(half + 5, top - 5, 3 if ny > 60 else 2)})
+    joints = sorted({int(v) for v in np.linspace(half + 7, top - 5, 3 if ny > 60 else 2)})
     for n, yj in enumerate(joints):                                             # small diamonds at the spine's joints
         for sgn in (-1, 1):
-            lab[(np.abs(x) + np.abs(y - sgn * yj)) <= 1] = 3 + n
+            lab[(np.abs(x) + np.abs(y - sgn * yj)) <= 2] = 3 + n
     p = np.pad(lab, 1, constant_values=FRAME)
     interior = np.ones((ny, nx), bool)
     for dy in (0, 1, 2):
@@ -535,11 +535,11 @@ def _spine_panel(seed, gx, gy):
     used = lab != 1
     used |= ~interior & (lab == 1) & False
 
-    def put(path, e0, e1):
+    def put(path, e0, e1, force=False):
         """Lay an arm (list of (j, i)) and its mirror images; returns False (nothing drawn) if it does not fit."""
         imgs = [[(cy + sy * (j - cy), cx + sx * (i - cx)) for j, i in path] for sx in (1, -1) for sy in (1, -1)]
         flat = {t for im in imgs for t in im}
-        if any(not (1 <= j < ny - 1 and 1 <= i < nx - 1) or used[j, i] or lab[j, i] != 1 for j, i in flat):
+        if any(not (1 <= j < ny - 1 and 1 <= i < nx - 1) or (used[j, i] and not force) or lab[j, i] != 1 for j, i in flat):
             return False
         for im in imgs:
             for (j0, i0), (j1, i1) in zip(im, im[1:]):
@@ -552,11 +552,11 @@ def _spine_panel(seed, gx, gy):
         return True
 
     # the spine: lozenge tip -> diamond -> ... -> an arrowhead pointing back to the centre
-    stops = [half + 2] + [v for yj in joints for v in (yj - 2, yj + 2)] + [top]
+    stops = [half + 2] + [v for yj in joints for v in (yj - 3, yj + 3)] + [top]
     for a, b in zip(stops[0::2], stops[1::2]):
         if b > a:
-            put([(cy + v, cx) for v in range(a, b + 1)], 0, 0)
-    put([(cy + v, cx) for v in range(ny // 2 - 2, top + 2, -1)], 0, ARROW_OPEN)       # a stub from the frame, arrow pointing in
+            put([(cy + v, cx) for v in range(a, b + 1)], 0, 0, force=True)
+    put([(cy + v, cx) for v in range(ny // 2 - 2, top, -1)], 0, ARROW_OPEN, force=True)   # the spine's end: an arrowhead pointing in
     # stepped side hooks from each joint (and the lozenge), ending in a small open square
     for yj in [0] + joints:
         for _try in range(6):
@@ -648,7 +648,7 @@ def fret(i, j, period=12, width=2, diagonal=False, hand=1):
     cu, cv = np.floor_divide(u, P), np.floor_divide(v, P)
     x, y = (u - cu * P) - (P - 1) / 2.0, (v - cv * P) - (P - 1) / 2.0
     y = np.where(x * hand > 0, y + 2 * w, y)            # the break: one half slips by one ring pitch, so ring k meets ring k + 2
-    ring = np.floor((np.maximum(np.abs(x), np.abs(y)) + 0.5) / w).astype(int)
+    ring = (np.floor(np.maximum(np.abs(x), np.abs(y))) // w).astype(int)
     return ((ring + cu + cv) % 2).astype(np.uint8)
 
 
@@ -701,7 +701,7 @@ def fret_along(i, j, period=12, width=2, diagonal=False, hand=1):
     P, w = int(period), int(width)
     x, y = (u % P) - (P - 1) / 2.0, (v % P) - (P - 1) / 2.0
     y2 = np.where(x * hand > 0, y + 2 * w, y)
-    ring = np.floor((np.maximum(np.abs(x), np.abs(y2)) + 0.5) / w)
+    ring = np.floor(np.maximum(np.abs(x), np.abs(y2))) // w
     return ((ring + np.arctan2(y, x) / TAU) / max(P / (2.0 * w), 1.0)) % 1.0
 
 
@@ -761,9 +761,10 @@ def hk_tile(family, seed=0, size=HK_T):
         ay = np.abs(y)
         key = fret(i, j, 8, 1, diagonal=True)                               # 45 degree staircase key hooks, 2 turns
         r0 = np.where(key == 1, np.where(ay <= 1.5, 2, 1), 0)               # white on black, orange along the mid-line
-        dd = (cen(i, 16) + np.floor(ay)).astype(int)                        # concentric diamonds, tips touching:
-        r1 = np.where((dd // 2) % 2 == 0, 2, 0)                              # nested outlines two floats wide, orange / black
-        r1 = np.where((dd // 2 == 4) | (dd // 2 == 6), 1, r1)                # stepped chevrons between them in white
+        dd = (cen(i, 16) + np.floor(ay)).astype(int)                        # concentric diamonds, tips touching: three
+        r1 = np.where((dd % 2 == 1) & (dd <= 6), 2, 0)                       # nested outlines one float wide, orange / black,
+        r1 = np.where(dd == 0, 2, r1)                                       # a core, and stepped white chevrons between
+        r1 = np.where((dd >= 8) & (dd % 2 == 0), 1, r1)
         e = (cen(i, 6) + np.floor(ay)).astype(int)                          # chain of small orange diamonds, tip to tip,
         r2 = np.where(e <= 2, np.where(e == 0, 0, 2), np.where((e == 4) | (e == 5) | (e == 8), 1, 0))   # white zigzag echoes
         role = np.where(band == 0, r0, np.where(band == 1, r1, r2))
@@ -774,19 +775,18 @@ def hk_tile(family, seed=0, size=HK_T):
         x, y = (i % 24) - 11.5, (j % 24) - 11.5
         ax, ay = np.abs(x), np.abs(y)
         d = (ax + ay).astype(int)                                           # 1, 2, ... from the tile centre outward
-        frame = ombre(17 - d, 6)                                            # six ombré rings, one bead each, corners in
+        frame = ombre(20 - d, 6)                                            # six ombré rings, one bead each, corners in
         xi, yi = np.floor(x).astype(int), np.floor(y).astype(int)
         key = (fret(xi + 6, yi + 6, 12, 2, hand=1 if seed % 2 == 0 else -1) == 1) & (np.maximum(ax, ay) < 6)   # big S-fret,
-        t0 = np.where(d <= 10, np.where(key, WHITE_ROLE, 0), np.where(d == 11, 0, frame))                    # 2 beads wide
+        t0 = np.where(d <= 13, np.where(key, WHITE_ROLE, 0), np.where(d == 14, 7, frame))                    # 2 beads wide
         eyes = (np.abs(ax - 3.0) <= 1.0) & (np.abs(ay - 3.0) <= 1.0)        # four eyes: 2 x 2 squares, outlined
         ring = (np.abs(ax - 3.0) <= 2.0) & (np.abs(ay - 3.0) <= 2.0) & ~eyes
-        t1 = np.where(d <= 10, np.where(eyes, 7, np.where(ring, 8, 0)), np.where(d == 11, 0, frame))
+        t1 = np.where(d <= 13, np.where(eyes, 7, np.where(ring, 8, 0)), np.where(d == 14, 0, frame))
         ov = np.sqrt(((ax - 4.5) / 3.0) ** 2 + (ay / 6.5) ** 2)             # eye pair: two upright ovals on an ombré ground
         t2 = np.where(ov <= 1.0, np.where((np.abs(ax - 4.5) < 1.0) & (ay < 3.0), 0, WHITE_ROLE),
                       np.where(ov <= 1.25, 0, ombre(np.floor((ov - 1.25) * 5.0).astype(int), 6)))
-        rib = (fret(xi, yi, 8, 1, diagonal=True) == 1) & (np.abs(x - y) <= 9.5)                 # diagonal key ribbon
-        t3 = np.where(rib, WHITE_ROLE, np.where(np.abs(x - y) <= 10.5, 0, ombre(((xi + yi + 24) // 3) % 6, 6)))
-        t3 = np.where(np.abs(x - y) <= 9.5, np.where(rib, WHITE_ROLE, ombre(((xi + yi + 24) // 4) % 6, 6)), t3)
+        key2 = (fret(xi + 6, yi + 6, 12, 2, hand=-1 if seed % 2 == 0 else 1) == 1) & (np.maximum(ax, ay) < 6)
+        t3 = np.where(d <= 13, np.where(key2, WHITE_ROLE, 8), np.where(d == 14, 0, ombre(d - 15, 6)))   # mirrored key on a
         role = np.where(ti == 0, np.where(tj == 0, t0, t2), np.where(tj == 0, t1, t3))
         role = np.where((ax > 11.0) | (ay > 11.0), 0, role)                 # the gap between tiles
         along = np.where((ti == 0) & (tj == 0), fret_along(xi + 6, yi + 6, 12, 2), ang)
@@ -794,35 +794,41 @@ def hk_tile(family, seed=0, size=HK_T):
         strap = ((i // 16) + seed) % 3
         x, y = (i % 16) - 7.0, (j % 16) - 7.5
         a, b = np.abs(x), np.abs(y)
-        # strap 1: an X of ombré chevron arms; nested-ring diamonds with a white cross between the X's
+        # strap 1: an X of ombré chevron arms with dark outlines; ring diamonds between the X's hold a white cross
         e = np.floor(np.abs(a - b + 0.5)).astype(int)
         s1 = np.where(e <= 3, ombre(e, 4), np.where(e == 4, 8, 0))
         dd = np.floor(a + (8.0 - b)).astype(int)
-        s1 = np.where((b - a > 4.5), np.where(dd <= 1, WHITE_ROLE, np.where(dd % 2 == 0, 5, 6)), s1)
+        ringd = np.where(dd % 2 == 0, 5, 6)
+        cross = ((a == 0) & (b >= 6.0)) | ((a == 1) & (b >= 7.0))
+        s1 = np.where((b - a > 4.5), np.where(cross, np.where((a == 0) & (b >= 7.0), 7, WHITE_ROLE), ringd), s1)
         s1 = np.where((a - b > 4.5), np.where(e % 2 == 0, 8, 0), s1)
-        # strap 2: nested chevrons in greens pointing at a dark X, a white diamond outline at its centre
+        # strap 2: nested chevrons in greens pointing at a dark X; a white diamond outline round its filled centre
         v = np.floor(b - a + 8.0).astype(int)
-        s2 = np.choose(v % 4, [WHITE_ROLE, 4, 5, 6])
+        s2 = np.choose(v % 4, [WHITE_ROLE, 5, 6, 5])
         s2 = np.where(np.abs(a - b + 0.5) < 1.0, 6, s2)
-        s2 = np.where(np.floor(a + b).astype(int) == 3, WHITE_ROLE, np.where(a + b < 3.0, 0, s2))
-        # strap 3: a chain of rhombi each holding four small diamonds; rainbow rays fan out to the edges
-        q = a + b * 0.8
+        s2 = np.where(np.floor(a + b).astype(int) == 3, WHITE_ROLE, np.where(a + b < 3.0, 6, s2))
+        # strap 3: a chain of rhombi each holding a 2 x 2 grid of small diamonds; rainbow rays fan out to the edges
+        q = a + b
         four = (np.abs(a - 2.0) + np.abs(b - 2.5)) <= 1.0
-        s3 = np.where(q <= 5.0, np.where(four, 7, 8), np.where(q <= 5.8, 0, ombre(np.floor(q - 5.8).astype(int), 6)))
-        s3 = np.where(q > 11.8, 0, s3)
+        core = (np.abs(a - 2.0) + np.abs(b - 2.5)) <= 0.5
+        s3 = np.where(q <= 6.5, np.where(four, np.where(core, 7, 0), 8), 0)
+        ray = np.floor(q - 7.0).astype(int)                                 # rays: bands that widen away from the rhombus
+        s3 = np.where(q >= 7.5, np.where(ray <= 5, ombre(ray, 6), 0), s3)
         role = np.where(strap == 0, s1, np.where(strap == 1, s2, s3))
         role = np.where(a > 6.0, 0, role)                                   # 13 beads, then dark ground
         along = (j / 16.0) % 1.0
     else:                                               # G key-fret panels: red and green T-frets, 2-bead lines with
         A, B = cen(i, 48), cen(j, 48)                   # 1-bead dark separators, in diamonds; blue chevron bands between
-        d = np.minimum(A + B, 48 - (A + B))
+        d = A + B                                                           # one rhombus per repeat; the rest is chevrons
         ci, cj = i // 3, j // 3
+        ci, cj = ci + 4, cj + 4                                             # a whole fret unit sits on the rhombus centre
         f = fret(ci, cj, 8, 1, hand=1 if seed % 2 == 0 else -1).astype(int)
         sep = ((i % 3 == 2) & (f != fret(ci + 1, cj, 8, 1, hand=1 if seed % 2 == 0 else -1))) | \
               ((j % 3 == 2) & (f != fret(ci, cj + 1, 8, 1, hand=1 if seed % 2 == 0 else -1)))
         panel = np.where(sep, 0, np.where(f == 1, 7, 8))
-        chev = ombre(d - 19, 5)                                             # white peak line next to the panel, then
-        role = np.where(d <= 17, panel, np.where(d == 18, 7, chev))         # sky, periwinkle, royal, navy
+        k = (d - 24) // 2                                                   # nested V chevrons, two beads each: the white
+        chev = ombre(np.minimum(k % 10, 9 - k % 10), 5)                     # peak next to the panel, down to navy, back up
+        role = np.where(d <= 21, panel, np.where(d <= 23, 7, chev))
         along = fret_along(ci, cj, 8, 1)
     out = np.zeros((size, size, 2), np.uint8)
     out[..., 0], out[..., 1] = role, np.round(along * 255.0).astype(np.uint8)
@@ -1025,10 +1031,10 @@ vec4 shipibo(vec2 g, float fw, float v, float prog, float cloth){
         if (code == 1) dFill = max(fb - (0.42-fa)*0.80, -fa-0.16);                              // arrowhead
         else if (code == 4) dTerm = abs(max(fb - (0.36-fa)*0.80, -fa-0.16));                    // arrowhead, outline only
         else if (code == 2) dTerm = seg(c + pv*0.36, pv*0.72);                                  // T-bar
-        else if (code == 3) dTerm = abs(max(abs(c.x), abs(c.y)) - 0.30);                        // small end-cap
+        else if (code == 3) dTerm = abs(max(abs(c.x), abs(c.y)) - 0.36);                        // small OPEN end-cap (a key)
       }
       // terminals are drawn with a stroke that stays inside the tile (nothing is ever cut at a tile edge: no shimmer)
-      aArm = max(max(stroke(dT, uArmW*br, fw), stroke(dTerm, min(uArmW, 0.12), fw)), 1.0 - smoothstep(-fw, fw, dFill));
+      aArm = max(max(stroke(dT, uArmW*br, fw), stroke(dTerm, min(uArmW, 0.10), fw)), 1.0 - smoothstep(-fw, fw, dFill));
       dT = 9.0;
     } else if ((b & 64) != 0) {                        // a small filled accent block
       aBlk = 1.0 - smoothstep(-fw, fw, max(abs(c.x), abs(c.y)) - (code == 3 ? 0.5 : 0.36));
@@ -1110,7 +1116,7 @@ vec4 shipiboLayout(vec2 P, float px){
     }
     vec2 g = q/ts + 0.5*N; float fw = px/ts*(1.0+0.6*uCurve);
     if (uLay == 0) {
-      vec2 o = abs(P) - 0.5*N*ts, oc = o - (uBorder > 0.5 ? 7.4 : (uFrameOn > 0.5 ? 0.06/ts : 1.3))*ts;
+      vec2 o = abs(P) - 0.5*N*ts, oc = o - (uBorder > 0.5 ? 7.4 : (uFrameOn > 0.5 ? 0.085/ts : 1.3))*ts;
       float cloth = 1.0 - smoothstep(-px, px, max(oc.x, oc.y));
       vec4 s = shipibo(g, fw, 0.0, uDraw, cloth);
       float d = max(o.x, o.y)/ts;
@@ -1227,7 +1233,7 @@ vec4 hunikuin(vec2 P, float px){
     L = P*uHB + uHScroll; fw = px*uHB;
     if (uHMed > 0.5 && uHMed < 1.5) L.x = P.x*uHB*1.4 + uHScroll.x;   // woven floats are taller than wide (1 : 1.4)
     if (uHMed > 2.5) L.x += 0.5*mod(floor(L.y), 2.0);   // staggered rows, as beads sit in the stitch
-    if (uLay == 2) { L.y = P.y*uHB; mask = step(abs(floor(L.y)+0.5), floor(uHB*0.22)+0.6); }
+    if (uLay == 2) { L.y = P.y*uHB; mask = step(abs(floor(L.y)+0.5), uHEdge > 0.5 ? floor(uHB*0.22)+0.6 : 8.1); }   // woven: one 16-row strap
   }
   vec2 b = floor(L), c = fract(L)-0.5;
   float lit; vec3 col = beadCol(b, lit);
@@ -1248,7 +1254,7 @@ vec4 hunikuin(vec2 P, float px){
   if (uHMed < 1.5) {                                    // woven: a clean grid of floats with a dark gap between them
     vec2 q = abs(c); float fx = fw*1.4;
     a = (1.0 - smoothstep(0.44-fx, 0.44+fx, q.x))*(1.0 - smoothstep(0.46-fw, 0.46+fw, q.y));
-    shade = 0.86 + 0.14*cos(c.x*TAU)*(1.0-smoothstep(0.08, 0.2, fw));
+    shade = 0.95 + 0.05*cos(c.x*TAU)*(1.0-smoothstep(0.08, 0.2, fw));
     a = mix(a, 0.8, smoothstep(0.25, 0.5, fw));
     return vec4(col*lit*a*shade, a*step(0.001, lit)) * mask * fade;
   }
@@ -1703,13 +1709,13 @@ SHOTS = [
     ("study_A_inverted_light", {S: 1, "kene_style": 0, "kene_colors": 1, "kene_seed": 3, "kene_curve": 0.5}),
     ("study_B_cloth", {S: 1, "kene_style": 6, "kene_seed": 14, "kene_curve": 0.3, "kene_scale": 0.5}),
     ("study_C_embroidered", {S: 1, "kene_style": 7, "kene_seed": 6, "kene_curve": 0.3, "kene_scale": 0.5}),
-    ("study_D_woven_band_key", {H: 1, "hk_motif": 5, "hk_medium": 1, "hk_colors": 9, "kene_layout": 2, "hk_size": 0.33}),
+    ("study_D_woven_band_key", {H: 1, "hk_motif": 5, "hk_medium": 1, "hk_colors": 9, "kene_layout": 2, "hk_size": 1.0}),
     ("study_D_woven_bands_stacked", {H: 1, "hk_motif": 5, "hk_medium": 1, "hk_colors": 9, "hk_size": 0.45}),
     ("study_E_bead_tiles", {H: 1, "hk_motif": 6, "hk_medium": 0, "hk_colors": 6, "hk_size": 0.6}),
     ("study_E_bead_tiles_green", {H: 1, "hk_motif": 6, "hk_medium": 0, "hk_colors": 8, "hk_size": 0.35, "kene_seed": 1}),
-    ("study_F_bead_straps", {H: 1, "hk_motif": 7, "hk_medium": 0, "hk_colors": 6, "hk_size": 0.5}),
+    ("study_F_bead_straps", {H: 1, "hk_motif": 7, "hk_medium": 0, "hk_colors": 6, "hk_size": 0.55}),
     ("study_F_bead_straps_green", {H: 1, "hk_motif": 7, "hk_medium": 3, "hk_colors": 8, "hk_size": 0.3, "kene_seed": 1}),
-    ("study_G_key_fret", {H: 1, "hk_motif": 8, "hk_medium": 0, "hk_colors": 7, "hk_size": 0.8}),
+    ("study_G_key_fret", {H: 1, "hk_motif": 8, "hk_medium": 0, "hk_colors": 7, "hk_size": 1.0}),
 ]
 # PRIVATE study references (research/kene_reference/user_refs: copyrighted, never published) next to the studies
 USER_PAIRS = [

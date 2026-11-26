@@ -47,7 +47,9 @@ MAX_LAYERS = 8
 SIZES = (512, 1024)
 FADE_S = 0.4                     # source crossfade / fade in from procedural
 PH_WRAP = 2.0                    # every skin phase wraps here: one mirrored repeat = two plain repeats
-KINDS = ("art", "ai")            # art/ uploads (+ dreamified art), textures/ (AI, seed and dreamified textures)
+KINDS = ("art", "ai", "layer")   # art/ uploads (+ dreamified art), textures/ (AI, seed and dreamified textures),
+                                 # "layer" = a live engine layer rendered to a small texture (LayerHub, below)
+LAYER_RE = re.compile(r"^[a-z0-9_]{1,24}$")
 NAME_RE = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]{1,120}$")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
@@ -87,6 +89,34 @@ INT = {
 FIELDS = tuple(NUM) + tuple(INT)
 TINT_DEFAULT = (1.0, 1.0, 1.0)
 
+# ---- skin STACKS: every slot = its base (the fields above) + up to MAX_OVERLAYS overlay layers drawn on top of it.
+# An overlay is one more fetch from an image or a live layer, with its own blend, opacity, scale / rotation / scroll,
+# per-channel gains (`gate` r g b a), an optional colour remap (`remap` 1: colour = sum of channel x cols[channel], for
+# 4-channel line layers: R primary lines, G fine fill, B ground, A accents) and a travelling noise mask ("floating
+# patches": noise amount / scale / speed / threshold). `lit` = how much the world's form light shades the layer.
+MAX_OVERLAYS = 2
+BLEND_NAMES = ["Add", "Screen", "Multiply", "Over (by brightness)", "Mask (base only through the layer)"]
+LNUM = {
+    "opacity": (0.0, 2.0, 1.0, "Opacity"),
+    "scale": (0.25, 8.0, 1.0, "Scale"),
+    "rot": (-180.0, 180.0, 0.0, "Rotation"),
+    "scroll": (0.0, 2.0, 0.0, "Scroll speed"),
+    "dir": (0.0, 360.0, 90.0, "Scroll direction"),
+    "noise": (0.0, 1.0, 0.0, "Floating patches"),
+    "nscale": (0.25, 8.0, 1.5, "Patch size"),
+    "nspeed": (0.0, 2.0, 0.15, "Patch drift"),
+    "thr": (0.0, 1.0, 0.5, "Patch threshold"),
+    "lit": (0.0, 1.0, 0.6, "Shaded by the world's light"),
+}
+LINT = {
+    "blend": (0, len(BLEND_NAMES) - 1, 0, "Blend"),
+    "remap": (0, 1, 0, "Colour by channel"),
+    "tile": (0, 1, 1, "Tiling"),
+}
+LFIELDS = tuple(LNUM) + tuple(LINT)
+GATE_DEFAULT = (1.0, 1.0, 1.0, 1.0)
+COLS_DEFAULT = ((1.0, 0.93, 0.80), (0.85, 0.90, 1.0), (0.05, 0.16, 0.62), (1.0, 0.10, 0.16))
+
 # Mapping geometry: (env, slot, effective map) -> (kind, base tiles, base z scale, travel follow).
 #   "cyl":   the shader gives (angle / TAU, distance along the axis). Tiles round the axis are snapped to a whole
 #            number (an even one for mirror tiling), so the seam at the atan cut closes for any scale / rotation.
@@ -99,12 +129,12 @@ _GEO = {
     ("corridor", "floor", 0): ("plane", 0.26, 0.26, 1.0),
     ("torus", "tube", 0): ("cyl", 4.0, 0.33, 1.0),
     ("torus", "chambers", 0): ("cyl", 4.0, 0.33, 1.0),
-    ("vortex", "walls", 0): ("cyl", 4.0, 0.34, 1.0),
-    ("hexdome", "domes", 0): ("cyl", 4.0, 2.0, 0.0),
+    ("vortex", "walls", 0): ("cyl", 4.0, 0.20, 1.0),
+    ("hexdome", "domes", 0): ("plane", 0.55, 0.55, 0.0),          # one image per honeycomb cell (no polar stretch)
     ("tunnel", "walls", EFF_LOGPOLAR): ("cyl", 4.0, 0.75, -math.log(2.0)),
     ("tunnel", "walls", EFF_TUBE): ("cyl", 4.0, 0.9, 2.0),
     ("tunnel", "walls", EFF_GROUND): ("plane", 0.9, 0.9, 1.25),
-    ("tunnel", "walls", EFF_SCREEN): ("plane", 1.0, 1.0, 0.0),
+    ("tunnel", "walls", EFF_SCREEN): ("plane", 0.62, 0.62, 0.0),
 }
 
 
@@ -171,10 +201,12 @@ def clean_field(name, v):
 
 
 def clean_src(raw):
-    """-> {"kind", "name"} or None (procedural)."""
+    """-> {"kind", "name"} or None (procedural). kind "layer": name = a live layer source id (lower-case word)."""
     if not isinstance(raw, dict):
         return None
     kind, name = raw.get("kind"), raw.get("name")
+    if kind == "layer":
+        return dict(kind=kind, name=name) if isinstance(name, str) and LAYER_RE.match(name) else None
     if kind not in KINDS or not isinstance(name, str) or not NAME_RE.match(name) or name in (".", ".."):
         return None
     if not name.lower().endswith(IMG_EXT):
@@ -193,7 +225,66 @@ def default_slot():
     d.update({f: INT[f][2] for f in INT})
     d["tint"] = list(TINT_DEFAULT)
     d["src"] = None
+    d["layers"] = [None] * MAX_OVERLAYS
     return d
+
+
+def default_layer():
+    d = {f: LNUM[f][2] for f in LNUM}
+    d.update({f: LINT[f][2] for f in LINT})
+    d["gate"] = list(GATE_DEFAULT)
+    d["cols"] = [list(c) for c in COLS_DEFAULT]
+    d["src"] = None
+    return d
+
+
+def clean_lfield(name, v):
+    if name in LNUM:
+        lo, hi, d = LNUM[name][:3]
+        return min(max(float(v), lo), hi) if _isnum(v) else d
+    lo, hi, d = LINT[name][:3]
+    return int(min(max(round(float(v)), lo), hi)) if _isnum(v) else d
+
+
+def _clean_gate(v, strict=False):
+    if isinstance(v, (list, tuple)) and len(v) == 4 and all(_isnum(x) for x in v):
+        return [min(max(float(x), 0.0), 2.0) for x in v]
+    if strict:
+        raise ValueError("gate must be [r, g, b, a] gains")
+    return list(GATE_DEFAULT)
+
+
+def _clean_cols(v, strict=False):
+    if (isinstance(v, (list, tuple)) and len(v) == 4 and all(isinstance(c, (list, tuple)) and len(c) == 3
+                                                             and all(_isnum(x) for x in c) for c in v)):
+        return [[min(max(float(x), 0.0), 1.0) for x in c] for c in v]
+    if strict:
+        raise ValueError("cols must be four [r, g, b] colours")
+    return [list(c) for c in COLS_DEFAULT]
+
+
+def clean_layer(raw):
+    """An overlay layer -> its full canonical dict, or None (empty: no layer)."""
+    if not isinstance(raw, dict):
+        return None
+    out = default_layer()
+    for f in LFIELDS:
+        if f in raw:
+            out[f] = clean_lfield(f, raw[f])
+    if "gate" in raw:
+        out["gate"] = _clean_gate(raw["gate"])
+    if "cols" in raw:
+        out["cols"] = _clean_cols(raw["cols"])
+    out["src"] = clean_src(raw.get("src"))
+    return out
+
+
+def _layer_diff(lay):
+    """Compact form for JSON: only what differs from the default (None stays None)."""
+    if lay is None:
+        return None
+    d = default_layer()
+    return {k: v for k, v in lay.items() if v != d[k]}
 
 
 def clean_slot(raw, env=None):
@@ -205,6 +296,9 @@ def clean_slot(raw, env=None):
         if "tint" in raw:
             out["tint"] = clean_tint(raw["tint"])
         out["src"] = clean_src(raw.get("src"))
+        lays = raw.get("layers")
+        if isinstance(lays, list):
+            out["layers"] = [clean_layer(x) for x in (lays + [None] * MAX_OVERLAYS)[:MAX_OVERLAYS]]
     if env is not None:
         out["map"] = min(out["map"], len(ENVS[env]["maps"]) - 1)
     return out
@@ -255,6 +349,8 @@ def clean_skins(raw, sources=None):
                 continue
             s = clean_slot(val, p[0])
             diff = {k: v for k, v in s.items() if v != dflt[k]}
+            if "layers" in diff:
+                diff["layers"] = [_layer_diff(x) for x in s["layers"]]
             if diff:
                 out["slots"][key] = diff
     mods = raw.get("mods")
@@ -309,8 +405,35 @@ def validate(c):
         out["env"], out["slot"] = _env_slot(c)
         src = clean_src(dict(kind=c.get("kind"), name=c.get("name")))
         if src is None:
-            raise ValueError("source must be {kind: art | ai, name: an image file name}")
+            raise ValueError("source must be {kind: art | ai, name: an image file name} or {kind: layer, name: a layer id}")
         out.update(src)
+    elif op in ("layer", "layer_clear"):
+        out["env"], out["slot"] = _env_slot(c)
+        i = c.get("i")
+        if type(i) is not int or not 0 <= i < MAX_OVERLAYS:
+            raise ValueError(f"overlay index i must be an integer 0..{MAX_OVERLAYS - 1}")
+        out["i"] = i
+        if op == "layer":
+            sets = c.get("set")
+            if not isinstance(sets, dict) or not sets:
+                raise ValueError("nothing to set")
+            clean = {}
+            for f, v in sets.items():
+                if f == "src":
+                    clean[f] = None if v is None else clean_src(v)
+                    if v is not None and clean[f] is None:
+                        raise ValueError("bad overlay source")
+                elif f == "gate":
+                    clean[f] = _clean_gate(v, strict=True)
+                elif f == "cols":
+                    clean[f] = _clean_cols(v, strict=True)
+                elif f in LFIELDS:
+                    if not _isnum(v):
+                        raise ValueError(f"'{f}' must be a number")
+                    clean[f] = clean_lfield(f, v)
+                else:
+                    raise ValueError("unknown overlay field")
+            out["set"] = clean
     elif op == "clear":
         out["env"], out["slot"] = _env_slot(c)
     elif op == "reset":
@@ -410,8 +533,12 @@ class SkinState:
         frame = {}
         for env, ss in (self.slots.items() if self.on else ()):
             for s, d in ss.items():
-                if d["src"] is not None:
-                    frame.setdefault(env, {})[s] = dict(d, tint=list(d["tint"]), src=dict(d["src"]))
+                lays = [None if (x is None or x["src"] is None) else
+                        dict(x, gate=list(x["gate"]), cols=[list(c) for c in x["cols"]], src=dict(x["src"]))
+                        for x in d["layers"]]
+                if d["src"] is not None or any(lays):
+                    frame.setdefault(env, {})[s] = dict(d, tint=list(d["tint"]),
+                                                        src=dict(d["src"]) if d["src"] else None, layers=lays)
         self.frame = frame
         self._modded = [(k, parse_key(k), "skin:" + k) for k in self.mods]
 
@@ -448,6 +575,18 @@ class SkinState:
             self._rebuild()
         elif op == "assign":
             self.assign(c["env"], c["slot"], c["kind"], c["name"])
+        elif op == "layer":
+            lays = self.slots[c["env"]][c["slot"]]["layers"]
+            lay = lays[c["i"]] or default_layer()
+            for f, v in c["set"].items():
+                lay[f] = [list(x) for x in v] if f == "cols" else (list(v) if isinstance(v, list) else v)
+            lays[c["i"]] = lay
+            self.edits += 1
+            self._rebuild()
+        elif op == "layer_clear":
+            self.slots[c["env"]][c["slot"]]["layers"][c["i"]] = None
+            self.edits += 1
+            self._rebuild()
         elif op == "clear":
             self.slots[c["env"]][c["slot"]]["src"] = None
             self.edits += 1
@@ -498,6 +637,9 @@ class SkinState:
         for ss in self.slots.values():
             for d in ss.values():
                 d["src"] = None
+                for lay in d["layers"]:
+                    if lay is not None:
+                        lay["src"] = None
         self.gen_cancel()
         self.cut += 1
         self.edits += 1
@@ -580,7 +722,11 @@ class SkinState:
             if self.slots[g["env"]][g["slot"]]["src"] != g["src0"]:
                 self.gen_note = f"{name} is in the library; the slot was changed meanwhile, so it was left alone"
                 return None
-            return name if self.assign(g["env"], g["slot"], "ai", name) else None
+            if not self.assign(g["env"], g["slot"], "ai", name):
+                return None
+            self.slots[g["env"]][g["slot"]]["tile"] = 0      # the local generator makes true seamless tiles: plain
+            self._rebuild()                                  # repeat, no mirror creases
+            return name
         if now - g["t"] > GEN_TIMEOUT_S:
             self.gen_cancel("the AI worker did not answer")
         return None
@@ -631,13 +777,17 @@ def meta():
               for k, e in ENVS.items()],
         num={f: dict(lo=v[0], hi=v[1], default=v[2], label=v[3]) for f, v in NUM.items()},
         int={f: dict(lo=v[0], hi=v[1], default=v[2], label=v[3]) for f, v in INT.items()},
-        mix=list(MIX_NAMES), tile=list(TILE_NAMES), kinds=list(KINDS), max_layers=MAX_LAYERS)
+        mix=list(MIX_NAMES), tile=list(TILE_NAMES), kinds=list(KINDS), max_layers=MAX_LAYERS,
+        overlays=dict(n=MAX_OVERLAYS, blend=list(BLEND_NAMES),
+                      num={f: dict(lo=v[0], hi=v[1], default=v[2], label=v[3]) for f, v in LNUM.items()},
+                      int={f: dict(lo=v[0], hi=v[1], default=v[2], label=v[3]) for f, v in LINT.items()}),
+        layer_sources=dict(LAYER_SOURCES), examples=sorted(EXAMPLES))
 
 
 # ------------------------------------------------------------------ GLSL chunk (pasted into the host shader)
 
 def glsl(nslots=MAX_SLOTS, pal="palC"):
-    """Uniforms + helpers. The host calls skTap / skTri (ONE fetch / THREE fetches) and skMix.
+    """Uniforms + helpers. The host calls skLight (3D worlds), skTap / skTri (ONE fetch / THREE fetches) and skMix.
     `pal` = the host's palette lookup, float -> vec3."""
     return """
 // ---- environment skins (materials.py). Per slot: skA = layer A, layer B, crossfade, amount;
@@ -645,6 +795,9 @@ def glsl(nslots=MAX_SLOTS, pal="palC"):
 // brightness; skE = tint rgb, unused.
 uniform sampler2DArray texSkin;
 uniform vec4 skA[%(n)d], skB[%(n)d], skC[%(n)d], skD[%(n)d], skE[%(n)d];
+float skZ = 0.5;                                      // depth of this pixel, 0 near .. 1 far (set by the host)
+float skSp = 0.0;                                     // specular glint of the form light (set by skLight)
+float skDim = 1.0;                                    // the host multiplies its own haze / glow by this
 vec3 skFetch(int s, vec2 uv, vec2 gx, vec2 gy){
   if (skB[s].z > 0.5) {                               // mirrored repeat: continuous for ANY image; the fold is kept
     uv = 1.0 - abs(mod(uv, 2.0) - 1.0);               // half a (mip) texel away from the edge so the wrap never bleeds in
@@ -653,7 +806,10 @@ vec3 skFetch(int s, vec2 uv, vec2 gx, vec2 gy){
     uv = clamp(uv, e, 1.0 - e);
   }
   vec3 c = textureGrad(texSkin, vec3(uv, skA[s].x), gx, gy).rgb;
-  if (skA[s].z > 0.002) c = mix(c, textureGrad(texSkin, vec3(uv, skA[s].y), gx, gy).rgb, skA[s].z);   // only while a swap fades
+  if (skA[s].z > 0.002) {                             // only while a swap fades: the new image sweeps in from the
+    float e = mix(-0.25, 1.25, skA[s].z);             // near end to the far end (a wipe along depth, no grey double exposure)
+    c = mix(c, textureGrad(texSkin, vec3(uv, skA[s].y), gx, gy).rgb, 1.0 - smoothstep(e - 0.18, e + 0.18, skZ));
+  }
   return c;
 }
 // ONE fetch. uv = the mapping's two coordinates, gx / gy = their change across one pixel (analytic: no derivative
@@ -665,25 +821,40 @@ vec3 skTap(int s, vec2 uv, vec2 gx, vec2 gy){
 // THREE fetches (the expensive mapping; only run when the slot asks for it). zr = distance along the travel axis.
 vec3 skTri(int s, vec3 p, vec3 n, float f){
   mat2 M = mat2(skC[s].xy, skC[s].zw);
-  vec3 w = abs(n); w *= w; w *= w; w /= (w.x + w.y + w.z + 1e-5);
+  vec3 w = abs(n); w *= w; w *= w; w *= w; w /= (w.x + w.y + w.z + 1e-5);       // ^8: crisp, no double exposure
   vec2 gx = M*vec2(f*1.4, 0.0), gy = M*vec2(0.0, f*1.4), o = skD[s].xy;
   return skFetch(s, M*p.yz + o, gx, gy)*w.x + skFetch(s, M*p.xz + o, gx, gy)*w.y + skFetch(s, M*p.xy + vec2(o.x, 0.0), gx, gy)*w.z;
 }
-// proc = the world's own colour at this point, S = the skin, lines = the world's line mask (0..1), shade = soft form
-// shading for "replace" so the surface still reads as a surface.
+// Form light for a raymarched surface: N = surface normal (towards the camera side), rd = view ray, t = distance,
+// steps = march steps taken (cheap ambient occlusion). Returns diffuse x AO x a fog that ends in true black, and
+// leaves a soft specular glint in skSp and the depth in skZ. Analytic: no extra march, no fetch.
+float skLight(vec3 N, vec3 rd, float t, float steps){
+  const vec3 L = vec3(0.2120, 0.7420, -0.6360);
+  float ndl = clamp(dot(N, L)*0.40 + 0.68, 0.34, 1.0);
+  float sp = max(dot(reflect(rd, N), L), 0.0); sp *= sp; sp *= sp; sp *= sp;       // ^16 by squaring (no pow)
+  skSp = sp*sp*0.45;
+  skZ = clamp(t*0.04, 0.0, 1.0);
+  return ndl*exp(-(steps*0.006 + t*t*0.0017));
+}
+// proc = the world's own colour at this point, S = the skin, lines = the world's line mask (0..1), shade = the form
+// shading (light x the world's own relief) so the surface still reads as a lit surface, not a sticker.
 vec3 skMix(int s, vec3 proc, vec3 S, float lines, float shade){
+  S = max((S - 0.05)*1.0526, 0.0);                    // black floor: dark paint is no light at all
   float l = dot(S, vec3(0.299, 0.587, 0.114));
+  S *= (0.72 + 0.72*l)*smoothstep(0.02, 0.24, l);     // local contrast: lights up, murk down (black = no light)
   if (skB[s].w > 0.001) S = mix(S, %(pal)s(l*0.85 + 0.08)*l*1.7, skB[s].w);
-  S = min(S*skE[s].rgb*(skD[s].w*smoothstep(0.08, 0.40, l)), 1.25);   // dark paint stays black (black = no light)
+  S = min(S*skE[s].rgb*skD[s].w, 1.25);
+  l = dot(S, vec3(0.299, 0.587, 0.114));
   vec3 pc = min(proc, 1.0), o;
-  float m = skB[s].y;
-  if (m < 0.5) o = S*(shade*1.3) + proc*lines*0.12;
-  else if (m < 1.5) o = proc*S*2.2;
-  else if (m < 2.5) o = 1.0 - (1.0 - pc)*(1.0 - min(S*shade, 1.0));
-  else if (m < 3.5) o = mix(2.0*pc*S, 1.0 - 2.0*(1.0 - pc)*(1.0 - min(S, 1.0)), step(0.5, pc))*1.15;
-  else o = S*lines*1.45 + proc*(1.0 - lines)*0.10;
+  float m = skB[s].y, pl = dot(pc, vec3(0.299, 0.587, 0.114));
+  if (m < 0.5) o = S*(shade*1.75) + vec3(1.0, 0.95, 0.88)*(skSp*l*shade) + proc*lines*0.16;
+  else if (m < 1.5) o = proc*(0.22 + 2.1*S);          // the world's own light takes the skin's colour and grain
+  else if (m < 2.5) { vec3 q = S*(shade*0.85); o = max(pc, q) + 0.25*min(pc, q); }     // lighter of the two: no milky haze
+  else if (m < 3.5) o = proc*(0.50 + 1.5*S) + S*(pl*0.50 + 0.10*shade);
+  else o = S*(lines*1.9*(0.55 + 0.45*shade)) + proc*(1.0 - lines)*0.10;
   vec3 k = max(o - 0.8, 0.0);                          // soft knee: a bright skin rolls off, it never clips to white
   o = min(o, 0.8) + k/(1.0 + 4.0*k);
+  skDim = min(skDim, 1.0 - 0.6*skA[s].w);
   return mix(proc, o, skA[s].w);
 }
 """ % dict(n=nslots, pal=pal)

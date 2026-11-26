@@ -348,7 +348,7 @@ def test_stack_fields_are_modulated_by_the_mod_matrix(tmp_path):
     base = c.stack.find(1)["speed"]
     assert c.stack.live["1:speed"] == pytest.approx(base + 0.25 * 8.0)  # amount x range x source
     assert c.stack.find(1)["speed"] == base                            # the stored value is never touched
-    assert c.state()["stack"]["live"]["1:speed"] == pytest.approx(2.25)
+    assert c.state()["stack"]["live"]["1:speed"] == pytest.approx(base + 2.0)
     do(c, cmd="mod", name="stack:1:speed", slot=0, src="none")
     assert c.stack.mods == {}
     for bad in ("stack:1:gen", "stack:x:speed", "stack:1:nope", "stack:1"):
@@ -802,3 +802,21 @@ def test_meta_describes_the_stack_for_the_panel():
     assert m["max"] == 8 and len(m["generators"]) == 8 and {x["name"] for x in m["num"]} == set(stack.NUM)
     assert all(set(stack.FIELDS) <= set(p) for p in m["presets"].values())
     json.dumps(m)
+
+
+def test_meta_offers_the_named_showpiece_looks():
+    """The composed showpiece stacks are named presets the panel / clips can load with one `replace`."""
+    looks = stack.meta()["looks"]
+    names = [lk["name"] for lk in looks]
+    for want in ("Op-art moire", "Star lattice", "Tunnel weave"):
+        assert want in names
+    for lk in looks:
+        assert lk["hint"]
+        clean = stack.clean_stack(lk["stack"])
+        assert 2 <= len(clean["layers"]) <= stack.MAX_LAYERS
+        assert stack.validate({"cmd": "stack", "op": "replace", "stack": lk["stack"]})
+        st = StackState()
+        st.do({"cmd": "stack", "op": "replace", "stack": lk["stack"]})
+        for _ in range(120):                                  # two seconds of play: nothing breaks the safe rates
+            st.step(1 / 60, dict(bpm=124.0, beat=0.0))
+        assert not st.state()["capped"]                       # shipped looks never need the speed limiter

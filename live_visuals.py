@@ -861,21 +861,26 @@ void main(){
   // block is skipped and no texture is sampled. ONE fetch (hardware-filtered); analytic gradients = no atan seam.
   if (skA[0].w > 0.0005) {
     float em = skB[0].x, rK = length(pt)+1e-5, thK = atan(pt.y, pt.x), fd, fogk = clamp(p_depth_fog, 0.0, 1.0); vec3 S;
+    float lit = 0.80 + 0.20*sin(thK + 1.15);                         // a soft light from above: the tunnel reads as a tube
+    float far = 1.0 + 0.07/rK;                                       // filter a little harder toward the vanishing point
+    skZ = clamp(1.0 - rK*1.5, 0.0, 1.0);
     if (em > 3.5) {                                                   // ground + sky planes (flat field, travel mode 1)
-      float ay = max(abs(pf_.y), 1e-3), z = 0.32/ay;
-      S = skTap(0, vec2(pf_.x*z + step(0.0, pf_.y)*3.7, z), vec2(min(ps*z, 4.0), 0.0), vec2(0.0, min(ps*z/ay, 4.0)));
-      fd = exp(-(z-0.64)*mix(0.03, 0.75, fogk))*smoothstep(0.015, 0.06, ay);
-    } else if (em > 2.5) {                                            // screen
-      S = skTap(0, pscr, vec2(pxh, 0.0), vec2(0.0, pxh)); fd = 1.0;
+      float ay = max(abs(pf_.y), 1e-3), z = 0.32/ay, fz = 1.0 + 0.5*z;
+      S = skTap(0, vec2(pf_.x*z + step(0.0, pf_.y)*3.7, z), vec2(min(ps*z*fz, 4.0), 0.0), vec2(0.0, min(ps*z/ay*fz, 4.0)));
+      fd = smoothstep(0.035, mix(0.20, 0.34, fogk), ay)*pow(min(ay*2.2, 1.0), 0.35); lit = 1.0; skZ = clamp(1.0 - ay*2.5, 0.0, 1.0);
+    } else if (em > 2.5) {                                            // screen: a projection that the tunnel's own light masks
+      vec2 su = pscr*(1.0 + 0.15*dot(pscr, pscr));
+      S = skTap(0, su, vec2(pxh, 0.0), vec2(0.0, pxh));
+      fd = (0.45 + 1.3*min(dot(col, vec3(.299,.587,.114)), 1.0))*smoothstep(0.03, 0.30, rK); lit = 1.0;
     } else if (em > 1.5) {                                            // tube: depth along it, angle round it
       float z = 0.5/rK;
-      S = skTap(0, vec2(thK/TAU, z), vec2(min(ps/(TAU*rK), 4.0), 0.0), vec2(0.0, min(ps*z/rK, 4.0)));
-      fd = exp(-(z-0.5)*mix(0.03, 0.85, fogk))*smoothstep(0.02, 0.07, rK);
+      S = skTap(0, vec2(thK/TAU, z), vec2(min(ps/(TAU*rK)*far, 4.0), 0.0), vec2(0.0, min(ps*z/rK*far, 4.0)));
+      fd = exp(-(z-0.5)*mix(0.10, 0.85, fogk))*smoothstep(0.03, 0.12, rK);
     } else {                                                          // log-polar: the endless zoom tunnel / Droste
-      S = skTap(0, vec2(thK/TAU, log(rK)), vec2(min(ps/(TAU*rK), 4.0), 0.0), vec2(0.0, min(ps/rK, 4.0)));
-      fd = smoothstep(0.02, mix(0.10, 0.45, fogk), rK);
+      S = skTap(0, vec2(thK/TAU, log(rK)), vec2(min(ps/(TAU*rK)*far, 4.0), 0.0), vec2(0.0, min(ps/rK*far, 4.0)));
+      fd = smoothstep(0.04, mix(0.36, 0.60, fogk), rK);
     }
-    col = skMix(0, col, S*fd, smoothstep(0.02, 0.28, max3(col)), 1.0);
+    col = skMix(0, col, S*fd, smoothstep(0.02, 0.28, max3(col)), lit);
     cov = max(cov, min(max3(col), 1.0)*skA[0].w);
   }
   // <skins]

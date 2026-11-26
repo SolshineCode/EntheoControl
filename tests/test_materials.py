@@ -975,7 +975,8 @@ def test_procedural_sources_are_untouched_and_hooks_still_fit():
         sk = fx.skinned_source(i)
         assert sk.count("uniform sampler2DArray texSkin") == 1 and sk.count("skMix(") == 2
         anchor, add, _ = fx.SKIN_HOOKS[i]
-        assert sk.replace(mt.GLSL, "").replace(add, "") == fs, "skinned = original + one chunk + one block, nothing else"
+        back = sk.replace(mt.GLSL, "").replace(add, "").replace("col += skDim*palC(", "col += palC(")
+        assert back == fs, "skinned = original + one chunk + one block + the haze dimmer, nothing else"
     assert mt.GLSL.count("textureGrad(") == 2, "one fetch per slot per pixel (+ one only while a swap fades)"
     assert "sampler2DArray" in mt.GLSL and mt.UNIT not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21)
 

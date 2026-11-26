@@ -356,3 +356,22 @@ def test_polytope_edge_counts():
     ids = e[:, 8].astype(int)
     assert [(ids == i).sum() for i in range(3)] == [32, 96, 720]    # tesseract, 24-cell, 600-cell
     assert np.allclose(np.linalg.norm(e[:, :4], axis=1), 1.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("morph", [0.0, 0.3, 0.5, 0.7, 1.0, float("nan")])
+@pytest.mark.parametrize("phase", [0.0, 2.0, 4.5])
+def test_julia_zooms_into_a_repelling_spiral_centre(morph, phase):
+    """The Julia zoom centre is the alpha fixed point of a p/q bulb: repelling (|lambda| > 1, or the zoom loop
+    never leaves it), turning p/q of a turn per period (q spiral arms), and the set is connected (the critical orbit
+    stays bounded: filaments, not dust and straight escape lines)."""
+    import cmath
+    c, a, lam = ml.julia_constants(morph, phase)
+    assert abs(a * a + c - a) < 1e-9 and abs(lam - 2 * a) < 1e-12
+    assert abs(lam) > 1.02
+    i = min(int((0.5 if morph != morph else morph) * len(ml.JULIA_BULBS)), len(ml.JULIA_BULBS) - 1)
+    p, q = ml.JULIA_BULBS[i]
+    assert abs((cmath.phase(lam) / (2 * math.pi)) % 1.0 - p / q) < 0.01
+    z = 0j
+    for _ in range(500):
+        z = z * z + c
+    assert abs(z) < 2.0

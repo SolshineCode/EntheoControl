@@ -34,8 +34,8 @@ def sp(ctx):
 
 def state(layers):
     st = stack.StackState()
-    for lay in layers:
-        st.add(lay.get("gen", 0), lay)
+    for lay in layers:                                         # plain flat bands unless a test asks for the look fields
+        st.add(lay.get("gen", 0), dict(dict(glow=0.0, bevel=0.0, even=0.0, grad=0.0, duty=0.5), **lay))
     st.restore(st.to_json())                                   # no fade-in
     return st
 
@@ -131,3 +131,30 @@ def test_palette_layers_take_the_show_palette(sp):
     sp.render(st.frame, 1.0, [(0, 1, 0)] * 5)
     img = np.asarray(sp.read(), dtype=np.int16)
     assert img[..., 1].max() > 240 and img[..., 0].max() < 8 and img[..., 2].max() < 8
+
+
+def test_full_width_band_has_no_seam(sp):
+    """duty 1 = no gap: the band edge must not draw a dark seam line (it did: the square edge fell to half)."""
+    img = shot(sp, state([dict(gen=0, wave=1, freq=3, duty=1.0, soft=0.0, angle=0.25,
+                               stops=[[0, 0.8, 0.8, 0.8], [0.5, 0.8, 0.8, 0.8]])]))
+    lum = img[..., :3].max(axis=2)
+    assert lum.min() >= 0.9 * lum.max()
+
+
+@pytest.mark.parametrize("i", range(3))
+def test_named_looks_keep_the_room_dark_and_the_lines_crisp(ctx, i):
+    big = (480, 300)                                            # fine filaments need real pixels to show their cores
+    sp = stack.StackPass(ctx, big)
+    lk = stack.meta()["looks"][i]
+    st = stack.StackState()
+    st.do({"cmd": "stack", "op": "replace", "stack": lk["stack"]})
+    st.restore(st.to_json())
+    for _ in range(30):
+        st.step(1 / 60, dict(bpm=120.0, beat=0.0), aspect=big[0] / big[1])
+    sp.render(st.frame, 1.0)
+    img = np.asarray(sp.read(), dtype=np.int16)[..., :3]
+    sp.release()
+    lum = img.max(axis=2)
+    assert (lum > 48).mean() <= 0.45, lk["name"]               # projected in a dark room: mostly no light
+    assert (lum > 48).mean() >= 0.06, lk["name"]
+    assert lum.max() >= 200, lk["name"]                         # luminous cores, not a dim haze
