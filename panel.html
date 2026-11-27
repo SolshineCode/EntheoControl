@@ -1598,6 +1598,7 @@ function nudge(dx,dy){mNudge(dx*mStep,-dy*mStep);}        /* the shared keydown 
   var list=h('div','sfrows'),tools=h('div','row'),tools2=h('div','row');
   add(tools,btn('+ ADD',function(){mSend('add',{});}),btn('DUPLICATE',function(){mSend('dup',{id:mSurf().id});}),
     armBtn('DELETE','TAP AGAIN',function(){mSend('del',{id:mSurf().id});}),
+    armBtn('FULL SCREEN','TAP AGAIN: replace all surfaces',function(){mSend('fullscreen',{});}),
     btn('▲',function(){var i=MS.surfaces.indexOf(mSurf());if(i>0)mSend('move',{id:mSurf().id,to:i-1});}),
     btn('▼',function(){var i=MS.surfaces.indexOf(mSurf());if(i<MS.surfaces.length-1)mSend('move',{id:mSurf().id,to:i+1});}));
   tools.lastChild.title='draw later = on top';tools.children[3].title='draw earlier = underneath';

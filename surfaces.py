@@ -463,7 +463,7 @@ _FIELDS = {
 _ID = 1 << 30
 EDIT_OPS = ("add", "dup", "del", "rename", "move", "set", "corner", "nudge", "corners", "shift", "mask", "mask_add",
             "mask_del", "square", "angle", "edge", "rotate", "reset", "replace")
-EDIT_OPS += ("set_layers", "looks")                 # per-surface layers (2026-11-26)
+EDIT_OPS += ("set_layers", "looks", "fullscreen")                 # per-surface layers (2026-11-26)
 OPS = EDIT_OPS + ("select", "overlay", "undo", "redo", "save")
 BIG = 1e5
 
@@ -494,7 +494,7 @@ def validate_cmd(c, output=DEFAULT_OUTPUT):
         if c.get("name") is not None:
             out["name"] = _name(c["name"])
         return out
-    if op == "looks":                                     # every surface a different moving look (round robin)
+    if op in ("looks", "fullscreen"):                     # looks: round-robin skins; fullscreen: one full-frame surface
         return out
     if op == "replace":                                   # whole-set import (the panel's "paste layout")
         if not isinstance(c.get("surfaces"), list) or not 1 <= len(c["surfaces"]) <= MAX_SURFACES:
@@ -999,6 +999,10 @@ class SurfaceSet:
             s = new_surface(sid, self.output, c.get("name"), [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]])
             self.surfaces.append(s)
             self.sel = sid
+            return True
+        if op == "fullscreen":                           # user 2026-11-26: back to plain full screen in one tap (undoable)
+            self.surfaces = [new_surface(1, self.output, "Full screen")]
+            self.sel = 1
             return True
         if op == "replace":
             surfs, seen = [], set()
