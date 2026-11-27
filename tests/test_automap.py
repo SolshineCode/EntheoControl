@@ -700,7 +700,7 @@ def test_concave_quads_names_and_server_side_ai_validation():
     cal = am.Calibration(np.linalg.inv(H_PC), 0.5, (CW, CH), (PW, PH), "aruco")
     many = am.validate_polys([{"points": BOX_A}] * 12, (CW, CH)) * 3
     new, ids = am.to_surfaces(many, cal, [], (PW, PH), [None, "  ", "x"])
-    assert len(new) == surfaces.MAX_SURFACES and new[0]["name"] == "Auto 1" and new[2]["name"] == "x"
+    assert len(new) == min(len(many), surfaces.MAX_SURFACES) and new[0]["name"] == "Auto 1" and new[2]["name"] == "x"
     ss = surfaces.SurfaceSet((PW, PH))
     assert ss.apply(surfaces.validate_cmd({"op": "replace", "surfaces": new}, (PW, PH)))
 

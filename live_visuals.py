@@ -2129,6 +2129,19 @@ class Phases:
             serpW=np.array([(self.serp * 3.0) % tau + k * tau, (self.serp * 1.3) % tau + k * tau], dtype="f4"))
 
 
+def keep_display_awake():
+    """Stop Windows turning the displays (projector) off or sleeping while the show runs (display idle timeout,
+    default 10 min on AC). Thread-sticky ES_CONTINUOUS flag: released automatically when the engine exits."""
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+        ok = ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        print("[display] keep-awake on (no display sleep during the show)" if ok else "[display] keep-awake refused")
+        return bool(ok)
+    except Exception:                    # not Windows / no ctypes: nothing to do
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--monitor", type=int, default=None, help="borderless on this monitor index (projector usually 1); waits for it if unplugged")
@@ -2230,6 +2243,7 @@ def main():
         glfw.set_window_pos(win, mx, my)
         glfw.show_window(win)
         print(f"[display] borderless on monitor {idx} '{projector[0]}' at {mx},{my} {mw}x{mh}")
+        keep_display_awake()                                   # user 2026-11-26: Windows display sleep blanked the projector
     else:
         win = glfw.create_window(rw, rh, "Projection (preview)", None, None)
     glfw.make_context_current(win)
@@ -2278,6 +2292,12 @@ def main():
     mapper = surf_model.Mapper(path=(args.surfaces if headless else HERE / "surfaces.json"), legacy=map_file,
                                output=(rw, rh), writable=not headless)
     surf_draw = guarded("map", SurfaceRenderer, ctx) if SurfaceRenderer is not None else None
+    try:                                         # [surf-layers] which per-surface sources a bypass switches off
+        from params import bypass_cover as _bc
+        from surface_render import blocked_sources as surf_blocked
+        _BYP_COVER = _bc()
+    except Exception:
+        _BYP_COVER, surf_blocked = {}, (lambda keys, cover: set())
     print(f"[map] {len(mapper.set.surfaces)} surface(s), {mapper.set.status}"
           + ("" if surf_draw is not None else " (multi-surface output unavailable: corner pin only)"))
     corners = mapper.corners()
@@ -2369,12 +2389,12 @@ def main():
     # copied from the show's own render when the layer is up, else drawn by its own 512 px instance.
     skin_hub, hub_st = None, dict(frame=-1, vals=None, uni=None, has_video=False, fbo=None, own={})
     if skins is not None:
-        skin_hub = guarded("skins", skin_mod.LayerHub, ctx, size=512)
+        skin_hub = guarded("skins", skin_mod.LayerHub, ctx, size=512, layers=8)   # 8: per-surface layers too
     if skin_hub is not None:
         skins.hub = skin_hub
         _ex_by = {e["param"]: e for e in extra}
         _hub_cls = dict(l_kene_shipibo=KenePass, l_beings=BeingsPass, l_text=TextPass, l_fractal=FractalPass,
-                        l_stack=stack_mod.StackPass if stack_mod is not None else None)
+                        l_stack=stack_mod.StackPass if stack_mod is not None else None, l_land=LandPass)
 
         def _hub_render(param, o, vv):           # the same calls the layer loop makes, on the small instance
             if param == "l_fractal":
@@ -2386,6 +2406,8 @@ def main():
                 return o.render(dict(vv, chase_phase=chase % 1.0, rot_phase=ph.rot + ph.spin), clock, T, dts, smr, pal)
             if param == "l_text":
                 return o.render(vv, clock, T, dts, smr, pal)
+            if param == "l_land":                # [surf-layers] the 3D deck for per-surface layers
+                return o.render(vv, clock, T, ph.travel, None, pal, smr, spin_phase=ph.spin)
             if param == "l_stack":
                 return o.render(the_stack().frame, 1.0, pal) if the_stack() is not None and the_stack().frame else None
             return None
@@ -2462,6 +2484,14 @@ def main():
                                         and getattr(cam, "tex_m", None) is not None else None))
         _reg("video", visible=lambda: video.tex if hub_st["has_video"] else None)
         _reg("output", visible=lambda: disp, phase="post")   # <skins]
+        # [surf-layers> extra sources for PER-SURFACE LAYERS (surface_render): the 3D deck, the art / AI image
+        if LandPass is not None and "l_land" in PARAMS:
+            _reg("land", draw=_hub_draw("l_land", {"l_land": 1.0}), visible=_hub_vis("l_land"),
+                 release=lambda: _hub_free("l_land"), label="3D deck")
+        for _p, _n in (("l_art", "art"), ("l_ai", "ai")):
+            if _p in PARAMS:
+                _reg(_n, draw=_hub_scene_only(_p), every=2, label="Art image" if _n == "art" else "AI image")
+        # <surf-layers]
 
     def skin_scene():                            # the scene program with the tunnel-skin block: compiled ONCE. A failed
         nonlocal scene_skin                      # compile is remembered (False): no retry per frame, the tunnel stays
@@ -3353,7 +3383,9 @@ def main():
                 target = guarded("flashguard", fguard.output_begin, (fw, fh)) or real_target
             if plan == "multi":
                 try:
-                    surf_draw.render(mapper.set, disp, target, (fw, fh), T, float(smr[0]), grid=st["grid"])
+                    _byp = getattr(controller, "bypass", None)   # [surf-layers] bypassed layers: black on surfaces too
+                    surf_draw.render(mapper.set, disp, target, (fw, fh), T, float(smr[0]), grid=st["grid"], hub=skin_hub,
+                                     blocked=surf_blocked(_byp, _BYP_COVER) if _byp else ())
                     mapper.gate.ok()
                 except Exception as ex:
                     plan = "pin"

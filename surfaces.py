@@ -18,7 +18,18 @@ surfaces.json
       "source": {"mode": "full" | "rect" | "span", "rect": [x, y, w, h]},   rect in 0..1 of the frame, y down
       "content": "main" | "solid" | "glow" | "black",
       "color": [r, g, b],                  0..1: identification colour, solid fill, edge-glow tint
-      "opacity": 0..1, "brightness": 0..2, "glow": 0..1, "feather": px}]}
+      "opacity": 0..1, "brightness": 0..2, "glow": 0..1, "feather": px,
+      "layers": [{"src", "on", "opacity", "blend", "scale", "scroll", "dir", "hue"} x 0..3],   content "layers"
+      "maskfile": "name.png", "label": 1..255, "group": "Grass"}]}      shape "mask" only (see MASK SURFACES)
+
+  content "layers" (PER-SURFACE LAYERS): the surface shows its OWN stack of up to 3 engine layers (LayerHub sources,
+  or "main" = the show's picture), each with EYE (on), opacity, blend, scale, scroll speed + direction and hue shift,
+  laid out in the surface's own 0..1 square (mask surfaces: along each part's flow uv). The list is kept when the
+  surface shows something else, so "same as main" <-> "own layers" is a switch.
+
+  shape "mask" (MASK SURFACES, thin parts such as grass blades): the outline is a projector-space label image
+  masks/<maskfile> next to surfaces.json, RGBA = label (1..255), flow u (base -> tip), flow v (across), coverage.
+  Every part of one group shares one file (one draw for a whole group); `corners` = the part's bounding box.
 
   source "span": every surface in span mode is a window onto ONE picture laid over the bounding box of all of
   them, so the image runs continuously from face to face as if they were one canvas.
@@ -31,13 +42,14 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 import time
 from pathlib import Path
 
 VERSION = 1
 DEFAULT_OUTPUT = (1280, 800)
-MAX_SURFACES = 24
+MAX_SURFACES = 64       # 24 -> 64 (2026-11-26): thin mask parts (grass blades) are one surface each
 MAX_MASK = 8
 MAX_POLY = 16            # clipped polygon points the renderer accepts
 UNDO_DEPTH = 20
@@ -46,9 +58,22 @@ MAX_FEATHER = 200.0
 OVERSCAN = 0.5           # corners may sit this far (in frame sizes) outside the projector frame
 MIN_CROSS = 4.0          # px^2: smallest corner cross product of a usable quad (about 2 px x 2 px)
 CORNER_NAMES = ("TL", "TR", "BR", "BL")
-SHAPES = ("quad", "poly")
+SHAPES = ("quad", "poly", "mask")         # "mask" appended 2026-11-26
 SOURCE_MODES = ("full", "rect", "span")
-CONTENTS = ("main", "solid", "glow", "black")
+CONTENTS = ("main", "solid", "glow", "black", "layers")     # "layers" appended 2026-11-26 (order = shader index)
+MAX_SURF_LAYERS = 3
+BLENDS = ("normal", "add", "screen", "multiply")
+# per-surface layer sources: "main" = the show's own picture, the rest = materials.LayerHub source ids (the engine
+# registers what it actually has; an unknown / missing one draws nothing). Panel mirror: panel.html SURF_SRC.
+LAYER_SOURCES = (("main", "Main picture"), ("kene", "Kené study"), ("beadstudy", "Bead study"),
+                 ("blocks", "Folding Blocks"), ("beads", "Beadwork"), ("lines", "Sacred lines"), ("beings", "Beings"),
+                 ("fractal", "Math fractals"), ("land", "3D deck"), ("stack", "Math stack look"), ("art", "Art image"),
+                 ("ai", "AI image"), ("text", "Text"), ("lines4", "Line layer (4 ch)"), ("kene4", "Kené 4 channels"),
+                 ("video", "Video loops"), ("camera", "Crowd camera"))
+SOURCE_IDS = tuple(k for k, _ in LAYER_SOURCES)
+LOOK_ROTA = ("kene", "fractal", "blocks", "beadstudy", "lines", "beings", "land", "beads")   # all moving
+LAYER_DEFAULT = dict(src="kene", on=True, opacity=1.0, blend="normal", scale=1.0, scroll=0.0, dir=0.0, hue=0.0)
+MASK_DIR = Path(__file__).resolve().parent / "masks"
 OVERLAY_MODES = ("off", "sel", "all")
 # distinct, projector-friendly identification colours (assigned by id)
 COLORS = [(1.0, 0.25, 0.70), (0.10, 0.85, 1.0), (1.0, 0.80, 0.10), (0.35, 1.0, 0.35), (0.65, 0.40, 1.0), (1.0, 0.45, 0.15),
@@ -385,6 +410,42 @@ def _flag(v, what):
     return v
 
 
+def _layer(v):
+    """One per-surface layer row (missing fields take their defaults)."""
+    if not isinstance(v, dict):
+        raise ValueError("a layer must be an object")
+    out = dict(LAYER_DEFAULT)
+    if "src" in v:
+        out["src"] = _choice(v["src"], SOURCE_IDS, "src")
+    if "on" in v:
+        out["on"] = _flag(v["on"], "on")
+    if "blend" in v:
+        out["blend"] = _choice(v["blend"], BLENDS, "blend")
+    for k, lo, hi in (("opacity", 0.0, 1.0), ("scale", 0.1, 8.0), ("scroll", -2.0, 2.0), ("dir", -360.0, 360.0),
+                      ("hue", -180.0, 180.0)):
+        if k in v:
+            out[k] = _num(v[k], lo, hi, k)
+    return out
+
+
+def _layers(v):
+    if not isinstance(v, (list, tuple)) or len(v) > MAX_SURF_LAYERS:
+        raise ValueError(f"'layers' must be a list of 0..{MAX_SURF_LAYERS} layers")
+    return [_layer(x) for x in v]
+
+
+def _maskfile(v):
+    if not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9_\-]{1,48}\.png", v):
+        raise ValueError("'maskfile' must be a plain file name like grass_1.png")
+    return v
+
+
+def _group(v):
+    if not isinstance(v, str):
+        raise ValueError("'group' must be text")
+    return "".join(ch for ch in v if ch.isprintable()).strip()[:MAX_NAME]
+
+
 # field name in a "set" command -> cleaner
 _FIELDS = {
     "enabled": lambda v: _flag(v, "enabled"),
@@ -397,10 +458,12 @@ _FIELDS = {
     "src": lambda v: _choice(v, SOURCE_MODES, "src"),
     "rect": _rect,
     "color": _color,
+    "layers": _layers,
 }
 _ID = 1 << 30
 EDIT_OPS = ("add", "dup", "del", "rename", "move", "set", "corner", "nudge", "corners", "shift", "mask", "mask_add",
             "mask_del", "square", "angle", "edge", "rotate", "reset", "replace")
+EDIT_OPS += ("set_layers", "looks")                 # per-surface layers (2026-11-26)
 OPS = EDIT_OPS + ("select", "overlay", "undo", "redo", "save")
 BIG = 1e5
 
@@ -431,13 +494,21 @@ def validate_cmd(c, output=DEFAULT_OUTPUT):
         if c.get("name") is not None:
             out["name"] = _name(c["name"])
         return out
+    if op == "looks":                                     # every surface a different moving look (round robin)
+        return out
     if op == "replace":                                   # whole-set import (the panel's "paste layout")
         if not isinstance(c.get("surfaces"), list) or not 1 <= len(c["surfaces"]) <= MAX_SURFACES:
             raise ValueError("'surfaces' must be a list")
         out["surfaces"] = [clean_surface(s, wide, strict=True) for s in c["surfaces"]]
         return out
     out["id"] = _int(c.get("id"), 0, _ID, "id")
-    if op == "rename":
+    if c.get("group_all") is True:                       # set / set_layers on every surface of the id's group
+        out["group_all"] = True
+    if op == "set_layers":
+        out["layers"] = _layers(c.get("layers"))
+        if "content" in c:
+            out["content"] = _choice(c["content"], CONTENTS, "content")
+    elif op == "rename":
         out["name"] = _name(c.get("name"))
     elif op == "move":
         out["to"] = _int(c.get("to"), 0, MAX_SURFACES - 1, "to")
@@ -487,7 +558,8 @@ def new_surface(sid, output=DEFAULT_OUTPUT, name=None, corners=None):
     return dict(id=int(sid), name=name or f"Surface {sid}", order=0, enabled=True, shape="quad",
                 corners=[list(map(float, p)) for p in (corners or full_quad(output))], mask=[],
                 source=dict(mode="full", rect=[0.0, 0.0, 1.0, 1.0]), content="main",
-                color=list(COLORS[(int(sid) - 1) % len(COLORS)]), opacity=1.0, brightness=1.0, glow=0.0, feather=0.0)
+                color=list(COLORS[(int(sid) - 1) % len(COLORS)]), opacity=1.0, brightness=1.0, glow=0.0, feather=0.0,
+                layers=[])
 
 
 def clean_surface(raw, output=DEFAULT_OUTPUT, strict=False):
@@ -528,7 +600,19 @@ def clean_surface(raw, output=DEFAULT_OUTPUT, strict=False):
     opt("order", lambda v: _int(v, -_ID, _ID, "order"))
     opt("mode", _FIELDS["src"], sub="source")
     opt("rect", _rect, sub="source")
+    opt("layers", _layers)
+    opt("group", _group)
     opt("mask", lambda v: [] if v == [] else _pts(v, output, 3, MAX_MASK, "mask"))
+    if s["shape"] == "mask":                             # a mask surface needs its label image + label
+        try:
+            s["maskfile"] = _maskfile(raw.get("maskfile"))
+            s["label"] = _int(raw.get("label"), 1, 255, "label")
+        except ValueError:
+            if strict:
+                raise
+            s["shape"] = "quad"                          # unusable: it falls back to its bounding quad
+        s["mask"] = []
+        return s
     if s["mask"] and not is_simple(s["mask"]):
         if strict:
             raise ValueError("mask must not cross itself")
@@ -632,6 +716,7 @@ class SurfaceSet:
         self.can_save = True
         self.status = "default"                            # how load() got here
         self.backup_first = False                          # copy the file on disk aside before the first save
+        self.mask_dir = MASK_DIR                           # where shape "mask" label images live (Mapper: next to the file)
         self._undo, self._redo, self._gesture = [], [], None
 
     # ---- construction / persistence
@@ -781,6 +866,8 @@ class SurfaceSet:
     def source_matrix(self, s):
         """3x3 M: projector pixel (x, y down) -> source (u, v) with (0, 0) the TOP-left of the rendered frame."""
         mode = s["source"]["mode"]
+        if s["shape"] == "mask" and mode == "full":      # a stencil: the picture as it falls on the projector
+            return [[1.0 / self.output[0], 0.0, 0.0], [0.0, 1.0 / self.output[1], 0.0], [0.0, 0.0, 1.0]]
         if mode == "span":
             x0, y0, cw, ch = self.span_box()
             return [[1.0 / cw, 0.0, -x0 / cw], [0.0, 1.0 / ch, -y0 / ch], [0.0, 0.0, 1.0]]
@@ -924,6 +1011,13 @@ class SurfaceSet:
             self.surfaces = surfs
             self.sel = surfs[0]["id"]
             return True
+        if op == "looks":                                # every surface its own moving source, hue and drift
+            n = len(LOOK_ROTA)
+            for k, t in enumerate(self.surfaces):
+                t["content"] = "layers"
+                t["layers"] = [dict(LAYER_DEFAULT, src=LOOK_ROTA[k % n], scroll=0.06 + 0.03 * (k % 3),
+                                    dir=float((k * 137) % 360 - 180), hue=float(((k // n) * 67) % 360 - 180) if k >= n else 0.0)]
+            return True
         s = self.get(c["id"])
         if s is None:
             return False
@@ -955,10 +1049,25 @@ class SurfaceSet:
             self.surfaces.remove(s)
             self.surfaces.insert(min(max(int(c["to"]), 0), len(self.surfaces)), s)
             return True
+        if op in ("set", "set_layers") and c.get("group_all") and s.get("group"):
+            ok = False                                   # one setting for the whole group: one undo step
+            for t in [x for x in self.surfaces if x.get("group") == s["group"]]:
+                ok = self._edit(op, dict(c, id=t["id"], group_all=False)) or ok
+            return ok
+        if op == "set_layers":
+            s["layers"] = copy.deepcopy(c["layers"])
+            if "content" in c:
+                s["content"] = c["content"]
+            return True
         if op == "set":
-            for k in ("enabled", "opacity", "brightness", "glow", "feather", "content", "shape", "color"):
+            if c.get("shape") == "mask" and not s.get("maskfile"):
+                return False                             # only AUTO MAP makes mask surfaces (it writes the label image)
+            if c.get("shape") in ("quad", "poly") and s["shape"] == "mask":
+                s.pop("maskfile", None)
+                s.pop("label", None)
+            for k in ("enabled", "opacity", "brightness", "glow", "feather", "content", "shape", "color", "layers"):
                 if k in c:
-                    s[k] = copy.copy(c[k])
+                    s[k] = copy.deepcopy(c[k])
             if "src" in c:
                 s["source"]["mode"] = c["src"]
             if "rect" in c:
@@ -1064,7 +1173,18 @@ class SurfaceSet:
                 continue                                     # wholly off the projector
             area = abs(signed_area(gl))
             glow = s["glow"] if s["content"] != "glow" or s["glow"] > 0 else 1.0
-            items.append(dict(id=s["id"], name=s["name"], poly=gl, n=len(gl), box=box,
+            lay = []
+            if s["content"] == "layers":
+                for ly in s.get("layers", ()):
+                    if ly["on"] and ly["opacity"] > 0.0:
+                        a = math.radians(ly["dir"])
+                        lay.append((ly["src"], ly["opacity"], BLENDS.index(ly["blend"]), ly["scale"], ly["scroll"],
+                                    math.cos(a), -math.sin(a), math.radians(ly["hue"])))
+            extra = dict(layers=tuple(lay))
+            if s["shape"] == "mask":
+                extra.update(maskfile=s["maskfile"], label=s["label"])
+                glow = 0.0                                 # the edge glow follows polygons; a mask has none
+            items.append(dict(extra, id=s["id"], name=s["name"], poly=gl, n=len(gl), box=box,
                               M=tuple(v for row in M for v in row), L=tuple(v for row in L for v in row),
                               content=CONTENTS.index(s["content"]), color=tuple(s["color"]), opacity=s["opacity"],
                               brightness=s["brightness"], glow=glow, feather=s["feather"] * (sx + sy) / 2.0,
@@ -1126,6 +1246,8 @@ class Mapper:
         self.legacy = Path(legacy) if legacy is not None else None
         self.writable = bool(writable) and self.path is not None
         self.set = SurfaceSet.load(self.path, self.legacy, output, writable=self.writable)
+        if self.path is not None:
+            self.set.mask_dir = self.path.parent / "masks"
         self._edit_t = None                                # when the pending write became due-able
         self._wait = self.AUTOSAVE_S                       # current delay (grows while writes fail)
         self.save_failed = False

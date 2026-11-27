@@ -114,35 +114,43 @@ def gray_sequence(w, h, stripe=STRIPE, level=PATTERN_LEVEL):
 
 def gray_decode(caps, w, h, min_contrast=MIN_CONTRAST, stripe=STRIPE):
     """caps {key: camera image (float or uint8)} from gray_sequence -> (proj_x, proj_y, valid), camera sized."""
+    import cv2
     white, black = caps["white"].astype(np.float32), caps["black"].astype(np.float32)
-    valid = (white - black) > 2 * min_contrast
+    span = white - black
+    valid = span > max(float(min_contrast), 18.0)        # tolerates darker cardboard surfaces while rejecting unlit wall
+    bit_thr = np.minimum(float(min_contrast), np.maximum(float(min_contrast) * 0.45, 0.14 * np.maximum(span, 0.0)))
     out = []
     for axis, n in (("x", w), ("y", h)):
         nb = gray_nbits(n, stripe)
         g = np.zeros(white.shape, np.int32)
         for b in range(nb - 1, -1, -1):
             pos, neg = caps[f"{axis}{b}"].astype(np.float32), caps[f"{axis}{b}i"].astype(np.float32)
-            valid &= np.abs(pos - neg) > min_contrast
+            valid &= np.abs(pos - neg) > bit_thr
             g |= (pos > neg).astype(np.int32) << b
         code = g.copy()                                  # Gray -> binary
         s = g >> 1
         while s.any():
             code ^= s
             s >>= 1
-        coord = code * stripe + stripe * 0.5 - 0.5
+        coord = (code * stripe + stripe * 0.5 - 0.5).astype(np.float32)
         valid &= coord < n
-        out.append(coord.astype(np.float32))
+        # Spatial consistency: reject isolated MSB bit-flips / speckles against 3x3 median (only in interior of valid mask)
+        n_ok = cv2.boxFilter(valid.astype(np.float32), -1, (3, 3), normalize=False)
+        med = cv2.medianBlur(coord, 3)
+        valid &= (n_ok < 7.0) | (np.abs(coord - med) <= max(3.0 * stripe, 12.0))
+        out.append(coord)
     return out[0], out[1], valid
 
 
 def aruco_board(w, h, grid=ARUCO_GRID, level=PATTERN_LEVEL):
     """Projector image with a grid of 4x4 ArUco markers + {id: 4 corners in projector px (TL, TR, BR, BL)}."""
     import cv2
+    level = int(min(max(level, 60), LEVEL_MAX))
     d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     nx, ny = grid
     cell = min(w / nx, h / ny)
     size = int(cell * 0.62)
-    img = np.zeros((h, w), np.uint8)
+    img = np.full((h, w), level, np.uint8)               # full white quiet zone (>=1.8 modules) + steady APL for auto-exposure
     corners = {}
     ox, oy = (w - cell * nx) / 2, (h - cell * ny) / 2
     for j in range(ny):
@@ -150,8 +158,6 @@ def aruco_board(w, h, grid=ARUCO_GRID, level=PATTERN_LEVEL):
             mid = j * nx + i
             x0 = int(round(ox + (i + 0.5) * cell - size / 2))
             y0 = int(round(oy + (j + 0.5) * cell - size / 2))
-            q = int(size * 0.12)                         # white quiet zone around the marker
-            img[y0 - q:y0 + size + q, x0 - q:x0 + size + q] = level
             m = cv2.aruco.generateImageMarker(d, mid, size)
             img[y0:y0 + size, x0:x0 + size] = (m > 127).astype(np.uint8) * level
             corners[mid] = np.array([[x0, y0], [x0 + size, y0], [x0 + size, y0 + size], [x0, y0 + size]], np.float64) - 0.5
@@ -164,8 +170,24 @@ def detect_aruco(gray):
     d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     p = cv2.aruco.DetectorParameters()
     p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    c, ids, _ = cv2.aruco.ArucoDetector(d, p).detectMarkers(np.asarray(gray, np.uint8))
-    return {} if ids is None else {int(i): cc.reshape(4, 2).astype(np.float64) for i, cc in zip(ids.ravel(), c)}
+    p.cornerRefinementWinSize = 3                        # 7x7 window: stays clear of interior bits on small 640x360 markers
+    p.adaptiveThreshWinSizeMin = 5
+    p.adaptiveThreshWinSizeMax = 35
+    p.adaptiveThreshWinSizeStep = 6
+    p.minMarkerPerimeterRate = 0.02
+    p.polygonalApproxAccuracyRate = 0.05
+    p.perspectiveRemovePixelPerCell = 8
+    p.minOtsuStdDev = 3.0
+    det = cv2.aruco.ArucoDetector(d, p)
+    u8 = np.asarray(gray, np.uint8)
+    c, ids, _ = det.detectMarkers(u8)
+    res = {} if ids is None else {int(i): cc.reshape(4, 2).astype(np.float64) for i, cc in zip(ids.ravel(), c)}
+    if len(res) < MIN_MARKERS:                           # low-contrast / uneven-vignetting fallback
+        eq = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(u8)
+        c2, ids2, _ = det.detectMarkers(eq)
+        if ids2 is not None and len(ids2) > len(res):
+            res = {int(i): cc.reshape(4, 2).astype(np.float64) for i, cc in zip(ids2.ravel(), c2)}
+    return res
 
 
 # ------------------------------------------------------------------ calibration result
@@ -204,14 +226,19 @@ def fit_lens(cam, proj, size, max_pts=600):
 
     def cost(k1, k2):
         u = undistort_pts(cam, K, (k1, k2)) if (k1 or k2) else cam
-        H, _ = cv2.findHomography(u, proj, 0)
-        if H is None:
+        if not np.isfinite(u).all():
             return float("inf")
-        return float(np.sqrt(((apply_h(H, u) - proj) ** 2).sum(axis=1).mean()))
+        H, _ = cv2.findHomography(u, proj, 0)
+        if H is None or not np.isfinite(H).all():
+            return float("inf")
+        pred = apply_h(H, u)
+        if not np.isfinite(pred).all():
+            return float("inf")
+        return float(np.sqrt(((pred - proj) ** 2).sum(axis=1).mean()))
     c0 = cost(0.0, 0.0)
     best = (c0, 0.0, 0.0)
-    for k1 in np.arange(-0.5, 0.501, 0.05):
-        for k2 in (-0.2, -0.1, 0.0, 0.1, 0.2):
+    for k1 in np.arange(-0.9, 0.501, 0.05):              # wide-angle webcams (70-80 deg) map to k1 ~ -0.5..-0.8 at f_scale 0.85
+        for k2 in (-0.2, -0.1, 0.0, 0.1, 0.2, 0.4):
             c = cost(k1, k2)
             if c < best[0]:
                 best = (c, k1, k2)
@@ -267,9 +294,22 @@ class Calibration:
                     out[k] = (float(np.median(px[y0:y1, x0:x1][m])), float(np.median(py[y0:y1, x0:x1][m])))
         return out
 
-    def proj_to_cam(self, pts):
+    def proj_to_cam(self, pts, dense=False):
+        pts = np.asarray(pts, np.float64).reshape(-1, 2)
         q = apply_h(self.Hinv, pts)
-        return distort_pts(q, self.K, self.dist) if self._lens() else q
+        out = distort_pts(q, self.K, self.dist) if self._lens() else q
+        if dense and self.dense is not None:             # 3D target (box off the wall): invert the dense map locally
+            px, py, ok = self.dense
+            ys, xs = np.nonzero(ok)
+            if len(xs) >= 16:
+                pxv, pyv = px[ys, xs].astype(np.float64), py[ys, xs].astype(np.float64)
+                for k, (u, v) in enumerate(pts):
+                    d2 = (pxv - u) ** 2 + (pyv - v) ** 2
+                    j = int(np.argmin(d2))
+                    if d2[j] <= 24.0 ** 2:
+                        near = d2 <= max(d2[j] * 1.5, 16.0)
+                        out[k] = (float(np.median(xs[near])), float(np.median(ys[near])))
+        return out
 
     def summary(self):
         return dict(method=self.method, rms=round(self.rms, 2), seen=self.seen, dense=self.dense is not None,
@@ -318,16 +358,40 @@ def proj_coverage(proj_pts, proj_size):
     return float(min(max(cv2.contourArea(hull) / float(W * H), 0.0), 1.0))
 
 
+def _proj_per_cam(cam, proj):
+    c_span = float(np.linalg.norm(np.ptp(cam, axis=0)))
+    p_span = float(np.linalg.norm(np.ptp(proj, axis=0)))
+    return max(1.0, p_span / max(c_span, 1.0))
+
+
 def _with_lens(cam, proj, cam_size, ransac):
-    """Lens fit on the RANSAC inliers, then the homography in corrected coordinates -> (H, dist, rms, inlier mask)."""
-    H0, inl, rms0 = fit_h(cam, proj, ransac=ransac)
-    dist, _, _ = fit_lens(cam[inl], proj[inl], cam_size) if inl.sum() >= 24 else ((0.0, 0.0), 0, 0)
+    """Fit radial lens distortion before strict RANSAC so wide-angle barrel bend is not rejected as outliers.
+    RANSAC threshold scales with projector-px per camera-px (~2.5 cam px floor). -> (H, dist, rms, inlier mask)."""
+    cam, proj = np.asarray(cam, np.float64).reshape(-1, 2), np.asarray(proj, np.float64).reshape(-1, 2)
+    ppc = _proj_per_cam(cam, proj)
+    r_eff = max(float(ransac), 2.5 * ppc) if ransac else 0.0
+    try:
+        H0, inl0, rms0 = fit_h(cam, proj, ransac=r_eff)
+    except CalibError:
+        H0, inl0, rms0 = None, None, float("inf")
+    # Coarse RANSAC keeps barrel-bent outer points so fit_lens can see the edge curvature
+    if len(cam) >= 16:
+        try:
+            _, inl_c, _ = fit_h(cam, proj, ransac=max(r_eff * 6.0, 16.0 * ppc))
+            pts_c = inl_c if inl_c.sum() >= 16 else np.ones(len(cam), bool)
+        except CalibError:
+            pts_c = np.ones(len(cam), bool)
+        dist, _, _ = fit_lens(cam[pts_c], proj[pts_c], cam_size)
+    else:
+        dist = (0.0, 0.0)
     if dist != (0.0, 0.0):
         u = undistort_pts(cam, lens_K(cam_size), dist)
-        H, inl, rms = fit_h(u, proj, ransac=ransac)
-        if rms < rms0:
+        H, inl, rms = fit_h(u, proj, ransac=r_eff)
+        if rms < rms0 or H0 is None:
             return H, dist, rms, inl
-    return H0, (0.0, 0.0), rms0, inl
+    if H0 is None:
+        raise CalibError("markers do not agree on a single plane: is the camera still and the view sharp?")
+    return H0, (0.0, 0.0), rms0, inl0
 
 
 def calib_from_aruco(board, found, cam_size, proj_size, need=MIN_MARKERS, mirrored=False):
@@ -338,12 +402,9 @@ def calib_from_aruco(board, found, cam_size, proj_size, need=MIN_MARKERS, mirror
                          f"part of it), dim the room lights, and try again")
     cam = np.concatenate([found[i] for i in ids])
     proj = np.concatenate([board[i] for i in ids])
-    if len(ids) >= need:                                 # enough markers spread out: fit the lens too
-        H, dist, rms, _ = _with_lens(cam, proj, cam_size, 3.0)
-    else:                                                # partial view: plain homography only
-        H, _, rms = fit_h(cam, proj)
-        dist = (0.0, 0.0)
-    if rms > MAX_RMS:
+    H, dist, rms, _ = _with_lens(cam, proj, cam_size, 3.0)   # fit lens on >=4 markers too (fit_lens returns 0,0 unless helpful)
+    max_rms = max(MAX_RMS, 1.5 * _proj_per_cam(cam, proj))   # <= 1.5 camera px even when camera is far (3-4 m)
+    if rms > max_rms:
         raise CalibError(f"markers do not line up (error {rms:.1f} px): is the wall flat and the camera still?")
     cov = proj_coverage(proj, proj_size)
     warn = ""
@@ -426,11 +487,12 @@ def lit_mask(grey, black, thr=20):
     return d > thr
 
 
-def _regions(grey, lit):
+def _regions(grey, lit, black=None):
     """Connected lit regions split by camera edges (box edges / creases): (n, labels, stats)."""
     import cv2
-    g = cv2.GaussianBlur(np.asarray(grey, np.uint8), (5, 5), 0)
-    e = cv2.dilate(cv2.Canny(g, 30, 90), np.ones((3, 3), np.uint8))
+    src = np.clip(np.asarray(grey, np.float32) - np.asarray(black, np.float32), 0, 255) if black is not None else np.asarray(grey, np.float32)
+    g = cv2.GaussianBlur(src.astype(np.uint8), (5, 5), 0)
+    e = cv2.dilate(cv2.Canny(g, 24, 72), np.ones((3, 3), np.uint8))
     reg = (lit & (e == 0)).astype(np.uint8)
     reg = cv2.morphologyEx(reg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(reg, connectivity=4)
@@ -470,8 +532,8 @@ def order_quad(q):
 
 def candidates(grey, black, max_n=12):
     """[{poly, quad, conf, area}] faces found in the camera picture, biggest first."""
-    lit = lit_mask(grey, black)
-    n, lab, st = _regions(grey, lit)
+    lit = lit_mask(grey, black, thr=15)
+    n, lab, st = _regions(grey, lit, black)
     tot = lit.size
     out = []
     for i in range(1, n):
@@ -495,8 +557,8 @@ def candidates(grey, black, max_n=12):
 
 def pick_face(grey, black, x, y):
     """The face under a click (camera px), or the nearest lit region; None if nothing is lit near it."""
-    lit = lit_mask(grey, black)
-    n, lab, st = _regions(grey, lit)
+    lit = lit_mask(grey, black, thr=15)
+    n, lab, st = _regions(grey, lit, black)
     h, w = lab.shape
     xi, yi = int(min(max(x, 0), w - 1)), int(min(max(y, 0), h - 1))
     k = lab[yi, xi]
@@ -575,7 +637,7 @@ def _simple(p):
     return True
 
 
-def to_surfaces(found, calib, existing, proj_size, names=None):
+def to_surfaces(found, calib, existing, proj_size, names=None, report=None):
     """Camera polygons -> surfaces.py surface dicts (projector px), appended to `existing` (a list of surface dicts).
     A lone untouched full-frame surface #1 is replaced (black outside the found faces). Quads -> shape quad; other
     polygons -> shape poly with the polygon as mask and its bounding quad as corners."""
@@ -591,12 +653,15 @@ def to_surfaces(found, calib, existing, proj_size, names=None):
         if len(keep) + len(made) >= surfaces.MAX_SURFACES:
             break
         p = calib.cam_to_proj(f["poly"])
-        if not np.isfinite(p).all():
-            continue                                     # beyond the calibration's vanishing line: skip, never wrap
-        p = np.clip(p, [-0.4 * W, -0.4 * H], [1.4 * W, 1.4 * H])
         nm = names[k] if names and k < len(names) and isinstance(names[k], str) else ""
         nm = nm.strip() or (f.get("name") or "").strip()
         name = nm[:40] or f"Auto {k + 1}"
+        why = reach_check(p, proj_size, bool(f.get("wall")))     # refuse blown-up / unreachable outlines, with why
+        if why:
+            if report is not None:
+                report.append(f"{name}: {why}")
+            continue
+        p = np.clip(p, [-0.4 * W, -0.4 * H], [1.4 * W, 1.4 * H])
         if f["quad"] and _convex(order_quad(p)):
             s = surfaces.new_surface(nid, proj_size, name, order_quad(p).tolist())
         else:
@@ -606,6 +671,287 @@ def to_surfaces(found, calib, existing, proj_size, names=None):
             if len(p) > surfaces.MAX_MASK or not _simple(p):
                 continue                                 # a warped outline that folds over itself: skip it
             s["shape"], s["mask"] = "poly", p.tolist()
+        made.append(s)
+        nid += 1
+    return keep + made, [s["id"] for s in made]
+
+
+# ------------------------------------------------------------------ projector reach (2026-11-26 live-test bugs 1 + 2)
+REACH_MIN_IN = 0.5               # at least half of a surface must land inside the projector frame
+REACH_MAX_OUT = 0.10             # a surface may overhang the frame by at most 10 % of the frame size
+REACH_MAX_FRAC = 0.85            # a non-wall face that covers > 85 % of the frame = a blown-up conversion
+
+
+def reach_check(p, proj_size, wall=False):
+    """Projector polygon -> None if usable, else the reason it is refused:
+    'outside projector reach' (the camera sees it, the projector cannot light it) or 'exceeds the projector frame'
+    (camera -> projector conversion blew up near the edge of the calibrated region)."""
+    import surfaces
+    W, H = proj_size
+    p = np.asarray(p, np.float64).reshape(-1, 2)
+    if len(p) < 3 or not np.isfinite(p).all():
+        return "outside the calibrated area"
+    area = abs(_area(p))
+    if area < 1.0:
+        return "too small"
+    frame = [(0.0, 0.0), (float(W), 0.0), (float(W), float(H)), (0.0, float(H))]
+    pts = [tuple(q) for q in p]
+    if surfaces.signed_area(pts) < 0:
+        pts = pts[::-1]
+    clipped = surfaces.clip_poly(pts, frame)
+    inside = abs(surfaces.signed_area(clipped)) if len(clipped) >= 3 else 0.0
+    if inside < REACH_MIN_IN * area:
+        return "outside projector reach"
+    x0, y0 = p.min(axis=0)
+    x1, y1 = p.max(axis=0)
+    if x0 < -REACH_MAX_OUT * W or y0 < -REACH_MAX_OUT * H or x1 > (1 + REACH_MAX_OUT) * W or y1 > (1 + REACH_MAX_OUT) * H:
+        return "exceeds the projector frame"
+    if not wall and inside > REACH_MAX_FRAC * W * H:
+        return "exceeds the projector frame"
+    return None
+
+
+def flag_reach(found, calib, proj_size):
+    """DETECT: mark every candidate the projector cannot (sensibly) light: f['reach'] = reason (shown in the panel)."""
+    for f in found:
+        try:
+            why = reach_check(calib.cam_to_proj(f["poly"]), proj_size, bool(f.get("wall")))
+        except Exception:
+            why = "outside the calibrated area"
+        if why:
+            f["reach"] = why
+        else:
+            f.pop("reach", None)
+    return found
+
+
+# ------------------------------------------------------------------ MASK SURFACES: thin parts (grass blades, leaves)
+THIN_MIN_AREA = 12               # camera px: a blade 2-3 px wide and 5+ px long in a 640 x 480 picture
+THIN_MIN_LEN = 10                # skeleton px: shorter pieces are spurs and join the blade they grow from
+THIN_MAX_PARTS = 255             # labels in one mask image
+
+
+def object_mask(white, black, block=31, c=-4, roi=None):
+    """Lit-object segmentation in camera px: projected white minus black, adaptive (local) threshold over a global
+    floor, open + close. roi = optional camera polygons (AI seeds): only what lies inside them counts."""
+    import cv2
+    d = np.clip(np.asarray(white, np.float32) - np.asarray(black, np.float32), 0, 255).astype(np.uint8)
+    d = cv2.GaussianBlur(d, (3, 3), 0)
+    otsu, _ = cv2.threshold(d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    ad = cv2.adaptiveThreshold(d, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, block, c)
+    m = ((ad > 0) & (d > max(12.0, 0.5 * otsu))).astype(np.uint8)
+    k = np.ones((3, 3), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    if roi:
+        r = np.zeros_like(m)
+        for poly in roi:
+            cv2.fillPoly(r, [np.round(np.asarray(poly, np.float64)).astype(np.int32)], 1)
+        m &= r
+    return m.astype(bool)
+
+
+def _tree(pix, root):
+    """Dijkstra over skeleton pixels from root -> (dist, parent)."""
+    import heapq
+    dist, par = {root: 0.0}, {root: None}
+    q = [(0.0, root)]
+    while q:
+        d, (y, x) = heapq.heappop(q)
+        if d > dist[(y, x)]:
+            continue
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                n = (y + dy, x + dx)
+                if (dy or dx) and n in pix:
+                    nd = d + (1.4142 if dy and dx else 1.0)
+                    if nd < dist.get(n, 1e18):
+                        dist[n], par[n] = nd, (y, x)
+                        heapq.heappush(q, (nd, n))
+    return dist, par
+
+
+def thin_instances(mask, min_area=THIN_MIN_AREA, min_len=THIN_MIN_LEN, max_parts=THIN_MAX_PARTS):
+    """Binary camera mask -> (labels int32, u, v float32, parts). Every thin structure is skeletonised; its ROOT is
+    the skeleton point lowest in the picture (where the plant stands). From the farthest tip inwards, each tip's path
+    back to the root is claimed until it meets an earlier blade: that piece is one blade (split at the junction).
+    Short pieces (spurs, shorter than min_len or 4 x the half width) join the blade they meet.
+    u = geodesic distance from the root along the skeleton / the blade's tip distance (0 base .. 1 tip);
+    v = distance from the skeleton / the blade's half width, 0 (middle) .. 1 (edge). Mask pixels take the values of
+    their nearest skeleton pixel."""
+    import cv2
+    m = np.asarray(mask, bool)
+    h, w = m.shape
+    labels = np.zeros((h, w), np.int32)
+    u = np.zeros((h, w), np.float32)
+    v = np.zeros((h, w), np.float32)
+    n, comp, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+    keepc = np.zeros(n, bool)
+    keepc[1:] = st[1:, 4] >= min_area
+    m = keepc[comp]
+    if not m.any():
+        return labels, u, v, []
+    skel = cv2.ximgproc.thinning(m.astype(np.uint8) * 255) > 0
+    dt = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+    slab = np.zeros((h, w), np.int32)                           # skeleton pixel -> blade id
+    su = np.zeros((h, w), np.float32)
+    blades, nid = [], 0
+    for c in range(1, n):
+        if not keepc[c]:
+            continue
+        ys, xs = np.nonzero(skel & (comp == c))
+        if not len(ys):
+            ys, xs = np.nonzero(comp == c)
+        pix = set(zip(ys.tolist(), xs.tolist()))
+        root = max(pix, key=lambda p: (p[0], -abs(p[1] - xs.mean())))
+        dist, par = _tree(pix, root)
+        deg = {p: sum((p[0] + dy, p[1] + dx) in pix for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx) for p in dist}
+        tips = sorted((p for p in dist if deg[p] <= 1 and p != root), key=lambda p: -dist[p]) or [max(dist, key=dist.get)]
+        spur = max(float(min_len), 4.0 * float(np.median(dt[ys, xs])))
+        owner = {}
+        for t in tips:
+            path, p = [], t
+            while p is not None and p not in owner:
+                path.append(p)
+                p = par[p]
+            hit = owner.get(p) if p is not None else None
+            seg = dist[t] - (dist[p] if p is not None else 0.0)
+            if hit is not None and seg < spur:
+                bid = hit                                       # a spur: it belongs to the blade it grows from
+            else:
+                nid += 1
+                bid = nid
+                blades.append(dict(label=bid, length=float(dist[t]), base=(root[1], root[0]), tip=(t[1], t[0]),
+                                   top=float(dist[t]) or 1.0))
+            for q in path:
+                owner[q] = bid
+        top = {b["label"]: b["top"] for b in blades}
+        for p, bid in owner.items():
+            slab[p] = bid
+            su[p] = min(1.0, dist[p] / top[bid]) if bid in top else 0.0
+    blades = sorted(blades, key=lambda b: -b["length"])[:max_parts]
+    remap = np.zeros(nid + 1, np.int32)
+    for k, b in enumerate(blades, 1):
+        remap[b["label"]] = k
+        b["label"] = k
+    slab = remap[slab]
+    seeds = slab > 0
+    sy, sx = np.nonzero(seeds)                                  # raster order = DIST_LABEL_PIXEL numbering
+    if not len(sy):
+        return labels, u, v, []
+    dist, near = cv2.distanceTransformWithLabels((~seeds).astype(np.uint8), cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    idx = np.clip(near - 1, 0, len(sy) - 1)
+    lab_of, u_of = slab[sy, sx], su[sy, sx]
+    labels[m] = lab_of[idx[m]]
+    u[m] = u_of[idx[m]]
+    for b in blades:
+        sel = labels == b["label"]
+        b["area"] = int(sel.sum())
+        hw = float(dist[sel].max()) if b["area"] else 1.0
+        v[sel] = np.clip(dist[sel] / max(hw, 1.0), 0.0, 1.0)
+        b.pop("top", None)
+    return labels, u, v, [b for b in blades if b["area"] > 0]
+
+
+def proj_to_cam_map(calib, proj_size):
+    """Per projector pixel: the camera pixel that sees it (float32 map_x, map_y; -1 = nobody). Dense Gray-code
+    correspondences when the calibration has them (splatted, small holes filled by normalized convolution),
+    else the planar homography (+ lens)."""
+    import cv2
+    W, H = proj_size
+    if calib.dense is None:
+        yy, xx = np.mgrid[0:H, 0:W]
+        q = calib.proj_to_cam(np.stack([xx.ravel() + 0.5, yy.ravel() + 0.5], 1).astype(np.float64))
+        mx, my = q[:, 0].reshape(H, W).astype(np.float32), q[:, 1].reshape(H, W).astype(np.float32)
+        cw, ch = calib.cam_size
+        bad = ~np.isfinite(mx) | ~np.isfinite(my) | (mx < 0) | (my < 0) | (mx > cw - 1) | (my > ch - 1)
+        mx[bad] = my[bad] = -1.0
+        return mx, my
+    px, py, ok = calib.dense
+    cy, cx = np.nonzero(ok)
+    tx, ty = np.round(px[cy, cx] - 0.5).astype(np.int64), np.round(py[cy, cx] - 0.5).astype(np.int64)
+    inn = (tx >= 0) & (ty >= 0) & (tx < W) & (ty < H)
+    sx, sy, wt = np.zeros((H, W), np.float32), np.zeros((H, W), np.float32), np.zeros((H, W), np.float32)
+    np.add.at(sx, (ty[inn], tx[inn]), cx[inn].astype(np.float32))
+    np.add.at(sy, (ty[inn], tx[inn]), cy[inn].astype(np.float32))
+    np.add.at(wt, (ty[inn], tx[inn]), 1.0)
+    mx, my = np.full((H, W), -1.0, np.float32), np.full((H, W), -1.0, np.float32)
+    got = wt > 0
+    mx[got], my[got] = sx[got] / wt[got], sy[got] / wt[got]
+    for k in (3, 5, 9):                                         # fill the holes between splats, smallest first
+        hole = ~got
+        if not hole.any():
+            break
+        bw = cv2.boxFilter(got.astype(np.float32), -1, (k, k), normalize=False)
+        bx = cv2.boxFilter(np.where(got, mx, 0).astype(np.float32), -1, (k, k), normalize=False)
+        by = cv2.boxFilter(np.where(got, my, 0).astype(np.float32), -1, (k, k), normalize=False)
+        f = hole & (bw >= max(2.0, 0.25 * k * k))
+        mx[f], my[f] = bx[f] / bw[f], by[f] / bw[f]
+        got = got | f
+    return mx, my
+
+
+def warp_parts(labels, u, v, calib, proj_size, parts=None, feather=1.5, min_px=6):
+    """Camera label / flow images -> the projector-space mask image (uint8 H x W x 4: label, u, v, coverage) and the
+    parts that landed (with projector bounding boxes). Parts the projector cannot reach are dropped."""
+    import cv2
+    W, H = proj_size
+    mx, my = proj_to_cam_map(calib, proj_size)
+    lab = cv2.remap(labels.astype(np.float32), mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    lab = np.where(mx < 0, 0, lab).astype(np.int32)
+    uu = cv2.remap(u.astype(np.float32), mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    vv = cv2.remap(v.astype(np.float32), mx, my, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # fill pinholes inside parts (close 3x3; the hole takes the label of its nearest labelled pixel)
+    occ = lab > 0
+    closed = cv2.morphologyEx(occ.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)) > 0
+    fill = closed & ~occ
+    if fill.any():
+        _, near = cv2.distanceTransformWithLabels((~occ).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+        oy, ox = np.nonzero(occ)
+        j = np.clip(near[fill] - 1, 0, len(oy) - 1)
+        lab[fill], uu[fill], vv[fill] = lab[oy[j], ox[j]], uu[oy[j], ox[j]], vv[oy[j], ox[j]]
+    occ = lab > 0
+    cov = cv2.GaussianBlur(occ.astype(np.float32), (0, 0), feather) if feather > 0 else occ.astype(np.float32)
+    cov = np.where(occ, np.clip(cov * 2.0 - 0.15, 0.25, 1.0), 0.0)      # inner 1-2 px soft edge, none outside
+    out = []
+    info = {p["label"]: p for p in (parts or [])}
+    ys, xs = np.nonzero(occ)
+    ls = lab[ys, xs]
+    for k in np.unique(ls):
+        sel = ls == k
+        if sel.sum() < min_px:
+            lab[ys[sel], xs[sel]] = 0
+            continue
+        x0, x1, y0, y1 = int(xs[sel].min()), int(xs[sel].max()) + 1, int(ys[sel].min()), int(ys[sel].max()) + 1
+        out.append(dict(info.get(int(k), {}), label=int(k), proj_box=[x0, y0, x1, y1], proj_area=int(sel.sum())))
+    img = np.zeros((H, W, 4), np.uint8)
+    keep = lab > 0
+    img[..., 0] = np.clip(lab, 0, 255)
+    img[..., 1] = np.where(keep, np.clip(np.rint(uu * 255), 0, 255), 0)
+    img[..., 2] = np.where(keep, np.clip(np.rint(vv * 255), 0, 255), 0)
+    img[..., 3] = np.where(keep, np.rint(cov * 255), 0)
+    return img, out
+
+
+def mask_surfaces(parts, existing, proj_size, maskfile, name="Grass blade", group=None):
+    """Projector parts -> mask surfaces (one per part, all in one group sharing `maskfile`), appended to `existing`.
+    A lone untouched full-frame surface #1 is replaced, as with to_surfaces."""
+    import surfaces
+    keep = list(existing)
+    if len(keep) == 1 and np.allclose(np.array(keep[0]["corners"], float), np.array(surfaces.full_quad(proj_size)), atol=2.0) \
+            and not keep[0].get("mask") and keep[0].get("shape") != "mask":
+        keep = []
+    nid = max([s["id"] for s in keep], default=0) + 1
+    group = group or name
+    made = []
+    for k, p in enumerate(parts, 1):
+        if len(keep) + len(made) >= surfaces.MAX_SURFACES:
+            break
+        x0, y0, x1, y1 = p["proj_box"]
+        x1, y1 = max(x1, x0 + 2), max(y1, y0 + 2)
+        s = surfaces.new_surface(nid, proj_size, f"{name} {k}"[:40], [[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+        s.update(shape="mask", maskfile=maskfile, label=int(p["label"]), group=group[:40])
         made.append(s)
         nid += 1
     return keep + made, [s["id"] for s in made]
@@ -816,6 +1162,8 @@ class AutoMap:
         self.scene = None                                # (grey, black) camera stills of the scene
         self.scene_person = (None, False)                # (person mask, segmentation trusted) taken with the scene
         self.found = []                                  # candidate faces (camera px)
+        self.thin = None                                 # DETECT THIN PARTS: {img (projector RGBA), parts, seen}
+        self.mask_dir = None                             # where mask images go (EngineBridge: next to surfaces.json)
         self.made = []                                   # surface ids created by the last "create"
         self.report = []                                 # per-surface verify result
         self.image = None                                # (kind, uint8 BGR) picture for the panel
@@ -871,7 +1219,8 @@ class AutoMap:
                 raise CalibError("the projector frame is not being drawn (is the projector window up, blackout off?)")
             self.sleep(0.01)
         t0 = self.clock()                                # the hold counts from when the pattern is really up
-        rest = (self.hold * PROFILES[self.profile]["settle"] if settle is None else settle) - (self.clock() - t0)
+        want = self.hold * PROFILES[self.profile]["settle"] if settle is None else max(self.hold, float(settle))
+        rest = want - (self.clock() - t0)
         if rest > 0:
             if self.sleep is time.sleep:                 # the real clock: CANCEL / PANIC ends the hold at once
                 if self._cancel.wait(rest):
@@ -934,7 +1283,11 @@ class AutoMap:
         """Built-in webcams often deliver a mirror image: the ArUco markers only decode the right way round."""
         board, _ = aruco_board(W, H, level=self.adapt["level"])
         was, self.mirrored = self.mirrored, False
-        u8 = np.clip(self._cap(board), 0, 255).astype(np.uint8)
+        try:
+            u8 = np.clip(self._cap(board), 0, 255).astype(np.uint8)
+        except Exception:
+            self.mirrored = was
+            raise
         a, b = len(detect_aruco(u8)), len(detect_aruco(u8[:, ::-1].copy()))
         self.mirrored = (b > a) if max(a, b) >= MIN_PARTIAL else was
         return max(a, b)
@@ -967,6 +1320,45 @@ class AutoMap:
                     + f"the projection covers {frac * 100:.0f}% of the camera view; signal/noise {snr:.0f}"
                     f"{' (low: dim the room)' if snr < 8 else ''}; Gray-code stripes {stripe} px. " + " ".join(advice))
 
+    def watch(self, on=True, seconds=900.0):
+        """Live camera view for the panel (user 2026-11-26): stills ~2/s with the found faces drawn on top.
+        Projects nothing, never marks the wizard busy, pauses while a real step runs, stops after `seconds`."""
+        self._watch_until = (self.clock() + float(seconds)) if on else 0.0
+        if on and not getattr(self, "_watch_thread", None):
+            def loop():
+                try:
+                    try:                                         # lock exposure like CALIBRATE (else auto exposure clips
+                        W, H = self._surfaces()[1]               # the projection to flat white): brief steady grey frame
+                        self._project(np.full((H, W), int(self.adapt["level"] * 0.45), np.uint8))   # dimmer than
+                        self.sleep(float(self.cam_profile.get("settle", 1.6)) if isinstance(getattr(self, "cam_profile", None), dict) else 1.6)
+                        self._exposure(True)
+                    except Exception:
+                        pass
+                    finally:
+                        self._show(None)
+                    while self.clock() < getattr(self, "_watch_until", 0.0):
+                        if not self.busy and not self._ready():
+                            try:
+                                self._stills(5)
+                                raw = np.asarray(self._still(1), np.uint8)
+                                g = (raw[:, ::-1] if self.mirrored else raw).astype(np.float32)
+                                self._picture("scene" if self.found else "check", g, None)
+                            except Exception:
+                                pass
+                        self.sleep(0.5)
+                finally:
+                    self._stills(0)
+                    try:
+                        self._exposure(False)
+                    except Exception:
+                        pass
+                    self._watch_thread = None
+            self._watch_thread = threading.Thread(target=loop, name="automap-watch", daemon=True)
+            self._watch_thread.start()
+        if not on:
+            self._stills(0)
+        return True
+
     def framing_live(self, on=True, seconds=90.0):
         """Live framing check while the laptop is being aimed: a steady dim white frame (no flashing), the camera
         view with the lit area marked and advice, refreshed about twice a second; stops after `seconds` or CANCEL."""
@@ -976,18 +1368,35 @@ class AutoMap:
         return self._run("framing", self._framing, seconds)
 
     def _framing(self, seconds):
+        import cv2
         W, H = self._surfaces()[1]
         black = self._cap(np.zeros((H, W), np.uint8), n=1)
-        self._project(np.full((H, W), 120, np.uint8))
+        amb = float(np.percentile(black, 75))                # scalar ambient baseline (valid even as the laptop moves)
+        board, corners = aruco_board(W, H, level=120)        # static dim ArUco board: zero flashing + live marker/mirror check
+        self._project(board)
+        k_close = np.ones((15, 15), np.uint8)
         t0 = self.clock()
         while self.clock() - t0 < seconds and not self._cancel.is_set():
-            g = np.asarray(self._still(1), np.float32)
-            g = g[:, ::-1] if self.mirrored else g
-            lit = lit_mask(g, black, thr=12)
+            raw = np.asarray(self._still(1), np.uint8)
+            n_m = 0
+            if self.mirrored is None:
+                a, b = len(detect_aruco(raw)), len(detect_aruco(raw[:, ::-1].copy()))
+                if max(a, b) >= MIN_PARTIAL:
+                    self.mirrored = b > a
+                n_m = max(a, b)
+            u8 = raw[:, ::-1].copy() if self.mirrored else raw
+            if n_m == 0:
+                n_m = len(detect_aruco(u8))
+            g = u8.astype(np.float32)
+            floor = max(amb, float(np.percentile(g, 20))) + 14.0
+            lit = cv2.GaussianBlur(g, (5, 5), 0) > floor
+            lit = cv2.morphologyEx(lit.astype(np.uint8), cv2.MORPH_CLOSE, k_close) > 0   # bridge black marker interiors
             frac, advice = framing_advice(lit)
-            self.framing = dict(coverage=round(frac, 3), advice=advice)
+            self.framing = dict(coverage=round(frac, 3), advice=advice, markers=n_m)
             self._picture("check", g, lit)
-            self.msg = f"live framing: {frac * 100:.0f}% of the camera view is projection. " + " ".join(advice)
+            m_txt = f", {n_m}/{len(corners)} markers" if n_m else ""
+            self.msg = (f"live framing: {frac * 100:.0f}% of view{m_txt}"
+                        + (" (mirrored: handled)" if self.mirrored else "") + ". " + " ".join(advice))
             self.progress = min(1.0, (self.clock() - t0) / seconds)
             self.sleep(0.4)
 
@@ -999,6 +1408,10 @@ class AutoMap:
         self._project(np.full((H, W), int(self.adapt["level"] * 0.8), np.uint8))   # settle on a neutral frame,
         self._exposure(True)                                                          # then freeze the exposure
         try:
+            try:
+                self._still(2)                                                        # let locked exposure settle before board
+            except Exception:
+                pass
             self._calibrate_locked(gray)
         finally:
             self._exposure(False)
@@ -1021,7 +1434,16 @@ class AutoMap:
         cal = calib_from_aruco(corners, found, cam_size, (W, H), mirrored=bool(self.mirrored))
         self.msg = f"markers: {cal.seen}, error {cal.rms:.2f} px"
         if gray:
-            st = self.adapt["stripe"]
+            # Always adapt stripe width from the actual ArUco scale (even if 1 CHECK CAMERA was skipped)
+            pts_p = np.concatenate([corners[i] for i in found if i in corners])
+            pts_c = np.concatenate([found[i] for i in found if i in corners])
+            sc_xy = np.ptp(pts_c, axis=0) / np.maximum(np.ptp(pts_p, axis=0), 1.0)
+            scale_est = float(np.min(sc_xy))             # use the finer/foreshortened axis so both X and Y stripes stay >= 2.5 cam px
+            st = STRIPE
+            while st < 32 and st * scale_est < 2.5:
+                st *= 2
+            self.adapt["stripe"] = st
+            self.adapt["scale"] = round(scale_est, 3)
             seq = gray_sequence(W, H, st, lv)
             caps = {}
             for k, (key, pat) in enumerate(seq):
@@ -1038,7 +1460,12 @@ class AutoMap:
                 g.seen = cal.seen + "; " + g.seen
                 cal = g
             except CalibError as ex:
-                self.msg += f" (structured light skipped: {ex})"
+                if float(ok.mean()) >= 0.02:                     # non-planar scene (<50% planar): keep the dense map anyway
+                    cal.dense = (px, py, ok)
+                    cal.method = "aruco+graycode"
+                    cal.seen = cal.seen + f"; {ok.mean() * 100:.0f}% decoded (non-planar)"
+                else:
+                    self.msg += f" (structured light skipped: {ex})"
         self.calib = cal
         self.poses[self.pose] = cal
         cal.save(self._folder())
@@ -1060,12 +1487,14 @@ class AutoMap:
         self._need_calib()
         W, H = self._surfaces()[1]
         black = self._cap(np.zeros((H, W), np.uint8))
-        grey = self._cap(np.full((H, W), int(PATTERN_LEVEL * 0.6), np.uint8))
+        grey = self._cap(np.full((H, W), int(self.adapt["level"] * 0.85), np.uint8))
         self.scene = (grey, black)
         self.scene_person = self._person_now()           # who was in front of the camera when THIS photo was taken
-        self.found = candidates(grey, black)
+        self.found = flag_reach(candidates(grey, black), self.calib, (W, H))
         self._picture("scene", grey, None)
-        self.msg = f"{len(self.found)} face(s) found; click a face in the picture to add one, untick the ones you don't want"
+        far = sum(1 for f in self.found if f.get("reach"))
+        self.msg = f"{len(self.found)} face(s) found; click a face in the picture to add one, untick the ones you don't want" \
+            + (f" ({far} outside projector reach: they will not be created)" if far else "")
 
     def pick(self, x, y):
         """Click-to-pick (camera uv 0..1, y down): runs on the wizard thread (OpenCV never on the GL thread)."""
@@ -1113,9 +1542,11 @@ class AutoMap:
             self.err = "no face selected"
             return False
         cur, size = self._surfaces()
-        new, ids = to_surfaces(sel, self.calib, cur, size, names)
+        why = []
+        new, ids = to_surfaces(sel, self.calib, cur, size, names, report=why)
         if not ids:
-            self.err = "none of the selected faces could be turned into a surface (outside the calibrated area?)"
+            self.err = "none of the selected faces could be turned into a surface" + (": " + "; ".join(why) if why else
+                                                                                       " (outside the calibrated area?)")
             return False
         import surfaces
         cmd = {"cmd": "surf", "op": "replace", "surfaces": new}
@@ -1127,7 +1558,69 @@ class AutoMap:
         self._surf(cmd)
         self.made, self.step = ids, "created"
         self.msg = f"{len(ids)} surface(s) created" + (f" ({len(sel) - len(ids)} skipped)" if len(ids) < len(sel) else "") \
-            + ": edit them by hand as usual, or VERIFY & REFINE"
+            + ": edit them by hand as usual, or VERIFY & REFINE" + (" | refused: " + "; ".join(why) if why else "")
+        return True
+
+    # ---- MASK SURFACES: thin parts (grass blades / leaves), one surface each, one label image per group
+    def detect_thin(self, use_found=False):
+        return self._run("thin", self._detect_thin, use_found)
+
+    def _detect_thin(self, use_found):
+        self._need_calib()
+        W, H = self._surfaces()[1]
+        black = self._cap(np.zeros((H, W), np.uint8))
+        white = self._cap(np.full((H, W), int(self.adapt["level"]), np.uint8))
+        roi = [f["poly"] for f in self.found] if use_found and self.found else None
+        m = object_mask(white, black, roi=roi)
+        labels, u, v, parts = thin_instances(m)
+        img, landed = warp_parts(labels, u, v, self.calib, (W, H), parts)
+        self.thin = dict(img=img, parts=landed, seen=len(parts))
+        self.scene = (white, black)
+        self._picture("scene", white, None)
+        lost = len(parts) - len(landed)
+        self.msg = f"{len(landed)} thin part(s) found" + (f" ({lost} outside projector reach, dropped)" if lost else "") \
+            + ": CREATE THIN PARTS makes one surface per part, grouped"
+
+    def create_thin(self, name="Grass blade"):
+        import re
+        import surfaces
+        if self.busy:
+            self.err = "busy: wait for the current step"
+            return False
+        if not self.thin or not self.thin["parts"]:
+            self.err = "nothing to create: DETECT THIN PARTS first"
+            return False
+        cur, size = self._surfaces()
+        name = ("".join(ch for ch in str(name) if ch.isprintable()).strip() or "Grass blade")[:30]
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()[:24] or "part"
+        groups = {x.get("group") for x in cur}
+        group, k = name, 2
+        while group in groups:
+            group, k = f"{name} {k}", k + 1
+        mdir = Path(self.mask_dir or surfaces.MASK_DIR)
+        k = 1
+        while (mdir / f"{slug}_{k}.png").exists():
+            k += 1
+        fname = f"{slug}_{k}.png"
+        try:
+            from PIL import Image
+            mdir.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(self.thin["img"], "RGBA").save(mdir / fname, optimize=True)
+        except Exception as ex:
+            self.err = f"could not write the mask image: {ex}"
+            return False
+        new, ids = mask_surfaces(self.thin["parts"], cur, size, fname, name, group)
+        cmd = {"cmd": "surf", "op": "replace", "surfaces": new}
+        try:
+            surfaces.validate_cmd(cmd, size)
+        except ValueError as ex:
+            self.err = f"could not create the surfaces: {ex}"
+            return False
+        self._surf(cmd)
+        self.made, self.step = ids, "created"
+        cut = len(self.thin["parts"]) - len(ids)
+        self.msg = f"{len(ids)} thin part surface(s) created as group '{group}'" + \
+            (f" ({cut} more did not fit: {surfaces.MAX_SURFACES} surfaces max)" if cut else "")
         return True
 
     def verify(self, ids=None, iters=3):
@@ -1139,22 +1632,26 @@ class AutoMap:
         W, H = size
         want = ids or self.made or [x["id"] for x in cur]
         todo = [s for s in cur if s["id"] in want and s.get("shape", "quad") == "quad"]   # polygon masks: by hand
+        lv = self.adapt["level"]
         black = self._cap(np.zeros((H, W), np.uint8))
-        grey = self._cap(np.full((H, W), int(PATTERN_LEVEL * 0.6), np.uint8))
+        grey = self._cap(np.full((H, W), int(lv * 0.8), np.uint8))
         lit = np.clip(grey - black, 0, 255)               # projector light only: no ambient / wall texture edges
+        search = max(12, int(round(black.shape[1] * 0.025)))
+        scale = self.adapt.get("scale") or (black.shape[1] / float(max(W, 1)))
+        ow = max(3, min(10, int(round(2.0 / max(scale, 0.2)))))   # ~2 cam px outline width so dim/blurred lines stay visible
         report = []
         start = {s["id"]: np.array(s["corners"], np.float64) for s in todo}
         quads = {k: v.copy() for k, v in start.items()}
         targets = {}
         for sid, q in quads.items():
-            t = physical_quad(lit, self.calib.proj_to_cam(q))
+            t = physical_quad(lit, self.calib.proj_to_cam(q, dense=True), search=search)
             if t is not None and np.isfinite(t).all():
                 targets[sid] = t
         first, best = {}, {}
         for n, sid in enumerate(targets):                 # one surface at a time: neighbours' outlines can't confuse it
             for it in range(iters + 1):
-                out = self._cap(outline_image([quads[sid]], size))
-                seen = projected_quad(np.clip(out - black, 0, 255), self.calib.proj_to_cam(quads[sid]))
+                out = self._cap(outline_image([quads[sid]], size, width=ow, level=lv))
+                seen = projected_quad(np.clip(out - black, 0, 255), self.calib.proj_to_cam(quads[sid], dense=True), search=search)
                 if seen is None or not np.isfinite(seen).all():
                     break
                 e = float(np.linalg.norm(targets[sid] - seen, axis=1).max())
@@ -1300,12 +1797,13 @@ class AutoMap:
             new[sid] = old[sid] + self.calib.cam_to_proj(cam + d, dense=False) - self.calib.cam_to_proj(cam, dense=False)
 
         def errors(quads):
-            out = self._cap(outline_image(list(quads.values()), size))
+            out = self._cap(outline_image(list(quads.values()), size, level=self.adapt["level"]))
             diff = np.clip(out - black, 0, 255)
+            lit_scene = np.clip(grey - black, 0, 255)
             e = {}
             for sid, q in quads.items():
-                tgt = physical_quad(grey, self.calib.proj_to_cam(q))
-                seen = projected_quad(diff, self.calib.proj_to_cam(q))
+                tgt = physical_quad(lit_scene, self.calib.proj_to_cam(q, dense=True))
+                seen = projected_quad(diff, self.calib.proj_to_cam(q, dense=True))
                 e[sid] = None if tgt is None or seen is None else float(np.linalg.norm(tgt - seen, axis=1).max())
             return e
         before = errors({sid: old[sid] for sid in new})
@@ -1375,9 +1873,11 @@ class AutoMap:
         return dict(step=self.step, busy=self.busy, msg=self.msg, err=self.err, progress=round(self.progress, 2),
                     calib=self.calib.summary() if self.calib is not None else None,
                     found=[dict(quad=f["quad"], conf=f["conf"], area=round(f["area"], 3), name=f.get("name", ""), ai=bool(f.get("ai")),
-                                wall=bool(f.get("wall")))
+                                wall=bool(f.get("wall")), reach=f.get("reach", ""))
                            for f in self.found],
-                    made=list(self.made), report=[dict(r) for r in self.report], image=(self.image or (0, 0, 0))[2],
+                    made=list(self.made), thin=None if not self.thin else dict(
+                        n=len(self.thin["parts"]), seen=self.thin["seen"],
+                        parts=[dict(label=q["label"], box=q["proj_box"], area=q["proj_area"]) for q in self.thin["parts"][:64]]), report=[dict(r) for r in self.report], image=(self.image or (0, 0, 0))[2],
                     ai=self._ai_state(), profile=self.profile, profiles={k: v["label"] for k, v in PROFILES.items()},
                     pose=self.pose, poses=sorted(self.poses), mirrored=self.mirrored, adapt=dict(self.adapt),
                     framing=None if self.framing is None else dict(self.framing, advice=list(self.framing["advice"])))
@@ -1412,6 +1912,10 @@ class AutoMap:
             self.create(c.get("keep"), c.get("names"))
         elif op == "verify":
             self.verify(c.get("ids"))
+        elif op == "detect_thin":
+            self.detect_thin(bool(c.get("use_found")))
+        elif op == "create_thin":
+            self.create_thin(c.get("name") or "Grass blade")
         elif op == "ai_polys":
             self.add_polys(c["polys"])
         elif op == "ai_prepare":
@@ -1426,6 +1930,8 @@ class AutoMap:
             self.set_pose(c["n"])
         elif op == "framing":
             self.framing_live(bool(c.get("on", True)))
+        elif op == "watch":
+            self.watch(bool(c.get("on", True)))
         elif op == "cancel":
             self.cancel()
         elif op == "undo":
@@ -1433,7 +1939,7 @@ class AutoMap:
         elif op == "reset":
             self.cancel()
             self.scene, self.found, self.made, self.report, self.image, self.msg, self.err = None, [], [], [], None, "", ""
-            self.ai, self.scene_person = None, (None, False)
+            self.ai, self.scene_person, self.thin = None, (None, False), None
             self.step = "idle"
 
 
@@ -1444,6 +1950,15 @@ def validate_command(c):
     op = c.get("op")
     out = {"cmd": "automap", "type": "automap", "op": op}
     if op in ("check", "detect", "cancel", "undo", "reset"):
+        return out
+    if op == "detect_thin":
+        out["use_found"] = c.get("use_found") is True
+        return out
+    if op == "create_thin":
+        nm = c.get("name", "Grass blade")
+        if not isinstance(nm, str) or len(nm) > 200:
+            raise ValueError("'name' must be a short text")
+        out["name"] = "".join(ch for ch in nm if ch.isprintable()).strip()[:30] or "Grass blade"
         return out
     if op == "calibrate":
         out["gray"] = c.get("gray", True) is True
@@ -1498,7 +2013,7 @@ def validate_command(c):
             raise ValueError("'n' must be 1 or 2")
         out["n"] = c["n"]
         return out
-    if op == "framing":
+    if op in ("framing", "watch"):
         out["on"] = c.get("on", True) is True
         return out
     if op == "ai_polys":
@@ -1568,10 +2083,11 @@ class EngineBridge:
                 w.cancel("stopped by PANIC / BLACKOUT: run the step again when the room is ready")
         if not getattr(self.cam, "on", True) and (w.image is not None or w.scene is not None or w.ai is not None):
             w.clear_pictures("camera off")
-        elif not w.busy and w.image is not None and w.clock() - w.touched > self.IDLE_DROP_S:
+        elif not w.busy and w.image is not None and w.clock() - w.touched > self.IDLE_DROP_S and w.clock() >= getattr(w, "_watch_until", 0.0):   # live view on: it has its own 15-min stop
             w.clear_pictures("10 minutes idle")
         with self._lock:
             q, self._q = self._q, []
+        w.mask_dir = getattr(mapper.set, "mask_dir", None)
         out = tuple(getattr(mapper.set, "output", self.output))
         for c in q:
             try:
@@ -1586,10 +2102,35 @@ class EngineBridge:
     def draw(self, target, size, suppress=False):
         if self.overlay is None:
             return False
+        p = getattr(self.controller, "panics", 0)        # catch PANIC that arrived after tick() on this same frame
+        if p != self._panics:
+            self._panics = p
+            self.overlay.show(None)
+            if self.wizard.busy:
+                self.wizard.cancel("stopped by PANIC / BLACKOUT: run the step again when the room is ready")
+            return False
         if suppress:                                     # blackout / master down: never light the wall with patterns
             self.overlay.show(None)
             return False
+        if self.mapping_mode():                          # user 2026-11-26: while mapping, all other visuals go dark
+            try:
+                target.use()
+                target.clear(0.0, 0.0, 0.0, 1.0)
+            except Exception:
+                pass
         return self.overlay.draw(target, size)
+
+    MAPPING_HOLD_S = 300.0
+
+    def mapping_mode(self):
+        """True while an AUTO MAP session is in use: a step is running, or a step ran / the card was used within the
+        last 5 minutes and the wizard has not been reset. The wall then shows only the calibration pattern (or black)."""
+        w = self.wizard
+        if w.busy:
+            return True
+        if getattr(w, "step", "idle") in ("idle", "", None):
+            return False
+        return (w.clock() - getattr(w, "touched", -1e9)) < self.MAPPING_HOLD_S
 
     def command(self, c):
         self.wizard.touched = self.wizard.clock()

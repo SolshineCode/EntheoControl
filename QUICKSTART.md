@@ -492,6 +492,8 @@ Each surface is a corner-pinned (or masked) piece of the picture; everything out
 - **Show on the projector**: OFF, SELECTED or ALL, plus **TEST GRID** (outline in the surface's colour, number, name, white dot on the top-left corner).
 - **UNDO** (Ctrl+Z, 20 steps, kept by the engine so it survives a reload), REDO (Ctrl+Y), SAVE. It also autosaves 1.5 s after the last edit to `surfaces.json`.
 
+- **LAYERS ON THIS SURFACE** (card under the selected surface): **SAME AS MAIN** shows the show's picture; **OWN LAYERS** gives the surface its own moving textures, up to 3 rows like the LAYERS tab: source (Kené study, Bead study, Folding Blocks, Beadwork, Sacred lines, Beings, Math fractals, 3D deck, Math stack look, Art / AI image, Text, Main picture ...), **EYE**, opacity, blend (Normal / Add / Screen / Multiply), scroll speed + direction, scale, hue shift. **+ LAYER** adds a row, × removes it. **GIVE EVERY SURFACE A DIFFERENT LOOK** gives each surface its own moving source, drift and hue in one step (UNDO = back). A layer switched off on its own tab (EYE / bypass) is black on the surfaces too. Each source is drawn once per frame however many surfaces use it.
+
 Exercise: tape a rectangle on the wall, drag the 4 corners onto it while watching the wall. Then stack a box, + ADD a surface per visible face, turn on ALL + TEST GRID, drag each face's corners (they snap so faces share an edge), and try EDGE GLOW, SPANNED and WHOLE FRAME.
 
 ### 8.2 AUTO MAP (camera-assisted)
@@ -505,6 +507,9 @@ A webcam calibrates the projector and finds the faces for you. Results are ordin
    - UNDO (one step per create or verify), CANCEL, RESET.
 3. **BUILT-IN WEBCAM**: pick it in the card, run the panel from your phone, press **LIVE FRAMING** and follow the hints (tilt up / down, turn left / right, move back / closer) until it says good. Mirroring and the wide-angle lens are handled. If it cannot see the whole projection, calibrate **POSE 1**, turn the laptop to see the rest with some overlap, then **POSE 2**.
 4. **AI assist** (needs ONLINE and your Gemini key): type what to look for, then **AI: FIND SURFACES** or **AI: CHECK OUTLINES**. You see the exact picture that would be sent (people greyed out) and choose SEND or DISCARD. A picture with a person needs an extra tick.
+
+5. **Thin parts (grass, leaves, branches)**: after CALIBRATE (tick "dense"), press **DETECT THIN PARTS (blades/leaves)** (second tap: patterns). Every blade becomes its own part (split where blades meet); the count is shown. Name the group (default "Grass blade") and **CREATE THIN PARTS**: one surface per blade, "Grass blade 1..N", in one group. On LAYERS ON THIS SURFACE tick "apply to every part of the group" to set them all at once, or select one blade to change just that one. Layers and their scroll flow along each blade from base to tip. Tick "only inside the found faces" to use AI / detected outlines as a fence.
+6. Faces the projector cannot light (below / beside its frame) are marked **⚠ outside projector reach** and unticked; an outline that blew up to the whole frame is refused ("exceeds the projector frame"). CREATE says which ones it skipped and why.
 
 Calibration files hold numbers only, never pictures (`calibration\`). BLACKOUT, master down and PANIC take the pattern off the wall at once. A pattern is capped below full brightness.
 

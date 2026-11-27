@@ -1314,7 +1314,8 @@ vec4 shipiboLayout(vec2 P, float px){
       q = rot(uCurve*0.16*env*sin(PI*min(length(u), 1.0)))*q;
       q += uCurve*0.75*ts*env*vec2(sin(3.0*PI*u.y)+0.5*sin(5.0*PI*u.x), -sin(3.0*PI*u.x)-0.5*sin(5.0*PI*u.y));
     }
-    vec2 g = contentMap(q/ts + 0.5*N, uLay == 0);      // a medallion shows the pattern only (its own ring frame) float fw = px/ts*(1.0+0.6*uCurve)/uCZoom;
+    vec2 g = contentMap(q/ts + 0.5*N, uLay == 0);      // a medallion shows the pattern only (its own ring frame)
+    float fw = px/ts*(1.0+0.6*uCurve)/uCZoom;
     if (uLay == 0) {
       vec2 o = abs(P) - 0.5*N*ts, oc = o - (uVec > 0.5 ? 0.0 : (uBorder > 0.5 ? 7.4 : (uFrameOn > 0.5 ? 0.085/ts : 1.3)))*ts;
       float cloth = 1.0 - smoothstep(-px, px, max(oc.x, oc.y));

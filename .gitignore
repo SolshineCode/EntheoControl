@@ -40,3 +40,9 @@ test_frames/kene_real/reference_pairs.png
 tools/agy_neon_runner.py
 # the user's own sprite images (beings.py sprite creature) and art uploads stay local, never in the repo
 art/
+
+# local loops / launchers (never commit)
+.wall_loop/
+launch/
+masks/
+mapping_presets/

@@ -102,6 +102,18 @@ def test_text_op(ctx):
     assert any(c["cmd"] == "text" and c["text"] == "WELCOME HOME" for c in r["commands"])
 
 
+def test_density_budget_never_grows_a_busy_look(ctx):
+    r = run(["l_swarm=high", "l_fractal=high", "l_land=high"], ctx)
+    assert not pm._over(r["commands"], ctx) and any("density budget" in n for n in r["notes"])
+    sets = {c["name"]: c["v"] for c in r["commands"] if c["cmd"] == "set"}
+    assert sets.get("l_fractal", 0) > 0.5 and sets.get("l_land", 0) > 0.5       # what was asked for stays
+
+
+def test_density_budget_caps_filters_added_at_once(ctx):
+    r = run(["flt_neon+++", "flt_bloom+++", "flt_oil+++", "flt_dream+++"], ctx)
+    assert not pm._over(r["commands"], ctx)
+
+
 def test_score():
     it = [("dir", "speed", -1), ("dir", "travel", 1)]
     assert pm.score(["speed-", "travel+|zoom+"], it)["exact"] == 1.0

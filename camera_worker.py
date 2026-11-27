@@ -204,7 +204,7 @@ class Worker:
         self.server = None
         self.cap = None
         self.still_until = 0.0                                    # /still is refused unless AUTO MAP opened it
-        self._exposure = None                                     # pending lock_exposure request (bool)
+        self._exposure = None                                     # pending (lock: bool, done: Event) request
 
     # ---- capture (its own thread: cap.read() blocks at the camera's rate, which drops in a dark room)
     def _open(self):
@@ -213,8 +213,9 @@ class Worker:
         import cv2
         cap = cv2.VideoCapture(self.device, cv2.CAP_DSHOW)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        hd = os.environ.get("CAMERA_HD", "").strip().lower() in ("1", "true", "yes")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280 if hd else 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720 if hd else 360)
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
@@ -226,14 +227,25 @@ class Worker:
         fails = 0
         while not self._stop.is_set():
             with self._lock:
-                lock, self._exposure = self._exposure, None
-            if lock is not None:                                 # AUTO MAP: freeze exposure / white balance if the driver can
+                exp_req, self._exposure = self._exposure, None
+            if exp_req is not None:                              # AUTO MAP: freeze exposure / white balance if the driver can
+                lock, done = exp_req
+                locked = False
                 try:
                     import cv2
-                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if lock else 0.75)
+                    if lock:
+                        cur_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+                        ok_ae = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) or cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+                        if math.isfinite(cur_exp) and cur_exp != 0.0:
+                            ok_ae = cap.set(cv2.CAP_PROP_EXPOSURE, cur_exp) or ok_ae
+                        locked = bool(ok_ae)
+                    else:
+                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75) or cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
                     cap.set(cv2.CAP_PROP_AUTO_WB, 0 if lock else 1)
                 except Exception:
                     pass
+                self.stats["exposure_locked"] = locked
+                done.set()
             ok, fr = cap.read()
             if not ok or fr is None:
                 fails += 1
@@ -412,8 +424,9 @@ class Worker:
                 item, fs = self._frame_in, self._frame_seq
             if item is not None and fs >= want:
                 g = cv2.cvtColor(item[1], cv2.COLOR_BGR2GRAY)
-                if g.shape != (360, 640):
-                    g = cv2.resize(g, (640, 360), interpolation=cv2.INTER_AREA)
+                if g.shape[1] > 1280:                            # preserve native 640x360 or 1280x720; only cap >720p
+                    nh = max(1, int(round(g.shape[0] * 1280.0 / g.shape[1])))
+                    g = cv2.resize(g, (1280, nh), interpolation=cv2.INTER_AREA)
                 return pack_still(g)
             time.sleep(0.01)
         return None
@@ -423,9 +436,11 @@ class Worker:
             raise ValueError("config must be an object")
         lim = dict(fps=(5, 30), res=(0, len(RES_STEPS) - 1), pose_every=(1, 6), max_poses=(0, MAX_POSES))
         new = dict(self.cfg)
+        exp_done = None
         if isinstance(body.get("lock_exposure"), bool):
+            exp_done = threading.Event()
             with self._lock:
-                self._exposure = body["lock_exposure"]
+                self._exposure = (body["lock_exposure"], exp_done)
         a = body.get("allow_still_s")
         if isinstance(a, (int, float)) and not isinstance(a, bool) and math.isfinite(a):
             self.still_until = self.clock() + min(max(float(a), 0.0), 600.0) if a > 0 else 0.0
@@ -436,6 +451,8 @@ class Worker:
                     raise ValueError(f"'{k}' must be a number")
                 new[k] = int(min(max(round(v), lo), hi))
         self.cfg = new
+        if exp_done is not None:
+            exp_done.wait(timeout=1.0)
         return new
 
     def start_server(self):

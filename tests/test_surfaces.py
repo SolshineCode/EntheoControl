@@ -154,7 +154,7 @@ def test_list_ops_add_dup_delete_rename_reorder_select():
     assert st.apply(cmd("del", id=1)) and st.sel in (2, 3) and len(st.surfaces) == 2
     st.apply(cmd("del", id=2))
     assert not st.apply(cmd("del", id=3)), "the last surface cannot be deleted"
-    for _ in range(40):
+    for _ in range(S.MAX_SURFACES + 2):
         st.apply(cmd("add"))
     assert len(st.surfaces) == S.MAX_SURFACES and len({s["id"] for s in st.surfaces}) == S.MAX_SURFACES
 
@@ -391,7 +391,7 @@ def test_save_load_round_trip_and_legacy_file_follows(tmp_path):
     raw = json.loads((tmp_path / "surfaces.json").read_text())
     assert raw["version"] == 1 and raw["output"] == [1280, 800] and "overlay" not in raw and len(raw["surfaces"]) == 3
     assert set(raw["surfaces"][0]) == {"id", "name", "order", "enabled", "shape", "corners", "mask", "source", "content",
-                                       "color", "opacity", "brightness", "glow", "feather"}
+                                       "color", "opacity", "brightness", "glow", "feather", "layers"}   # layers: 2026-11-26
     back = S.SurfaceSet.load(tmp_path / "surfaces.json")
     assert back.status == "loaded" and back.to_dict() == st.to_dict() and back.overlay["mode"] == "off"
     assert not list(tmp_path.glob("*.tmp"))
@@ -690,10 +690,11 @@ def test_name_tags_of_deleted_surfaces_are_released_and_the_font_is_cached():
 
 
 def test_a_full_layout_import_fits_in_one_request():
-    """Review L10: 24 surfaces with 8-point masks as one surf `replace`."""
+    """Review L10: 24 surfaces with 8-point masks as one surf `replace`. (MAX_SURFACES went 24 -> 64 on 2026-11-26 for
+    thin mask parts; those are compact: 64 grass-blade surfaces fit too, see test_surface_layers.)"""
     import remote_control
     st = S.SurfaceSet()
-    for _ in range(S.MAX_SURFACES - 1):
+    for _ in range(24 - 1):
         st.apply(cmd("add"))
     for s in st.surfaces:
         s["name"] = "W" * S.MAX_NAME
@@ -705,4 +706,4 @@ def test_a_full_layout_import_fits_in_one_request():
     assert len(body.encode()) < remote_control.MAX_BODY
     c = remote_control.validate_command(json.loads(body)[0])
     fresh = S.SurfaceSet()
-    assert fresh.apply(c) and len(fresh.surfaces) == S.MAX_SURFACES
+    assert fresh.apply(c) and len(fresh.surfaces) == 24

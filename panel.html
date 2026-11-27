@@ -273,6 +273,9 @@ select{background:var(--btn);color:var(--txt);border:1px solid var(--line);borde
 .lyr .monimg{display:block;width:100%;aspect-ratio:16/10;background:#000;border:1px solid var(--line);border-radius:8px;object-fit:contain}
 .lyr .cap{font-size:11px;letter-spacing:.08em;margin-top:6px;color:var(--ok);font-weight:700}
 .lyr .cap.solo{color:var(--acc3)}
+.slrows{display:flex;flex-direction:column;gap:8px}.slrow{border:1px solid var(--line);border-radius:8px;padding:6px}.slrow.hid{opacity:.5}
+.slrow>.row{gap:6px;flex-wrap:nowrap}.slrow select{flex:1 1 auto;min-width:0;min-height:34px}.slrow .ey{min-width:48px;min-height:34px}
+.slrow .ey.on{background:color-mix(in srgb,var(--ok) 45%,#120b18);border-color:var(--ok);color:#fff}
 .lrow{display:grid;grid-template-columns:40px 52px 64px minmax(90px,1fr) 40px;gap:6px;align-items:center;padding:3px 4px;border-radius:8px}
 .lrow.hid{opacity:.5}.lrow.so{background:color-mix(in srgb,var(--acc3) 14%,transparent)}
 .lrow button{min-height:34px;padding:0;font-size:11px}
@@ -1510,6 +1513,10 @@ document.addEventListener('pointerdown',function(e){
 var MS=null,mPt={m:false,i:0},mStep=1,mSnap=true,mGest=0,mDrag=null,mGK='',mGT=0,mapPaint=function(){};
 var MCOL=[[1,.25,.7],[.1,.85,1],[1,.8,.1],[.35,1,.35],[.65,.4,1],[1,.45,.15],[.2,.55,1],[.85,1,.2],[1,.3,.3],[.2,1,.75],[1,.55,.9],[.75,.75,.75]];
 var CN=['TL','TR','BR','BL'],EN=['Top','Right','Bottom','Left'];
+/* per-surface layer sources: mirror of surfaces.LAYER_SOURCES (tests/test_surface_layers_gl.py checks they match) */
+var SURF_SRC=[['main','Main picture'],['kene','Kené study'],['beadstudy','Bead study'],['blocks','Folding Blocks'],['beads','Beadwork'],
+  ['lines','Sacred lines'],['beings','Beings'],['fractal','Math fractals'],['land','3D deck'],['stack','Math stack look'],['art','Art image'],
+  ['ai','AI image'],['text','Text'],['lines4','Line layer (4 ch)'],['kene4','Kené 4 channels'],['video','Video loops'],['camera','Crowd camera']];
 function dragging(){return !!mDrag;}                       /* merge() asks this before taking the engine's corners */
 function mDefault(){var w=L.res[0]||1280,hh=L.res[1]||800;
   return {version:1,output:[w,hh],sel:1,rev:-1,undo:0,redo:0,overlay:{mode:'off',grid:false},dirty:false,can_save:true,local:true,
@@ -1833,11 +1840,63 @@ function nudge(dx,dy){mNudge(dx*mStep,-dy*mStep);}        /* the shared keydown 
     mrow.style.display=mPt.m&&s.shape==='poly'?'':'none';if(mPt.m)setTxt(mrow.firstChild,'Mask pt '+(mPt.i+1));
     setTxt($('dlab'),mPt.m?'M'+(mPt.i+1):CN[mPt.i]);
   }
-  add(pg,c1,c2,c3);
+
+  /* ---------- card 4: LAYERS ON THIS SURFACE (per-surface layers, surfaces.py content "layers"; engine: surface_render) */
+  var c4=card('Layers on this surface');c4.id='mlay';
+  var lyGrp=false;                                         /* apply to the whole group (mask parts, e.g. grass blades) */
+  function lyList(){var s=mSurf();if(!s.layers)s.layers=[];return s.layers;}
+  function lySend(extra){var s=mSurf(),o={id:s.id,layers:lyList(),g:mG('ly'+s.id)};if(lyGrp&&s.group)o.group_all=true;
+    if(extra)for(var k in extra)o[k]=extra[k];mSend('set_layers',o,'sly');draw();}
+  var lyMode=lseg('This surface shows',[['main','SAME AS MAIN'],['layers','OWN LAYERS']],function(){return mSurf().content==='layers'?'layers':'main';},
+    function(v){var s=mSurf();s.content=v;if(v==='layers'&&!lyList().length)s.layers=[{src:SURF_SRC[1][0],on:true,opacity:1,blend:'normal',scale:1,scroll:0.1,dir:0,hue:0}];
+      lySend({content:v});});
+  var lyGrpL=h('label','dim'),lyGrpC=h('input');lyGrpC.type='checkbox';lyGrpL.appendChild(lyGrpC);lyGrpL.appendChild(document.createTextNode(' '));
+  var lyGrpT=h('span');lyGrpL.appendChild(lyGrpT);lyGrpC.addEventListener('change',function(){lyGrp=lyGrpC.checked;});
+  var lyRows=h('div','slrows'),lyTools=h('div','row');
+  add(lyTools,btn('+ LAYER',function(){var L=lyList();if(L.length>=3){banner('3 layers per surface',1400);return;}
+      var used=L.map(function(x){return x.src;}),nx=SURF_SRC.filter(function(o){return o[0]!=='main'&&used.indexOf(o[0])<0;})[0]||SURF_SRC[1];
+      L.push({src:nx[0],on:true,opacity:L.length?0.6:1,blend:L.length?'screen':'normal',scale:1,scroll:0.1,dir:0,hue:0});mSurf().content='layers';lySend({content:'layers'});}),
+    btn('GIVE EVERY SURFACE A DIFFERENT LOOK',function(){mSend('looks',{});banner('Every surface: its own moving layer (UNDO = back)',1800);}));
+  lyTools.lastChild.id='mlooks';lyTools.lastChild.title='each surface gets a different moving source, drift direction and hue (one undo step)';
+  var lySig='',lyDraws=[],lyRowEl=null;
+  function lyRow(k){
+    var r=h('div','slrow'),top=h('div','row'),ey=h('button','ey','EYE'),sel=h('select'),bl=h('select'),rm=h('button',null,'×');
+    SURF_SRC.forEach(function(o){var e=h('option',null,o[1]);e.value=o[0];sel.appendChild(e);});
+    [['normal','Normal'],['add','Add'],['screen','Screen'],['multiply','Multiply']].forEach(function(o){var e=h('option',null,o[1]);e.value=o[0];bl.appendChild(e);});
+    function L(){return lyList()[k]||{};}
+    ey.title='show / hide this layer on this surface';
+    ey.addEventListener('click',function(){L().on=!L().on;lySend();});
+    sel.addEventListener('change',function(){L().src=sel.value;lySend();});
+    bl.addEventListener('change',function(){L().blend=bl.value;lySend();});
+    rm.title='remove this layer';rm.addEventListener('click',function(){lyList().splice(k,1);lySend();});
+    add(top,ey,sel,bl,rm);r.appendChild(top);
+    var fd=[];
+    function fad(label,key,lo,hi,def,fmt){var w=h('div','msl'),val=h('span','mono dim'),t=h('div','row');add(t,h('span','lab',label),val);
+      var sl=mkSlider({lo:lo,hi:hi,def:def,get:function(){var v=L()[key];return v==null?def:v;},set:function(v){L()[key]=+clamp(v,lo,hi).toFixed(3);lySend();}});
+      add(w,t,sl);fd.push(function(){sl.draw();var v=L()[key];setTxt(val,fmt(v==null?def:v));});return w;}
+    var g=h('div','msls');
+    add(g,fad('Opacity','opacity',0,1,1,function(v){return v.toFixed(2);}),fad('Scroll','scroll',-1,1,0,function(v){return v.toFixed(2)+'/s';}),
+      fad('Direction','dir',-180,180,0,function(v){return Math.round(v)+'°';}),fad('Scale','scale',0.25,4,1,function(v){return v.toFixed(2)+'×';}),
+      fad('Hue shift','hue',-180,180,0,function(v){return Math.round(v)+'°';}));
+    r.appendChild(g);lyRowEl=r;
+    return function(){var x=L();ey.classList.toggle('on',!!x.on);setTxt(ey,x.on?'EYE':'OFF');r.classList.toggle('hid',!x.on);
+      if(document.activeElement!==sel)sel.value=x.src;if(document.activeElement!==bl)bl.value=x.blend;fd.forEach(function(f){f();});};
+  }
+  var lyHint=h('div','dim','Each layer is the engine layer rendered on its own (drawn once per frame, however many surfaces use it). A layer switched off on its LAYERS tab (EYE / bypass) is black here too.');
+  add(c4,lyMode,lyGrpL,lyRows,lyTools,lyHint);
+  function drawLayers(){
+    var s=mSurf(),L=lyList(),sig=s.id+':'+L.length;
+    if(sig!==lySig){lySig=sig;lyRows.textContent='';lyDraws=[];
+      for(var k=0;k<L.length;k++){lyDraws.push(lyRow(k));lyRows.appendChild(lyRowEl);}}
+    lyDraws.forEach(function(f){f();});
+    lyGrpL.style.display=s.group?'':'none';setTxt(lyGrpT,'apply to every part of the group "'+(s.group||'')+'"');lyGrpC.checked=lyGrp;
+    lyRows.style.opacity=s.content==='layers'?'':'.45';
+  }
+  add(pg,c1,c2,c3,c4);
   reg('mapping',function(){
     mSurf();var s=mSurf();
     if(mPt.m&&(s.shape!=='poly'||mPt.i>=s.mask.length))mPt={m:false,i:0};
-    drawList();paint();drawNums();
+    drawList();paint();drawNums();drawLayers();
     if(document.activeElement!==nameIn&&nameIn.value!==s.name)nameIn.value=s.name;
     sliders.forEach(function(fn){fn();});
     bsnap.classList.toggle('on',mSnap);bgrid.classList.toggle('on',!!MS.overlay.grid);bc.classList.toggle('on',!!L.calib);
@@ -2531,7 +2590,7 @@ function buildCard(){
    'NVIDIA Control Panel > Manage 3D settings > Program settings > python.exe: Max Frame Rate 60 (or the show cap).',
    'NVIDIA: WhisperMode off for python.exe (it fights the show\u2019s own frame pacing).',
    'NVIDIA: Threaded optimization Off for python.exe.',
-   'Use the stock ThinkPad charger (or a higher-watt one) directly, not through a dock or a USB-C hub.'].forEach(function(t){ck.appendChild(el('div','dim','\u2022 '+t));});
+   'Use the stock laptop charger (or a higher-watt one) directly, not through a dock or a USB-C hub.'].forEach(function(t){ck.appendChild(el('div','dim','\u2022 '+t));});
   pw.appendChild(ck);card.appendChild(pw);
   var r=el('div','row');r.style.cssText='margin-top:8px;gap:6px;display:flex';
   var lp=el('button',null,'LOW-POWER PROFILE');lp.id='govlp';lp.addEventListener('click',function(){send({op:'low_power',on:!(G&&G.low_power)});});
@@ -3671,6 +3730,16 @@ btn('UNDO',function(){send({op:'undo'});});
 btn('CANCEL',function(){send({op:'cancel'});});
 btn('RESET',function(){send({op:'reset'});});
 c.appendChild(s);
+/* MASK SURFACES: thin parts (grass blades / leaves), one surface each, created as one group */
+var th=el('div','steps');ui.thinB=el('button',null,'DETECT THIN PARTS (blades/leaves)');ui.thinB.id='amthin';th.appendChild(ui.thinB);
+armed(ui.thinB,'DETECT THIN PARTS (blades/leaves)',function(){send({op:'detect_thin',use_found:ui.thinIn.checked});});
+ui.thinInL=el('label','dim');ui.thinIn=el('input');ui.thinIn.type='checkbox';ui.thinInL.appendChild(ui.thinIn);
+ui.thinInL.appendChild(document.createTextNode(' only inside the found faces (AI outlines as seeds)'));th.appendChild(ui.thinInL);
+ui.thinNm=el('input');ui.thinNm.type='text';ui.thinNm.value='Grass blade';ui.thinNm.maxLength=30;ui.thinNm.style.cssText='width:130px;background:#0a070d;border:1px solid var(--line);border-radius:6px;padding:4px 6px;color:inherit';
+ui.thinC=el('button',null,'CREATE THIN PARTS');ui.thinC.id='amthinc';ui.thinC.disabled=true;
+ui.thinC.addEventListener('click',function(){send({op:'create_thin',name:ui.thinNm.value});});
+th.appendChild(ui.thinNm);th.appendChild(ui.thinC);ui.thinN=el('span','ok','');th.appendChild(ui.thinN);
+c.appendChild(th);
 ui.bar=el('div','ambar');ui.bari=el('i');ui.bar.appendChild(ui.bari);c.appendChild(ui.bar);
 ui.msg=el('div','ok','');ui.err=el('div','err','');ui.cal=el('div','dim','');[ui.msg,ui.err,ui.cal].forEach(function(x){c.appendChild(x);});
 ui.img=el('img');ui.img.id='amimg';ui.img.alt='camera view for AUTO MAP';
@@ -3703,9 +3772,10 @@ function rows(){
   ui.list.textContent='';ui.rows=[];
   f.forEach(function(x,i){var r=el('div','amf'),cb=el('input'),nm=el('input'),dr=el('button',null,'×');cb.type='checkbox';cb.checked=x.conf>=0.6||x.name;
     nm.type='text';nm.value=x.name||('Auto '+(i+1));dr.title='drop';dr.addEventListener('click',function(){send({op:'drop',i:i});});
-    if(x.wall)cb.checked=false;
+    if(x.wall||x.reach)cb.checked=false;
     r.appendChild(cb);r.appendChild(el('b',null,String(i+1)));if(x.ai){var bd=el('span','pill','AI');bd.style.cssText='color:var(--acc3);border:1px solid var(--acc3);border-radius:6px;padding:0 4px';r.appendChild(bd);}r.appendChild(nm);
-    r.appendChild(el('span','dim',(x.quad?'quad':'polygon')+' · fit '+Math.round(x.conf*100)+'% · '+(x.area*100).toFixed(1)+'% of view'));r.appendChild(dr);
+    r.appendChild(el('span','dim',(x.quad?'quad':'polygon')+' · fit '+Math.round(x.conf*100)+'% · '+(x.area*100).toFixed(1)+'% of view'));
+    if(x.reach)r.appendChild(el('span','err','⚠ '+x.reach));r.appendChild(dr);
     ui.list.appendChild(r);ui.rows.push({cb:cb,nm:nm});});
 }
 function draw(){
@@ -3723,6 +3793,7 @@ function draw(){
   var fr=A.framing,ad=A.adapt||{};ui.frame.textContent=(fr?('Camera sees: '+Math.round(fr.coverage*100)+'% of its view is projection. '+fr.advice.join(' ')):'')
     +(ad.snr!=null?'  Signal/noise '+ad.snr+', stripes '+ad.stripe+' px, pattern level '+ad.level+'.':'');
   ui.create.disabled=!(A.found&&A.found.length);
+  var tn=A.thin;ui.thinC.disabled=!(tn&&tn.n);ui.thinN.textContent=tn?(tn.n+' thin part(s) found'+(tn.seen>tn.n?' ('+(tn.seen-tn.n)+' outside projector reach)':'')):'';
   var ai=A.ai||{};ui.aiD.disabled=ui.aiV.disabled=!ai.online||!!A.busy;
   ui.aiNote.textContent=!ai.online?'AI assist needs ONLINE (top bar). Nothing leaves this laptop while it is off.'
     :(ai.providers&&ai.providers.length?'AI route: '+ai.providers.join(' / ')+'. You see the exact picture (people greyed out) before anything is sent.'
@@ -3734,6 +3805,11 @@ function draw(){
     fetch('/automap-image?k='+encodeURIComponent(q)+'&i='+imgId,{cache:'no-store',signal:ac.signal}).then(function(r){return r.status===200?r.blob():null;})
      .then(function(b){if(b){var u=URL.createObjectURL(b),o=ui.img.src;ui.img.src=u;ui.img.style.display='block';if(o&&o.indexOf('blob:')===0)URL.revokeObjectURL(o);}}).catch(function(){});}
   if(!A.image){ui.img.style.display='none';imgId=0;}
+  if(!ui.live&&ui.img&&ui.img.parentNode){ui.live=document.createElement('button');ui.live.className='btn';ui.live.textContent='LIVE CAMERA VIEW: OFF';
+    ui.live.title='Show what the webcam sees, about twice a second (projects nothing). Stops by itself after 15 minutes.';
+    ui.live.onclick=function(){var on=ui.live.dataset.on!=='1';ui.live.dataset.on=on?'1':'0';ui.live.textContent='LIVE CAMERA VIEW: '+(on?'ON':'OFF');
+      send({op:'watch',on:on});};
+    ui.img.parentNode.insertBefore(ui.live,ui.img);}
 }
 var lastT=0;
 window.addEventListener('panelstate',function(e){var d=e.detail,t=Date.now();if(!d||t-lastT<300)return;lastT=t;
